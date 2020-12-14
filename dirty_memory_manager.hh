@@ -33,7 +33,7 @@ class dirty_memory_manager;
 
 class sstable_write_permit final {
     friend class dirty_memory_manager;
-    stdx::optional<semaphore_units<>> _permit;
+    std::optional<semaphore_units<>> _permit;
 
     sstable_write_permit() noexcept = default;
     explicit sstable_write_permit(semaphore_units<>&& units) noexcept
@@ -111,6 +111,8 @@ class dirty_memory_manager: public logalloc::region_group_reclaimer {
         return over_soft_limit();
     }
 
+    unsigned _extraneous_flushes = 0;
+
     seastar::metrics::metric_groups _metrics;
 public:
     void setup_collectd(sstring namestr);
@@ -149,19 +151,19 @@ public:
     //
     // We then set the soft limit to 80 % of the virtual dirty hard limit, which is equal to 40 % of
     // the user-supplied threshold.
-    dirty_memory_manager(database& db, size_t threshold, double soft_limit)
+    dirty_memory_manager(database& db, size_t threshold, double soft_limit, scheduling_group deferred_work_sg)
         : logalloc::region_group_reclaimer(threshold / 2, threshold * soft_limit / 2)
         , _real_dirty_reclaimer(threshold)
         , _db(&db)
-        , _real_region_group(_real_dirty_reclaimer)
-        , _virtual_region_group(&_real_region_group, *this)
+        , _real_region_group("memtable", _real_dirty_reclaimer, deferred_work_sg)
+        , _virtual_region_group("memtable (virtual)", &_real_region_group, *this, deferred_work_sg)
         , _flush_serializer(1)
         , _waiting_flush(flush_when_needed()) {}
 
     dirty_memory_manager() : logalloc::region_group_reclaimer()
         , _db(nullptr)
-        , _real_region_group(_real_dirty_reclaimer)
-        , _virtual_region_group(&_real_region_group, *this)
+        , _real_region_group("memtable", _real_dirty_reclaimer)
+        , _virtual_region_group("memtable (virtual)", &_real_region_group, *this)
         , _flush_serializer(1)
         , _waiting_flush(make_ready_future<>()) {}
 
@@ -213,6 +215,17 @@ public:
         });
     }
 
+    bool has_extraneous_flushes_requested() const {
+        return _extraneous_flushes > 0;
+    }
+
+    void start_extraneous_flush() {
+        ++_extraneous_flushes;
+    }
+
+    void finish_extraneous_flush() {
+        --_extraneous_flushes;
+    }
 private:
     future<flush_permit> get_flush_permit(semaphore_units<>&& background_permit) {
         return get_units(_flush_serializer, 1).then([this, background_permit = std::move(background_permit)] (auto&& units) mutable {

@@ -55,18 +55,18 @@ namespace raw {
 
 class delete_statement : public modification_statement {
 private:
-    std::vector<::shared_ptr<operation::raw_deletion>> _deletions;
+    std::vector<std::unique_ptr<operation::raw_deletion>> _deletions;
     std::vector<::shared_ptr<relation>> _where_clause;
 public:
     delete_statement(::shared_ptr<cf_name> name,
-           ::shared_ptr<attributes::raw> attrs,
-           std::vector<::shared_ptr<operation::raw_deletion>> deletions,
+           std::unique_ptr<attributes::raw> attrs,
+           std::vector<std::unique_ptr<operation::raw_deletion>> deletions,
            std::vector<::shared_ptr<relation>> where_clause,
            conditions_vector conditions,
            bool if_exists);
 protected:
     virtual ::shared_ptr<cql3::statements::modification_statement> prepare_internal(database& db, schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats);
+        variable_specifications& bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats) const override;
 };
 
 }

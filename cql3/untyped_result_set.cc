@@ -47,46 +47,56 @@
 #include "result_set.hh"
 #include "transport/messages/result_message.hh"
 
-cql3::untyped_result_set_row::untyped_result_set_row(const std::unordered_map<sstring, bytes_opt>& data)
+cql3::untyped_result_set_row::untyped_result_set_row(const map_t& data)
     : _data(data)
 {}
 
-cql3::untyped_result_set_row::untyped_result_set_row(const std::vector<::shared_ptr<column_specification>>& columns, std::vector<bytes_opt> data)
+cql3::untyped_result_set_row::untyped_result_set_row(const std::vector<lw_shared_ptr<column_specification>>& columns, std::vector<bytes_opt> data)
 : _columns(columns)
 , _data([&columns, data = std::move(data)] () mutable {
-    std::unordered_map<sstring, bytes_opt> tmp;
-    std::transform(columns.begin(), columns.end(), data.begin(), std::inserter(tmp, tmp.end()), [](::shared_ptr<column_specification> c, bytes_opt& d) {
+    map_t tmp;
+    std::transform(columns.begin(), columns.end(), data.begin(), std::inserter(tmp, tmp.end()), [](lw_shared_ptr<column_specification> c, bytes_opt& d) {
        return std::make_pair<sstring, bytes_opt>(c->name->to_string(), std::move(d));
     });
     return tmp;
 }())
 {}
 
-bool cql3::untyped_result_set_row::has(const sstring& name) const {
+bool cql3::untyped_result_set_row::has(std::string_view name) const {
     auto i = _data.find(name);
     return i != _data.end() && i->second;
 }
 
 using cql_transport::messages::result_message;
 
+cql3::untyped_result_set::untyped_result_set(const cql3::result_set& rs) {
+    auto& cn = rs.get_metadata().get_names();
+    for (auto& r : rs.rows()) {
+        // r is const ref. TODO: make this more efficient by either wrapping result set
+        // or adding modifying accessors to it.
+        _rows.emplace_back(cn, r);
+    }
+}
+
 cql3::untyped_result_set::untyped_result_set(::shared_ptr<result_message> msg)
     : _rows([msg]{
     class visitor : public result_message::visitor_base {
     public:
-        rows_type rows;
+        std::optional<untyped_result_set> res;
         void visit(const result_message::rows& rmrs) override {
-            auto& rs = rmrs.rs();
-            auto& cn = rs.get_metadata().get_names();
-            for (auto& r : rs.rows()) {
-                rows.emplace_back(cn, r);
-            }
+            const auto& rs = rmrs.rs();
+            const auto& set = rs.result_set();
+            res.emplace(set); // construct untyped_result_set by const ref.
         }
     };
     visitor v;
     if (msg != nullptr) {
         msg->accept(v);
     }
-    return std::move(v.rows);
+    if (v.res) {
+        return std::move(v.res->_rows);
+    }
+    return rows_type{};
 }())
 {}
 

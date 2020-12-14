@@ -44,6 +44,8 @@
 #include "paging_state.hh"
 #include "cql3/result_set.hh"
 #include "cql3/selection/selection.hh"
+#include "service/storage_proxy.hh"
+#include "service/query_state.hh"
 
 namespace service {
 
@@ -70,6 +72,37 @@ namespace pager {
  */
 class query_pager {
 public:
+    struct stats {
+        // Total number of rows read by this pager, based on all pages it fetched
+        size_t rows_read_total = 0;
+    };
+
+protected:
+    // remember if we use clustering. if not, each partition == one row
+    const bool _has_clustering_keys;
+    bool _exhausted = false;
+    uint64_t _max;
+    uint64_t _per_partition_limit;
+
+    std::optional<partition_key> _last_pkey;
+    std::optional<clustering_key> _last_ckey;
+
+    schema_ptr _schema;
+    shared_ptr<const cql3::selection::selection> _selection;
+    service::query_state& _state;
+    const cql3::query_options& _options;
+    lw_shared_ptr<query::read_command> _cmd;
+    dht::partition_range_vector _ranges;
+    paging_state::replicas_per_token_range _last_replicas;
+    std::optional<db::read_repair_decision> _query_read_repair_decision;
+    uint64_t _rows_fetched_for_last_partition = 0;
+    stats _stats;
+public:
+    query_pager(schema_ptr s, shared_ptr<const cql3::selection::selection> selection,
+                service::query_state& state,
+                const cql3::query_options& options,
+                lw_shared_ptr<query::read_command> cmd,
+                dht::partition_range_vector ranges);
     virtual ~query_pager() {}
 
     /**
@@ -78,12 +111,14 @@ public:
      * @param pageSize the maximum number of elements to return in the next page.
      * @return the page of result.
      */
-    virtual future<std::unique_ptr<cql3::result_set>> fetch_page(uint32_t page_size, gc_clock::time_point) = 0;
+    future<std::unique_ptr<cql3::result_set>> fetch_page(uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
 
     /**
      * For more than one page.
      */
-    virtual future<> fetch_page(cql3::selection::result_set_builder&, uint32_t page_size, gc_clock::time_point) = 0;
+    virtual future<> fetch_page(cql3::selection::result_set_builder&, uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
+
+    future<cql3::result_generator> fetch_page_generator(uint32_t page_size, gc_clock::time_point now, db::timeout_clock::time_point timeout, cql3::cql_stats& stats);
 
     /**
      * Whether or not this pager is exhausted, i.e. whether or not a call to
@@ -91,7 +126,9 @@ public:
      *
      * @return whether the pager is exhausted.
      */
-    virtual bool is_exhausted() const = 0;
+    bool is_exhausted() const {
+        return _exhausted;
+    }
 
     /**
      * The maximum number of cells/CQL3 row that we may still have to return.
@@ -99,16 +136,41 @@ public:
      * returned (note that it's not how many we *will* return, just the upper
      * limit on it).
      */
-    virtual int max_remaining() const = 0;
+    uint64_t max_remaining() const {
+        return _max;
+    }
 
     /**
      * Get the current state (snapshot) of the pager. The state can allow to restart the
      * paging on another host from where we are at this point.
      *
-     * @return the current paging state. Will return null if paging is at the
-     * beginning. If the pager is exhausted, the result is undefined.
+     * @return the current paging state. If the pager is exhausted, the result is a valid pointer
+     * to a paging_state instance which will return 0 on calling get_remaining() on it.
      */
-    virtual ::shared_ptr<const paging_state> state() const = 0;
+    lw_shared_ptr<const paging_state> state() const;
+
+    const stats& stats() const {
+        return _stats;
+    }
+
+protected:
+    template<typename Base>
+    class query_result_visitor;
+    
+    future<service::storage_proxy::coordinator_query_result>
+    do_fetch_page(uint32_t page_size, gc_clock::time_point now, db::timeout_clock::time_point timeout);
+
+    template<typename Visitor>
+    requires query::ResultVisitor<Visitor>
+    void handle_result(Visitor&& visitor,
+                      const foreign_ptr<lw_shared_ptr<query::result>>& results,
+                      uint32_t page_size, gc_clock::time_point now);
+
+    virtual uint64_t max_rows_to_fetch(uint32_t page_size) {
+        return std::min(_max, static_cast<uint64_t>(page_size));
+    }
+
+    virtual void maybe_adjust_per_partition_limit(uint32_t page_size) const { }
 };
 
 }

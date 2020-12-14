@@ -50,8 +50,8 @@
 #include "cql3/result_set.hh"
 #include "exceptions/unrecognized_entity_exception.hh"
 #include "service/client_state.hh"
-#include "core/shared_ptr.hh"
-#include "core/distributed.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/distributed.hh>
 #include "validation.hh"
 
 namespace cql3 {
@@ -76,6 +76,7 @@ public:
         const bool _is_distinct;
         const bool _allow_filtering;
         const bool _is_json;
+        bool _bypass_cache = false;
     public:
         parameters();
         parameters(orderings_type orderings,
@@ -84,10 +85,12 @@ public:
         parameters(orderings_type orderings,
             bool is_distinct,
             bool allow_filtering,
-            bool is_json);
+            bool is_json,
+            bool bypass_cache);
         bool is_distinct() const;
         bool allow_filtering() const;
         bool is_json() const;
+        bool bypass_cache() const;
         orderings_type const& orderings() const;
     };
     template<typename T>
@@ -96,53 +99,65 @@ public:
     using result_row_type = std::vector<bytes_opt>;
     using ordering_comparator_type = compare_fn<result_row_type>;
 private:
-    ::shared_ptr<parameters> _parameters;
+    lw_shared_ptr<const parameters> _parameters;
     std::vector<::shared_ptr<selection::raw_selector>> _select_clause;
     std::vector<::shared_ptr<relation>> _where_clause;
     ::shared_ptr<term::raw> _limit;
+    ::shared_ptr<term::raw> _per_partition_limit;
+    std::vector<::shared_ptr<cql3::column_identifier::raw>> _group_by_columns;
 public:
     select_statement(::shared_ptr<cf_name> cf_name,
-            ::shared_ptr<parameters> parameters,
+            lw_shared_ptr<const parameters> parameters,
             std::vector<::shared_ptr<selection::raw_selector>> select_clause,
             std::vector<::shared_ptr<relation>> where_clause,
-            ::shared_ptr<term::raw> limit);
+            ::shared_ptr<term::raw> limit,
+            ::shared_ptr<term::raw> per_partition_limit,
+            std::vector<::shared_ptr<cql3::column_identifier::raw>> group_by_columns);
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override {
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override {
         return prepare(db, stats, false);
     }
-    std::unique_ptr<prepared> prepare(database& db, cql_stats& stats, bool for_view);
+    std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats, bool for_view);
 private:
     void maybe_jsonize_select_clause(database& db, schema_ptr schema);
     ::shared_ptr<restrictions::statement_restrictions> prepare_restrictions(
         database& db,
         schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names,
+        variable_specifications& bound_names,
         ::shared_ptr<selection::selection> selection,
-        bool for_view = false);
+        bool for_view = false,
+        bool allow_filtering = false);
 
     /** Returns a ::shared_ptr<term> for the limit or null if no limit is set */
-    ::shared_ptr<term> prepare_limit(database& db, ::shared_ptr<variable_specifications> bound_names);
+    ::shared_ptr<term> prepare_limit(database& db, variable_specifications& bound_names, ::shared_ptr<term::raw> limit);
 
-    static void verify_ordering_is_allowed(::shared_ptr<restrictions::statement_restrictions> restrictions);
+    static void verify_ordering_is_allowed(const restrictions::statement_restrictions& restrictions);
 
-    static void validate_distinct_selection(schema_ptr schema,
-        ::shared_ptr<selection::selection> selection,
-        ::shared_ptr<restrictions::statement_restrictions> restrictions);
+    static void validate_distinct_selection(const schema& schema,
+        const selection::selection& selection,
+        const restrictions::statement_restrictions& restrictions);
 
-    void handle_unrecognized_ordering_column(::shared_ptr<column_identifier> column);
+    void handle_unrecognized_ordering_column(const column_identifier& column) const;
 
-    select_statement::ordering_comparator_type get_ordering_comparator(schema_ptr schema,
-        ::shared_ptr<selection::selection> selection,
-        ::shared_ptr<restrictions::statement_restrictions> restrictions);
+    select_statement::ordering_comparator_type get_ordering_comparator(const schema& schema,
+        selection::selection& selection,
+        const restrictions::statement_restrictions& restrictions);
 
-    bool is_reversed(schema_ptr schema);
+    bool is_reversed(const schema& schema) const;
 
     /** If ALLOW FILTERING was not specified, this verifies that it is not needed */
-    void check_needs_filtering(::shared_ptr<restrictions::statement_restrictions> restrictions);
+    void check_needs_filtering(const restrictions::statement_restrictions& restrictions);
 
-    bool contains_alias(::shared_ptr<column_identifier> name);
+    void ensure_filtering_columns_retrieval(database& db,
+                                            selection::selection& selection,
+                                            const restrictions::statement_restrictions& restrictions);
 
-    ::shared_ptr<column_specification> limit_receiver();
+    /// Returns indices of GROUP BY cells in fetched rows.
+    std::vector<size_t> prepare_group_by(const schema& schema, selection::selection& selection) const;
+
+    bool contains_alias(const column_identifier& name) const;
+
+    lw_shared_ptr<column_specification> limit_receiver(bool per_partition = false);
 
 #if 0
     public:

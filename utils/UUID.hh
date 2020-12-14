@@ -28,9 +28,9 @@
 #include <array>
 #include <iosfwd>
 
-#include "core/sstring.hh"
-#include "core/print.hh"
-#include "net/byteorder.hh"
+#include <seastar/core/sstring.hh>
+#include <seastar/core/print.hh>
+#include <seastar/net/byteorder.hh>
 #include "bytes.hh"
 #include "hashing.hh"
 #include "utils/serialization.hh"
@@ -59,11 +59,15 @@ public:
         return (most_sig_bits >> 12) & 0xf;
     }
 
+    bool is_timestamp() const {
+        return version() == 1;
+    }
+
     int64_t timestamp() const {
         //if (version() != 1) {
         //     throw new UnsupportedOperationException("Not a time-based UUID");
         //}
-        assert(version() == 1);
+        assert(is_timestamp());
 
         return ((most_sig_bits & 0xFFF) << 48) |
                (((most_sig_bits >> 16) & 0xFFFF) << 32) |
@@ -74,7 +78,7 @@ public:
     // This matches Java's UUID.toString() actual implementation. Note that
     // that method's documentation suggest something completely different!
     sstring to_sstring() const {
-        return sprint("%08x-%04x-%04x-%04x-%012x",
+        return format("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
                 ((uint64_t)most_sig_bits >> 32),
                 ((uint64_t)most_sig_bits >> 16 & 0xffff),
                 ((uint64_t)most_sig_bits & 0xffff),

@@ -74,6 +74,11 @@ private:
      */
     uint32_t _number_of_aggregate_factories;
 
+    /**
+     * The number of factories that are only for post processing.
+     */
+    uint32_t _number_of_factories_for_post_processing;
+
 public:
     /**
      * Creates a new <code>SelectorFactories</code> instance and collect the column definitions.
@@ -94,14 +99,13 @@ public:
     selector_factories(std::vector<::shared_ptr<selectable>> selectables,
             database& db, schema_ptr schema, std::vector<const column_definition*>& defs);
 public:
-    bool uses_function(const sstring& ks_name, const sstring& function_name) const;
-
     /**
-     * Adds a new <code>Selector.Factory</code> for a column that is needed only for ORDER BY purposes.
+     * Adds a new <code>Selector.Factory</code> for a column that is needed only for ORDER BY or post
+     * processing purposes.
      * @param def the column that is needed for ordering
      * @param index the index of the column definition in the Selection's list of columns
      */
-    void add_selector_for_ordering(const column_definition& def, uint32_t index);
+    void add_selector_for_post_processing(const column_definition& def, uint32_t index);
 
     /**
      * Checks if this <code>SelectorFactories</code> contains only factories for aggregates.
@@ -111,7 +115,7 @@ public:
      */
     bool contains_only_aggregate_functions() const {
         auto size = _factories.size();
-        return size != 0 && _number_of_aggregate_factories == size;
+        return size != 0 && _number_of_aggregate_factories  == (size - _number_of_factories_for_post_processing);
     }
 
     /**

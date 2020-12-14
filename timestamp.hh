@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <limits>
 #include <chrono>
+#include <string>
 #include "clocks-impl.hh"
 
 namespace api {
@@ -57,3 +58,6 @@ timestamp_type new_timestamp() {
 }
 
 }
+
+/* For debugging and log messages. */
+std::string format_timestamp(api::timestamp_type);

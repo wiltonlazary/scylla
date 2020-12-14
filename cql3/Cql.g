@@ -43,12 +43,14 @@ options {
 #include "cql3/statements/create_table_statement.hh"
 #include "cql3/statements/create_view_statement.hh"
 #include "cql3/statements/create_type_statement.hh"
+#include "cql3/statements/create_function_statement.hh"
 #include "cql3/statements/drop_type_statement.hh"
 #include "cql3/statements/alter_type_statement.hh"
 #include "cql3/statements/property_definitions.hh"
 #include "cql3/statements/drop_index_statement.hh"
 #include "cql3/statements/drop_table_statement.hh"
 #include "cql3/statements/drop_view_statement.hh"
+#include "cql3/statements/drop_function_statement.hh"
 #include "cql3/statements/truncate_statement.hh"
 #include "cql3/statements/raw/update_statement.hh"
 #include "cql3/statements/raw/insert_statement.hh"
@@ -91,7 +93,8 @@ options {
 #include "cql3/ut_name.hh"
 #include "cql3/functions/function_name.hh"
 #include "cql3/functions/function_call.hh"
-#include "core/sstring.hh"
+#include "cql3/expr/expression.hh"
+#include <seastar/core/sstring.hh>
 #include "CqlLexer.hpp"
 
 #include <algorithm>
@@ -103,8 +106,8 @@ options {
 using namespace cql3::statements;
 using namespace cql3::selection;
 using cql3::cql3_type;
-using conditions_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,::shared_ptr<cql3::column_condition::raw>>>;
-using operations_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,::shared_ptr<cql3::operation::raw_update>>>;
+using conditions_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,lw_shared_ptr<cql3::column_condition::raw>>>;
+using operations_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, std::unique_ptr<cql3::operation::raw_update>>>;
 
 // ANTLR forces us to define a default-initialized return value
 // for every rule (e.g. [returns ut_name name]), but not every type
@@ -115,7 +118,7 @@ using operations_type = std::vector<std::pair<::shared_ptr<cql3::column_identifi
 // problem.  It is up to the user to ensure it is actually assigned to. 
 template <typename T>
 struct uninitialized {
-    std::experimental::optional<T> _val;
+    std::optional<T> _val;
     uninitialized() = default;
     uninitialized(const uninitialized&) = default;
     uninitialized(uninitialized&&) = default;
@@ -125,6 +128,7 @@ struct uninitialized {
     uninitialized& operator=(uninitialized&&) = default;
     operator const T&() const & { return check(), *_val; }
     operator T&&() && { return check(), std::move(*_val); }
+    operator std::optional<T>&&() && { return check(), std::move(_val); }
     void check() const { if (!_val) { throw std::runtime_error("not intitialized"); } }
 };
 
@@ -242,19 +246,22 @@ struct uninitialized {
         return res;
     }
 
-    bool convert_boolean_literal(stdx::string_view s) {
-        std::string lower_s(s.size(), '\0');
+    sstring to_lower(std::string_view s) {
+        sstring lower_s(s.size(), '\0');
         std::transform(s.cbegin(), s.cend(), lower_s.begin(), &::tolower);
-        return lower_s == "true";
+        return lower_s;
     }
 
-    void add_raw_update(std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,::shared_ptr<cql3::operation::raw_update>>>& operations,
-        ::shared_ptr<cql3::column_identifier::raw> key, ::shared_ptr<cql3::operation::raw_update> update)
+    bool convert_boolean_literal(std::string_view s) {
+        return to_lower(s) == "true";
+    }
+
+    void add_raw_update(std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, std::unique_ptr<cql3::operation::raw_update>>>& operations,
+        ::shared_ptr<cql3::column_identifier::raw> key, std::unique_ptr<cql3::operation::raw_update> update)
     {
         for (auto&& p : operations) {
             if (*p.first == *key && !p.second->is_compatible_with(update)) {
-                // \%s is escaped for antlr
-                add_recognition_error(sprint("Multiple incompatible setting of column \%s", *key));
+                add_recognition_error(format("Multiple incompatible setting of column {}", *key));
             }
         }
         operations.emplace_back(std::move(key), std::move(update));
@@ -313,63 +320,63 @@ struct uninitialized {
 
 /** STATEMENTS **/
 
-query returns [shared_ptr<raw::parsed_statement> stmnt]
-    : st=cqlStatement (';')* EOF { $stmnt = st; }
+query returns [std::unique_ptr<raw::parsed_statement> stmnt]
+    : st=cqlStatement (';')* EOF { $stmnt = std::move(st); }
     ;
 
-cqlStatement returns [shared_ptr<raw::parsed_statement> stmt]
+cqlStatement returns [std::unique_ptr<raw::parsed_statement> stmt]
     @after{ if (stmt) { stmt->set_bound_variables(_bind_variables); } }
-    : st1= selectStatement             { $stmt = st1; }
-    | st2= insertStatement             { $stmt = st2; }
-    | st3= updateStatement             { $stmt = st3; }
-    | st4= batchStatement              { $stmt = st4; }
-    | st5= deleteStatement             { $stmt = st5; }
-    | st6= useStatement                { $stmt = st6; }
-    | st7= truncateStatement           { $stmt = st7; }
-    | st8= createKeyspaceStatement     { $stmt = st8; }
-    | st9= createTableStatement        { $stmt = st9; }
-    | st10=createIndexStatement        { $stmt = st10; }
-    | st11=dropKeyspaceStatement       { $stmt = st11; }
-    | st12=dropTableStatement          { $stmt = st12; }
-    | st13=dropIndexStatement          { $stmt = st13; }
-    | st14=alterTableStatement         { $stmt = st14; }
-    | st15=alterKeyspaceStatement      { $stmt = st15; }
-    | st16=grantStatement              { $stmt = st16; }
-    | st17=revokeStatement             { $stmt = st17; }
-    | st18=listPermissionsStatement    { $stmt = st18; }
-    | st19=createUserStatement         { $stmt = st19; }
-    | st20=alterUserStatement          { $stmt = st20; }
-    | st21=dropUserStatement           { $stmt = st21; }
-    | st22=listUsersStatement          { $stmt = st22; }
+    : st1= selectStatement             { $stmt = std::move(st1); }
+    | st2= insertStatement             { $stmt = std::move(st2); }
+    | st3= updateStatement             { $stmt = std::move(st3); }
+    | st4= batchStatement              { $stmt = std::move(st4); }
+    | st5= deleteStatement             { $stmt = std::move(st5); }
+    | st6= useStatement                { $stmt = std::move(st6); }
+    | st7= truncateStatement           { $stmt = std::move(st7); }
+    | st8= createKeyspaceStatement     { $stmt = std::move(st8); }
+    | st9= createTableStatement        { $stmt = std::move(st9); }
+    | st10=createIndexStatement        { $stmt = std::move(st10); }
+    | st11=dropKeyspaceStatement       { $stmt = std::move(st11); }
+    | st12=dropTableStatement          { $stmt = std::move(st12); }
+    | st13=dropIndexStatement          { $stmt = std::move(st13); }
+    | st14=alterTableStatement         { $stmt = std::move(st14); }
+    | st15=alterKeyspaceStatement      { $stmt = std::move(st15); }
+    | st16=grantStatement              { $stmt = std::move(st16); }
+    | st17=revokeStatement             { $stmt = std::move(st17); }
+    | st18=listPermissionsStatement    { $stmt = std::move(st18); }
+    | st19=createUserStatement         { $stmt = std::move(st19); }
+    | st20=alterUserStatement          { $stmt = std::move(st20); }
+    | st21=dropUserStatement           { $stmt = std::move(st21); }
+    | st22=listUsersStatement          { $stmt = std::move(st22); }
 #if 0
     | st23=createTriggerStatement      { $stmt = st23; }
     | st24=dropTriggerStatement        { $stmt = st24; }
 #endif
-    | st25=createTypeStatement         { $stmt = st25; }
-    | st26=alterTypeStatement          { $stmt = st26; }
-    | st27=dropTypeStatement           { $stmt = st27; }
+    | st25=createTypeStatement         { $stmt = std::move(st25); }
+    | st26=alterTypeStatement          { $stmt = std::move(st26); }
+    | st27=dropTypeStatement           { $stmt = std::move(st27); }
+    | st28=createFunctionStatement     { $stmt = std::move(st28); }
+    | st29=dropFunctionStatement       { $stmt = std::move(st29); }
 #if 0
-    | st28=createFunctionStatement     { $stmt = st28; }
-    | st29=dropFunctionStatement       { $stmt = st29; }
     | st30=createAggregateStatement    { $stmt = st30; }
     | st31=dropAggregateStatement      { $stmt = st31; }
 #endif
-    | st32=createViewStatement         { $stmt = st32; }
-    | st33=alterViewStatement          { $stmt = st33; }
-    | st34=dropViewStatement           { $stmt = st34; }
-    | st35=listRolesStatement          { $stmt = st35; }
-    | st36=grantRoleStatement          { $stmt = st36; }
-    | st37=revokeRoleStatement         { $stmt = st37; }
-    | st38=dropRoleStatement           { $stmt = st38; }
-    | st39=createRoleStatement         { $stmt = st39; }
-    | st40=alterRoleStatement          { $stmt = st40; }
+    | st32=createViewStatement         { $stmt = std::move(st32); }
+    | st33=alterViewStatement          { $stmt = std::move(st33); }
+    | st34=dropViewStatement           { $stmt = std::move(st34); }
+    | st35=listRolesStatement          { $stmt = std::move(st35); }
+    | st36=grantRoleStatement          { $stmt = std::move(st36); }
+    | st37=revokeRoleStatement         { $stmt = std::move(st37); }
+    | st38=dropRoleStatement           { $stmt = std::move(st38); }
+    | st39=createRoleStatement         { $stmt = std::move(st39); }
+    | st40=alterRoleStatement          { $stmt = std::move(st40); }
     ;
 
 /*
  * USE <KEYSPACE>;
  */
-useStatement returns [::shared_ptr<raw::use_statement> stmt]
-    : K_USE ks=keyspaceName { $stmt = ::make_shared<raw::use_statement>(ks); }
+useStatement returns [std::unique_ptr<raw::use_statement> stmt]
+    : K_USE ks=keyspaceName { $stmt = std::make_unique<raw::use_statement>(ks); }
     ;
 
 /**
@@ -378,13 +385,15 @@ useStatement returns [::shared_ptr<raw::use_statement> stmt]
  * WHERE KEY = "key1" AND COL > 1 AND COL < 100
  * LIMIT <NUMBER>;
  */
-selectStatement returns [shared_ptr<raw::select_statement> expr]
+selectStatement returns [std::unique_ptr<raw::select_statement> expr]
     @init {
         bool is_distinct = false;
         ::shared_ptr<cql3::term::raw> limit;
+        ::shared_ptr<cql3::term::raw> per_partition_limit;
         raw::select_statement::parameters::orderings_type orderings;
         bool allow_filtering = false;
         bool is_json = false;
+        bool bypass_cache = false;
     }
     : K_SELECT (
                 ( K_JSON { is_json = true; } )?
@@ -393,13 +402,17 @@ selectStatement returns [shared_ptr<raw::select_statement> expr]
                )
       K_FROM cf=columnFamilyName
       ( K_WHERE wclause=whereClause )?
+      ( K_GROUP K_BY gbcolumns=listOfIdentifiers)?
       ( K_ORDER K_BY orderByClause[orderings] ( ',' orderByClause[orderings] )* )?
+      ( K_PER K_PARTITION K_LIMIT rows=intValue { per_partition_limit = rows; } )?
       ( K_LIMIT rows=intValue { limit = rows; } )?
       ( K_ALLOW K_FILTERING  { allow_filtering = true; } )?
+      ( K_BYPASS K_CACHE { bypass_cache = true; })?
       {
-          auto params = ::make_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering, is_json);
-          $expr = ::make_shared<raw::select_statement>(std::move(cf), std::move(params),
-            std::move(sclause), std::move(wclause), std::move(limit));
+          auto params = make_lw_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering, is_json, bypass_cache);
+          $expr = std::make_unique<raw::select_statement>(std::move(cf), std::move(params),
+            std::move(sclause), std::move(wclause), std::move(limit), std::move(per_partition_limit),
+            std::move(gbcolumns));
       }
     ;
 
@@ -464,22 +477,23 @@ jsonValue returns [::shared_ptr<cql3::term::raw> value]
  * USING TIMESTAMP <long>;
  *
  */
-insertStatement returns [::shared_ptr<raw::modification_statement> expr]
+insertStatement returns [std::unique_ptr<raw::modification_statement> expr]
     @init {
-        auto attrs = ::make_shared<cql3::attributes::raw>();
+        auto attrs = std::make_unique<cql3::attributes::raw>();
         std::vector<::shared_ptr<cql3::column_identifier::raw>> column_names;
         std::vector<::shared_ptr<cql3::term::raw>> values;
         bool if_not_exists = false;
+        bool default_unset = false;
         ::shared_ptr<cql3::term::raw> json_value;
     }
     : K_INSERT K_INTO cf=columnFamilyName
-          '(' c1=cident { column_names.push_back(c1); }  ( ',' cn=cident { column_names.push_back(cn); } )* ')'
-        ( K_VALUES
-              '(' v1=term { values.push_back(v1); } ( ',' vn=term { values.push_back(vn); } )* ')'
+        ('(' c1=cident { column_names.push_back(c1); }  ( ',' cn=cident { column_names.push_back(cn); } )* ')'
+            K_VALUES
+            '(' v1=term { values.push_back(v1); } ( ',' vn=term { values.push_back(vn); } )* ')'
             ( K_IF K_NOT K_EXISTS { if_not_exists = true; } )?
             ( usingClause[attrs] )?
               {
-              $expr = ::make_shared<raw::insert_statement>(std::move(cf),
+              $expr = std::make_unique<raw::insert_statement>(std::move(cf),
                                                        std::move(attrs),
                                                        std::move(column_names),
                                                        std::move(values),
@@ -487,22 +501,24 @@ insertStatement returns [::shared_ptr<raw::modification_statement> expr]
               }
         | K_JSON
           json_token=jsonValue { json_value = $json_token.value; }
+            ( K_DEFAULT K_UNSET { default_unset = true; } | K_DEFAULT K_NULL )?
             ( K_IF K_NOT K_EXISTS { if_not_exists = true; } )?
             ( usingClause[attrs] )?
               {
-              $expr = ::make_shared<raw::insert_json_statement>(std::move(cf),
+              $expr = std::make_unique<raw::insert_json_statement>(std::move(cf),
                                                        std::move(attrs),
                                                        std::move(json_value),
-                                                       if_not_exists);
+                                                       if_not_exists,
+                                                       default_unset);
               }
         )
     ;
 
-usingClause[::shared_ptr<cql3::attributes::raw> attrs]
+usingClause[std::unique_ptr<cql3::attributes::raw>& attrs]
     : K_USING usingClauseObjective[attrs] ( K_AND usingClauseObjective[attrs] )*
     ;
 
-usingClauseObjective[::shared_ptr<cql3::attributes::raw> attrs]
+usingClauseObjective[std::unique_ptr<cql3::attributes::raw>& attrs]
     : K_TIMESTAMP ts=intValue { attrs->timestamp = ts; }
     | K_TTL t=intValue { attrs->time_to_live = t; }
     ;
@@ -513,22 +529,24 @@ usingClauseObjective[::shared_ptr<cql3::attributes::raw> attrs]
  * SET name1 = value1, name2 = value2
  * WHERE key = value;
  */
-updateStatement returns [::shared_ptr<raw::update_statement> expr]
+updateStatement returns [std::unique_ptr<raw::update_statement> expr]
     @init {
-        auto attrs = ::make_shared<cql3::attributes::raw>();
-        std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, ::shared_ptr<cql3::operation::raw_update>>> operations;
+        bool if_exists = false;
+        auto attrs = std::make_unique<cql3::attributes::raw>();
+        std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, std::unique_ptr<cql3::operation::raw_update>>> operations;
     }
     : K_UPDATE cf=columnFamilyName
       ( usingClause[attrs] )?
       K_SET columnOperation[operations] (',' columnOperation[operations])*
       K_WHERE wclause=whereClause
-      ( K_IF conditions=updateConditions )?
+      ( K_IF (K_EXISTS{ if_exists = true; } | conditions=updateConditions) )?
       {
-          return ::make_shared<raw::update_statement>(std::move(cf),
+          return std::make_unique<raw::update_statement>(std::move(cf),
                                                   std::move(attrs),
                                                   std::move(operations),
                                                   std::move(wclause),
-                                                  std::move(conditions));
+                                                  std::move(conditions),
+                                                  if_exists);
      }
     ;
 
@@ -543,10 +561,10 @@ updateConditions returns [conditions_type conditions]
  * WHERE KEY = keyname
    [IF (EXISTS | name = value, ...)];
  */
-deleteStatement returns [::shared_ptr<raw::delete_statement> expr]
+deleteStatement returns [std::unique_ptr<raw::delete_statement> expr]
     @init {
-        auto attrs = ::make_shared<cql3::attributes::raw>();
-        std::vector<::shared_ptr<cql3::operation::raw_deletion>> column_deletions;
+        auto attrs = std::make_unique<cql3::attributes::raw>();
+        std::vector<std::unique_ptr<cql3::operation::raw_deletion>> column_deletions;
         bool if_exists = false;
     }
     : K_DELETE ( dels=deleteSelection { column_deletions = std::move(dels); } )?
@@ -555,7 +573,7 @@ deleteStatement returns [::shared_ptr<raw::delete_statement> expr]
       K_WHERE wclause=whereClause
       ( K_IF ( K_EXISTS { if_exists = true; } | conditions=updateConditions ))?
       {
-          return ::make_shared<raw::delete_statement>(cf,
+          return std::make_unique<raw::delete_statement>(cf,
                                             std::move(attrs),
                                             std::move(column_deletions),
                                             std::move(wclause),
@@ -564,17 +582,18 @@ deleteStatement returns [::shared_ptr<raw::delete_statement> expr]
       }
     ;
 
-deleteSelection returns [std::vector<::shared_ptr<cql3::operation::raw_deletion>> operations]
+deleteSelection returns [std::vector<std::unique_ptr<cql3::operation::raw_deletion>> operations]
     : t1=deleteOp { $operations.emplace_back(std::move(t1)); }
       (',' tN=deleteOp { $operations.emplace_back(std::move(tN)); })*
     ;
 
-deleteOp returns [::shared_ptr<cql3::operation::raw_deletion> op]
-    : c=cident                { $op = ::make_shared<cql3::operation::column_deletion>(std::move(c)); }
-    | c=cident '[' t=term ']' { $op = ::make_shared<cql3::operation::element_deletion>(std::move(c), std::move(t)); }
+deleteOp returns [std::unique_ptr<cql3::operation::raw_deletion> op]
+    : c=cident                { $op = std::make_unique<cql3::operation::column_deletion>(std::move(c)); }
+    | c=cident '[' t=term ']' { $op = std::make_unique<cql3::operation::element_deletion>(std::move(c), std::move(t)); }
+    | c=cident '.' field=ident { $op = std::make_unique<cql3::operation::field_deletion>(std::move(c), std::move(field)); }
     ;
 
-usingClauseDelete[::shared_ptr<cql3::attributes::raw> attrs]
+usingClauseDelete[std::unique_ptr<cql3::attributes::raw>& attrs]
     : K_USING K_TIMESTAMP ts=intValue { attrs->timestamp = ts; }
     ;
 
@@ -602,12 +621,12 @@ usingClauseDelete[::shared_ptr<cql3::attributes::raw> attrs]
  *   ...
  * APPLY BATCH
  */
-batchStatement returns [shared_ptr<cql3::statements::raw::batch_statement> expr]
+batchStatement returns [std::unique_ptr<cql3::statements::raw::batch_statement> expr]
     @init {
         using btype = cql3::statements::raw::batch_statement::type; 
         btype type = btype::LOGGED;
-        std::vector<shared_ptr<cql3::statements::raw::modification_statement>> statements;
-        auto attrs = make_shared<cql3::attributes::raw>();
+        std::vector<std::unique_ptr<cql3::statements::raw::modification_statement>> statements;
+        auto attrs = std::make_unique<cql3::attributes::raw>();
     }
     : K_BEGIN
       ( K_UNLOGGED { type = btype::UNLOGGED; } | K_COUNTER { type = btype::COUNTER; } )?
@@ -615,14 +634,14 @@ batchStatement returns [shared_ptr<cql3::statements::raw::batch_statement> expr]
           ( s=batchStatementObjective ';'? { statements.push_back(std::move(s)); } )*
       K_APPLY K_BATCH
       {
-          $expr = ::make_shared<cql3::statements::raw::batch_statement>(type, std::move(attrs), std::move(statements));
+          $expr = std::make_unique<cql3::statements::raw::batch_statement>(type, std::move(attrs), std::move(statements));
       }
     ;
 
-batchStatementObjective returns [shared_ptr<cql3::statements::raw::modification_statement> statement]
-    : i=insertStatement  { $statement = i; }
-    | u=updateStatement  { $statement = u; }
-    | d=deleteStatement  { $statement = d; }
+batchStatementObjective returns [std::unique_ptr<cql3::statements::raw::modification_statement> statement]
+    : i=insertStatement  { $statement = std::move(i); }
+    | u=updateStatement  { $statement = std::move(u); }
+    | d=deleteStatement  { $statement = std::move(d); }
     ;
 
 #if 0
@@ -674,65 +693,67 @@ dropAggregateStatement returns [DropAggregateStatement expr]
       )?
       { $expr = new DropAggregateStatement(fn, argsTypes, argsPresent, ifExists); }
     ;
+#endif
 
-createFunctionStatement returns [CreateFunctionStatement expr]
+createFunctionStatement returns [std::unique_ptr<cql3::statements::create_function_statement> expr]
     @init {
-        boolean orReplace = false;
-        boolean ifNotExists = false;
+        bool or_replace = false;
+        bool if_not_exists = false;
 
-        boolean deterministic = true;
-        List<ColumnIdentifier> argsNames = new ArrayList<>();
-        List<CQL3Type.Raw> argsTypes = new ArrayList<>();
+        std::vector<shared_ptr<cql3::column_identifier>> arg_names;
+        std::vector<shared_ptr<cql3_type::raw>> arg_types;
+        bool called_on_null_input = false;
     }
-    : K_CREATE (K_OR K_REPLACE { orReplace = true; })?
-      ((K_NON { deterministic = false; })? K_DETERMINISTIC)?
-      K_FUNCTION
-      (K_IF K_NOT K_EXISTS { ifNotExists = true; })?
+    : K_CREATE
+        // "OR REPLACE" and "IF NOT EXISTS" cannot be used together
+        ((K_OR K_REPLACE { or_replace = true; } K_FUNCTION)
+         | (K_FUNCTION K_IF K_NOT K_EXISTS { if_not_exists = true; })
+         | K_FUNCTION)
       fn=functionName
       '('
         (
-          k=ident v=comparatorType { argsNames.add(k); argsTypes.add(v); }
-          ( ',' k=ident v=comparatorType { argsNames.add(k); argsTypes.add(v); } )*
+          k=ident v=comparatorType { arg_names.push_back(k); arg_types.push_back(v); }
+          ( ',' k=ident v=comparatorType { arg_names.push_back(k); arg_types.push_back(v); } )*
         )?
       ')'
+      ( (K_RETURNS K_NULL) | (K_CALLED { called_on_null_input = true; })) K_ON K_NULL K_INPUT
       K_RETURNS rt = comparatorType
       K_LANGUAGE language = IDENT
       K_AS body = STRING_LITERAL
-      { $expr = new CreateFunctionStatement(fn, $language.text.toLowerCase(), $body.text, deterministic, argsNames, argsTypes, rt, orReplace, ifNotExists); }
+      { $expr = std::make_unique<cql3::statements::create_function_statement>(std::move(fn), to_lower($language.text), $body.text, std::move(arg_names), std::move(arg_types), std::move(rt), called_on_null_input, or_replace, if_not_exists); }
     ;
 
-dropFunctionStatement returns [DropFunctionStatement expr]
+dropFunctionStatement returns [std::unique_ptr<cql3::statements::drop_function_statement> expr]
     @init {
-        boolean ifExists = false;
-        List<CQL3Type.Raw> argsTypes = new ArrayList<>();
-        boolean argsPresent = false;
+        bool if_exists = false;
+        std::vector<shared_ptr<cql3_type::raw>> arg_types;
+        bool args_present = false;
     }
     : K_DROP K_FUNCTION
-      (K_IF K_EXISTS { ifExists = true; } )?
+      (K_IF K_EXISTS { if_exists = true; } )?
       fn=functionName
       (
         '('
           (
-            v=comparatorType { argsTypes.add(v); }
-            ( ',' v=comparatorType { argsTypes.add(v); } )*
+            v=comparatorType { arg_types.push_back(v); }
+            ( ',' v=comparatorType { arg_types.push_back(v); } )*
           )?
         ')'
-        { argsPresent = true; }
+        { args_present = true; }
       )?
-      { $expr = new DropFunctionStatement(fn, argsTypes, argsPresent, ifExists); }
+      { $expr = std::make_unique<cql3::statements::drop_function_statement>(std::move(fn), std::move(arg_types), args_present, if_exists); }
     ;
-#endif
 
 /**
  * CREATE KEYSPACE [IF NOT EXISTS] <KEYSPACE> WITH attr1 = value1 AND attr2 = value2;
  */
-createKeyspaceStatement returns [shared_ptr<cql3::statements::create_keyspace_statement> expr]
+createKeyspaceStatement returns [std::unique_ptr<cql3::statements::create_keyspace_statement> expr]
     @init {
         auto attrs = make_shared<cql3::statements::ks_prop_defs>();
         bool if_not_exists = false;
     }
     : K_CREATE K_KEYSPACE (K_IF K_NOT K_EXISTS { if_not_exists = true; } )? ks=keyspaceName
-      K_WITH properties[attrs] { $expr = make_shared<cql3::statements::create_keyspace_statement>(ks, attrs, if_not_exists); }
+      K_WITH properties[*attrs] { $expr = std::make_unique<cql3::statements::create_keyspace_statement>(ks, attrs, if_not_exists); }
     ;
 
 /**
@@ -742,33 +763,33 @@ createKeyspaceStatement returns [shared_ptr<cql3::statements::create_keyspace_st
  *     <name3> <type>
  * ) WITH <property> = <value> AND ...;
  */
-createTableStatement returns [shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
+createTableStatement returns [std::unique_ptr<cql3::statements::create_table_statement::raw_statement> expr]
     @init { bool if_not_exists = false; }
     : K_CREATE K_COLUMNFAMILY (K_IF K_NOT K_EXISTS { if_not_exists = true; } )?
-      cf=columnFamilyName { $expr = make_shared<cql3::statements::create_table_statement::raw_statement>(cf, if_not_exists); }
-      cfamDefinition[expr]
+      cf=columnFamilyName { $expr = std::make_unique<cql3::statements::create_table_statement::raw_statement>(cf, if_not_exists); }
+      cfamDefinition[*expr]
     ;
 
-cfamDefinition[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
+cfamDefinition[cql3::statements::create_table_statement::raw_statement& expr]
     : '(' cfamColumns[expr] ( ',' cfamColumns[expr]? )* ')'
-      ( K_WITH cfamProperty[$expr->properties()] ( K_AND cfamProperty[$expr->properties()] )*)?
+      ( K_WITH cfamProperty[$expr.properties()] ( K_AND cfamProperty[$expr.properties()] )*)?
     ;
 
-cfamColumns[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
+cfamColumns[cql3::statements::create_table_statement::raw_statement& expr]
     @init { bool is_static=false; }
-    : k=ident v=comparatorType (K_STATIC {is_static = true;})? { $expr->add_definition(k, v, is_static); }
-        (K_PRIMARY K_KEY { $expr->add_key_aliases(std::vector<shared_ptr<cql3::column_identifier>>{k}); })?
-    | K_PRIMARY K_KEY '(' pkDef[expr] (',' c=ident { $expr->add_column_alias(c); } )* ')'
+    : k=ident v=comparatorType (K_STATIC {is_static = true;})? { $expr.add_definition(k, v, is_static); }
+        (K_PRIMARY K_KEY { $expr.add_key_aliases(std::vector<shared_ptr<cql3::column_identifier>>{k}); })?
+    | K_PRIMARY K_KEY '(' pkDef[expr] (',' c=ident { $expr.add_column_alias(c); } )* ')'
     ;
 
-pkDef[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
+pkDef[cql3::statements::create_table_statement::raw_statement& expr]
     @init { std::vector<shared_ptr<cql3::column_identifier>> l; }
-    : k=ident { $expr->add_key_aliases(std::vector<shared_ptr<cql3::column_identifier>>{k}); }
-    | '(' k1=ident { l.push_back(k1); } ( ',' kn=ident { l.push_back(kn); } )* ')' { $expr->add_key_aliases(l); }
+    : k=ident { $expr.add_key_aliases(std::vector<shared_ptr<cql3::column_identifier>>{k}); }
+    | '(' k1=ident { l.push_back(k1); } ( ',' kn=ident { l.push_back(kn); } )* ')' { $expr.add_key_aliases(l); }
     ;
 
 cfamProperty[cql3::statements::cf_properties& expr]
-    : property[$expr.properties()]
+    : property[*$expr.properties()]
     | K_COMPACT K_STORAGE { $expr.set_compact_storage(); }
     | K_CLUSTERING K_ORDER K_BY '(' cfamOrdering[expr] (',' cfamOrdering[expr])* ')'
     ;
@@ -786,15 +807,15 @@ cfamOrdering[cql3::statements::cf_properties& expr]
  *    ....
  * )
  */
-createTypeStatement returns [::shared_ptr<create_type_statement> expr]
+createTypeStatement returns [std::unique_ptr<create_type_statement> expr]
     @init { bool if_not_exists = false; }
     : K_CREATE K_TYPE (K_IF K_NOT K_EXISTS { if_not_exists = true; } )?
-         tn=userTypeName { $expr = ::make_shared<create_type_statement>(tn, if_not_exists); }
-         '(' typeColumns[expr] ( ',' typeColumns[expr]? )* ')'
+         tn=userTypeName { $expr = std::make_unique<create_type_statement>(tn, if_not_exists); }
+         '(' typeColumns[*expr] ( ',' typeColumns[*expr]? )* ')'
     ;
 
-typeColumns[::shared_ptr<create_type_statement> expr]
-    : k=ident v=comparatorType { $expr->add_definition(k, v); }
+typeColumns[create_type_statement& expr]
+    : k=ident v=comparatorType { $expr.add_definition(k, v); }
     ;
 
 
@@ -802,7 +823,7 @@ typeColumns[::shared_ptr<create_type_statement> expr]
  * CREATE INDEX [IF NOT EXISTS] [indexName] ON <columnFamily> (<columnName>);
  * CREATE CUSTOM INDEX [IF NOT EXISTS] [indexName] ON <columnFamily> (<columnName>) USING <indexClass>;
  */
-createIndexStatement returns [::shared_ptr<create_index_statement> expr]
+createIndexStatement returns [std::unique_ptr<create_index_statement> expr]
     @init {
         auto props = make_shared<index_prop_defs>();
         bool if_not_exists = false;
@@ -810,17 +831,22 @@ createIndexStatement returns [::shared_ptr<create_index_statement> expr]
         std::vector<::shared_ptr<index_target::raw>> targets;
     }
     : K_CREATE (K_CUSTOM { props->is_custom = true; })? K_INDEX (K_IF K_NOT K_EXISTS { if_not_exists = true; } )?
-        (idxName[name])? K_ON cf=columnFamilyName '(' (target1=indexIdent { targets.emplace_back(target1); } (',' target2=indexIdent { targets.emplace_back(target2); } )*)? ')'
+        (idxName[*name])? K_ON cf=columnFamilyName '(' (target1=indexIdent { targets.emplace_back(target1); } (',' target2=indexIdent { targets.emplace_back(target2); } )*)? ')'
         (K_USING cls=STRING_LITERAL { props->custom_class = sstring{$cls.text}; })?
-        (K_WITH properties[props])?
-      { $expr = ::make_shared<create_index_statement>(cf, name, targets, props, if_not_exists); }
+        (K_WITH properties[*props])?
+      { $expr = std::make_unique<create_index_statement>(cf, name, targets, props, if_not_exists); }
     ;
 
 indexIdent returns [::shared_ptr<index_target::raw> id]
+    @init {
+        std::vector<::shared_ptr<cql3::column_identifier::raw>> columns;
+    }
     : c=cident                   { $id = index_target::raw::values_of(c); }
     | K_KEYS '(' c=cident ')'    { $id = index_target::raw::keys_of(c); }
     | K_ENTRIES '(' c=cident ')' { $id = index_target::raw::keys_and_values_of(c); }
     | K_FULL '(' c=cident ')'    { $id = index_target::raw::full_collection(c); }
+    | '(' c1=cident { columns.push_back(c1); } ( ',' cn=cident { columns.push_back(cn); } )* ')' { $id = index_target::raw::columns(std::move(columns)); }
+
     ;
 
 /**
@@ -831,7 +857,7 @@ indexIdent returns [::shared_ptr<index_target::raw> id]
  *  PRIMARY KEY (<pkColumns>)
  *  WITH <property> = <value> AND ...;
  */
-createViewStatement returns [::shared_ptr<create_view_statement> expr]
+createViewStatement returns [std::unique_ptr<create_view_statement> expr]
     @init {
         bool if_not_exists = false;
         std::vector<::shared_ptr<cql3::column_identifier::raw>> partition_keys;
@@ -845,7 +871,7 @@ createViewStatement returns [::shared_ptr<create_view_statement> expr]
     |   '(' k1=cident { partition_keys.push_back(k1); } ( ',' cn=cident { composite_keys.push_back(cn); } )* ')'
         )
         {
-             $expr = ::make_shared<create_view_statement>(
+             $expr = std::make_unique<create_view_statement>(
                 std::move(cf),
                 std::move(basecf),
                 std::move(sclause),
@@ -884,40 +910,57 @@ dropTriggerStatement returns [DropTriggerStatement expr]
 /**
  * ALTER KEYSPACE <KS> WITH <property> = <value>;
  */
-alterKeyspaceStatement returns [shared_ptr<cql3::statements::alter_keyspace_statement> expr]
+alterKeyspaceStatement returns [std::unique_ptr<cql3::statements::alter_keyspace_statement> expr]
     @init {
         auto attrs = make_shared<cql3::statements::ks_prop_defs>();
     }
     : K_ALTER K_KEYSPACE ks=keyspaceName
-        K_WITH properties[attrs] { $expr = make_shared<cql3::statements::alter_keyspace_statement>(ks, attrs); }
+        K_WITH properties[*attrs] { $expr = std::make_unique<cql3::statements::alter_keyspace_statement>(ks, attrs); }
     ;
 
 /**
  * ALTER COLUMN FAMILY <CF> ALTER <column> TYPE <newtype>;
- * ALTER COLUMN FAMILY <CF> ADD <column> <newtype>;
- * ALTER COLUMN FAMILY <CF> DROP <column>;
+ * ALTER COLUMN FAMILY <CF> ADD <column> <newtype>; | ALTER COLUMN FAMILY <CF> ADD (<column> <newtype>,<column1> <newtype1>..... <column n> <newtype n>)
+ * ALTER COLUMN FAMILY <CF> DROP <column>; | ALTER COLUMN FAMILY <CF> DROP ( <column>,<column1>.....<column n>)
  * ALTER COLUMN FAMILY <CF> WITH <property> = <value>;
  * ALTER COLUMN FAMILY <CF> RENAME <column> TO <column>;
  */
-alterTableStatement returns [shared_ptr<alter_table_statement> expr]
+alterTableStatement returns [std::unique_ptr<alter_table_statement> expr]
     @init {
         alter_table_statement::type type;
         auto props = make_shared<cql3::statements::cf_prop_defs>();
+        std::vector<alter_table_statement::column_change> column_changes;
         std::vector<std::pair<shared_ptr<cql3::column_identifier::raw>, shared_ptr<cql3::column_identifier::raw>>> renames;
-        bool is_static = false;
     }
     : K_ALTER K_COLUMNFAMILY cf=columnFamilyName
-          ( K_ALTER id=cident K_TYPE v=comparatorType { type = alter_table_statement::type::alter; }
-          | K_ADD   id=cident v=comparatorType ({ is_static=true; } K_STATIC)? { type = alter_table_statement::type::add; }
-          | K_DROP  id=cident                         { type = alter_table_statement::type::drop; }
-          | K_WITH  properties[props]                 { type = alter_table_statement::type::opts; }
+          ( K_ALTER id=cident K_TYPE v=comparatorType { type = alter_table_statement::type::alter; column_changes.emplace_back(alter_table_statement::column_change{id, v}); }
+          | K_ADD                                     { type = alter_table_statement::type::add; }
+            (          id=cident   v=comparatorType   s=cfisStatic { column_changes.emplace_back(alter_table_statement::column_change{id,  v,  s});  }
+            | '('     id1=cident  v1=comparatorType  s1=cfisStatic { column_changes.emplace_back(alter_table_statement::column_change{id1, v1, s1}); }
+                 (',' idn=cident  vn=comparatorType  sn=cfisStatic { column_changes.emplace_back(alter_table_statement::column_change{idn, vn, sn}); } )* ')'
+            )
+          | K_DROP                                    { type = alter_table_statement::type::drop; }
+            (          id=cident { column_changes.emplace_back(alter_table_statement::column_change{id});  }
+            | '('     id1=cident { column_changes.emplace_back(alter_table_statement::column_change{id1}); }
+                 (',' idn=cident { column_changes.emplace_back(alter_table_statement::column_change{idn}); } )* ')'
+            )
+          | K_WITH  properties[*props]                 { type = alter_table_statement::type::opts; }
           | K_RENAME                                  { type = alter_table_statement::type::rename; }
                id1=cident K_TO toId1=cident { renames.emplace_back(id1, toId1); }
                ( K_AND idn=cident K_TO toIdn=cident { renames.emplace_back(idn, toIdn); } )*
           )
     {
-        $expr = ::make_shared<alter_table_statement>(std::move(cf), type, std::move(id),
-            std::move(v), std::move(props), std::move(renames), is_static);
+        $expr = std::make_unique<alter_table_statement>(std::move(cf), type, std::move(column_changes), std::move(props), std::move(renames));
+    }
+    ;
+
+cfisStatic returns [bool isStaticColumn]
+    @init{
+        bool isStatic = false;
+    }
+    : (K_STATIC { isStatic=true; })?
+    {
+        $isStaticColumn = isStatic;
     }
     ;
 
@@ -926,126 +969,126 @@ alterTableStatement returns [shared_ptr<alter_table_statement> expr]
  * ALTER TYPE <name> ADD <field> <newtype>;
  * ALTER TYPE <name> RENAME <field> TO <newtype> AND ...;
  */
-alterTypeStatement returns [::shared_ptr<alter_type_statement> expr]
+alterTypeStatement returns [std::unique_ptr<alter_type_statement> expr]
     : K_ALTER K_TYPE name=userTypeName
-          ( K_ALTER f=ident K_TYPE v=comparatorType { $expr = ::make_shared<alter_type_statement::add_or_alter>(name, false, f, v); }
-          | K_ADD   f=ident v=comparatorType        { $expr = ::make_shared<alter_type_statement::add_or_alter>(name, true, f, v); }
+          ( K_ALTER f=ident K_TYPE v=comparatorType { $expr = std::make_unique<alter_type_statement::add_or_alter>(name, false, f, v); }
+          | K_ADD   f=ident v=comparatorType        { $expr = std::make_unique<alter_type_statement::add_or_alter>(name, true, f, v); }
           | K_RENAME
-               { $expr = ::make_shared<alter_type_statement::renames>(name); }
-               renames[{ static_pointer_cast<alter_type_statement::renames>($expr) }]
+               { $expr = std::make_unique<alter_type_statement::renames>(name); }
+               renames[{ static_cast<alter_type_statement::renames&>(*$expr) }]
           )
     ;
 
 /**
  * ALTER MATERIALIZED VIEW <CF> WITH <property> = <value>;
  */
-alterViewStatement returns [::shared_ptr<alter_view_statement> expr]
+alterViewStatement returns [std::unique_ptr<alter_view_statement> expr]
     @init {
         auto props = make_shared<cql3::statements::cf_prop_defs>();
     }
-    : K_ALTER K_MATERIALIZED K_VIEW cf=columnFamilyName K_WITH properties[props]
+    : K_ALTER K_MATERIALIZED K_VIEW cf=columnFamilyName K_WITH properties[*props]
     {
-        $expr = ::make_shared<alter_view_statement>(std::move(cf), std::move(props));
+        $expr = std::make_unique<alter_view_statement>(std::move(cf), std::move(props));
     }
     ;
 
-renames[::shared_ptr<alter_type_statement::renames> expr]
-    : fromId=ident K_TO toId=ident { $expr->add_rename(fromId, toId); }
+renames[alter_type_statement::renames& expr]
+    : fromId=ident K_TO toId=ident { $expr.add_rename(fromId, toId); }
       ( K_AND renames[$expr] )?
     ;
 
 /**
  * DROP KEYSPACE [IF EXISTS] <KSP>;
  */
-dropKeyspaceStatement returns [::shared_ptr<drop_keyspace_statement> ksp]
+dropKeyspaceStatement returns [std::unique_ptr<drop_keyspace_statement> ksp]
     @init { bool if_exists = false; }
-    : K_DROP K_KEYSPACE (K_IF K_EXISTS { if_exists = true; } )? ks=keyspaceName { $ksp = ::make_shared<drop_keyspace_statement>(ks, if_exists); }
+    : K_DROP K_KEYSPACE (K_IF K_EXISTS { if_exists = true; } )? ks=keyspaceName { $ksp = std::make_unique<drop_keyspace_statement>(ks, if_exists); }
     ;
 
 /**
  * DROP COLUMNFAMILY [IF EXISTS] <CF>;
  */
-dropTableStatement returns [::shared_ptr<drop_table_statement> stmt]
+dropTableStatement returns [std::unique_ptr<drop_table_statement> stmt]
     @init { bool if_exists = false; }
-    : K_DROP K_COLUMNFAMILY (K_IF K_EXISTS { if_exists = true; } )? cf=columnFamilyName { $stmt = ::make_shared<drop_table_statement>(cf, if_exists); }
+    : K_DROP K_COLUMNFAMILY (K_IF K_EXISTS { if_exists = true; } )? cf=columnFamilyName { $stmt = std::make_unique<drop_table_statement>(cf, if_exists); }
     ;
 
 /**
  * DROP TYPE <name>;
  */
-dropTypeStatement returns [::shared_ptr<drop_type_statement> stmt]
+dropTypeStatement returns [std::unique_ptr<drop_type_statement> stmt]
     @init { bool if_exists = false; }
-    : K_DROP K_TYPE (K_IF K_EXISTS { if_exists = true; } )? name=userTypeName { $stmt = ::make_shared<drop_type_statement>(name, if_exists); }
+    : K_DROP K_TYPE (K_IF K_EXISTS { if_exists = true; } )? name=userTypeName { $stmt = std::make_unique<drop_type_statement>(name, if_exists); }
     ;
 
 /**
  * DROP MATERIALIZED VIEW [IF EXISTS] <view_name>
  */
-dropViewStatement returns [::shared_ptr<drop_view_statement> stmt]
+dropViewStatement returns [std::unique_ptr<drop_view_statement> stmt]
     @init { bool if_exists = false; }
     : K_DROP K_MATERIALIZED K_VIEW (K_IF K_EXISTS { if_exists = true; } )? cf=columnFamilyName
-      { $stmt = ::make_shared<drop_view_statement>(cf, if_exists); }
+      { $stmt = std::make_unique<drop_view_statement>(cf, if_exists); }
     ;
 
 /**
  * DROP INDEX [IF EXISTS] <INDEX_NAME>
  */
-dropIndexStatement returns [::shared_ptr<drop_index_statement> expr]
+dropIndexStatement returns [std::unique_ptr<drop_index_statement> expr]
     @init { bool if_exists = false; }
     : K_DROP K_INDEX (K_IF K_EXISTS { if_exists = true; } )? index=indexName
-      { $expr = ::make_shared<drop_index_statement>(index, if_exists); }
+      { $expr = std::make_unique<drop_index_statement>(index, if_exists); }
     ;
 
 /**
   * TRUNCATE <CF>;
   */
-truncateStatement returns [::shared_ptr<truncate_statement> stmt]
-    : K_TRUNCATE (K_COLUMNFAMILY)? cf=columnFamilyName { $stmt = ::make_shared<truncate_statement>(cf); }
+truncateStatement returns [std::unique_ptr<truncate_statement> stmt]
+    : K_TRUNCATE (K_COLUMNFAMILY)? cf=columnFamilyName { $stmt = std::make_unique<truncate_statement>(cf); }
     ;
 
 /**
  * GRANT <permission> ON <resource> TO <grantee>
  */
-grantStatement returns [::shared_ptr<grant_statement> stmt]
+grantStatement returns [std::unique_ptr<grant_statement> stmt]
     : K_GRANT
           permissionOrAll
       K_ON
           resource
       K_TO
           grantee=userOrRoleName
-      { $stmt = ::make_shared<grant_statement>($permissionOrAll.perms, $resource.res, std::move(grantee)); } 
+      { $stmt = std::make_unique<grant_statement>($permissionOrAll.perms, $resource.res, std::move(grantee)); }
     ;
 
 /**
  * REVOKE <permission> ON <resource> FROM <revokee>
  */
-revokeStatement returns [::shared_ptr<revoke_statement> stmt]
+revokeStatement returns [std::unique_ptr<revoke_statement> stmt]
     : K_REVOKE
           permissionOrAll
       K_ON
           resource
       K_FROM
           revokee=userOrRoleName
-      { $stmt = ::make_shared<revoke_statement>($permissionOrAll.perms, $resource.res, std::move(revokee)); } 
+      { $stmt = std::make_unique<revoke_statement>($permissionOrAll.perms, $resource.res, std::move(revokee)); }
     ;
 
 /**
  * GRANT <rolename> to <grantee>
  */
-grantRoleStatement returns [::shared_ptr<grant_role_statement> stmt]
+grantRoleStatement returns [std::unique_ptr<grant_role_statement> stmt]
     : K_GRANT role=userOrRoleName K_TO grantee=userOrRoleName
-      { $stmt = ::make_shared<grant_role_statement>(std::move(role), std::move(grantee));  }
+      { $stmt = std::make_unique<grant_role_statement>(std::move(role), std::move(grantee));  }
     ;
 
 /**
  * REVOKE <rolename> FROM <revokee>
  */
-revokeRoleStatement returns [::shared_ptr<revoke_role_statement> stmt]
+revokeRoleStatement returns [std::unique_ptr<revoke_role_statement> stmt]
     : K_REVOKE role=userOrRoleName K_FROM revokee=userOrRoleName
-      { $stmt = ::make_shared<revoke_role_statement>(std::move(role), std::move(revokee)); }
+      { $stmt = std::make_unique<revoke_role_statement>(std::move(role), std::move(revokee)); }
     ;
 
-listPermissionsStatement returns [::shared_ptr<list_permissions_statement> stmt]
+listPermissionsStatement returns [std::unique_ptr<list_permissions_statement> stmt]
     @init {
 		std::optional<auth::resource> r;
 		std::optional<sstring> role;
@@ -1056,7 +1099,7 @@ listPermissionsStatement returns [::shared_ptr<list_permissions_statement> stmt]
       ( K_ON resource { r = $resource.res; } )?
       ( K_OF rn=userOrRoleName { role = sstring(static_cast<cql3::role_name>(rn).to_string()); } )?
       ( K_NORECURSIVE { recursive = false; } )?
-      { $stmt = ::make_shared<list_permissions_statement>($permissionOrAll.perms, std::move(r), std::move(role), recursive); } 
+      { $stmt = std::make_unique<list_permissions_statement>($permissionOrAll.perms, std::move(r), std::move(role), recursive); }
     ;
 
 permission returns [auth::permission perm]
@@ -1089,7 +1132,7 @@ roleResource returns [uninitialized<auth::resource> res]
 /**
  * CREATE USER [IF NOT EXISTS] <username> [WITH PASSWORD <password>] [SUPERUSER|NOSUPERUSER]
  */
-createUserStatement returns [::shared_ptr<create_role_statement> stmt]
+createUserStatement returns [std::unique_ptr<create_role_statement> stmt]
     @init {
         cql3::role_options opts;
         opts.is_superuser = false;
@@ -1097,45 +1140,45 @@ createUserStatement returns [::shared_ptr<create_role_statement> stmt]
 
         bool ifNotExists = false;
     }
-    : K_CREATE K_USER (K_IF K_NOT K_EXISTS { ifNotExists = true; })? username
+    : K_CREATE K_USER (K_IF K_NOT K_EXISTS { ifNotExists = true; })? u=username
       ( K_WITH K_PASSWORD v=STRING_LITERAL { opts.password = $v.text; })?
       ( K_SUPERUSER { opts.is_superuser = true; } | K_NOSUPERUSER { opts.is_superuser = false; } )?
-      { $stmt = ::make_shared<create_role_statement>(cql3::role_name($username.text, cql3::preserve_role_case::yes), std::move(opts), ifNotExists); }
+      { $stmt = std::make_unique<create_role_statement>(cql3::role_name(u, cql3::preserve_role_case::yes), std::move(opts), ifNotExists); }
     ;
 
 /**
  * ALTER USER <username> [WITH PASSWORD <password>] [SUPERUSER|NOSUPERUSER]
  */
-alterUserStatement returns [::shared_ptr<alter_role_statement> stmt]
+alterUserStatement returns [std::unique_ptr<alter_role_statement> stmt]
     @init {
         cql3::role_options opts;
     }
-    : K_ALTER K_USER username
+    : K_ALTER K_USER u=username
       ( K_WITH K_PASSWORD v=STRING_LITERAL { opts.password = $v.text; })?
       ( K_SUPERUSER { opts.is_superuser = true; } | K_NOSUPERUSER { opts.is_superuser = false; } )?
-      { $stmt = ::make_shared<alter_role_statement>(cql3::role_name($username.text, cql3::preserve_role_case::yes), std::move(opts)); }
+      { $stmt = std::make_unique<alter_role_statement>(cql3::role_name(u, cql3::preserve_role_case::yes), std::move(opts)); }
     ;
 
 /**
  * DROP USER [IF EXISTS] <username>
  */
-dropUserStatement returns [::shared_ptr<drop_role_statement> stmt]
+dropUserStatement returns [std::unique_ptr<drop_role_statement> stmt]
     @init { bool ifExists = false; }
-    : K_DROP K_USER (K_IF K_EXISTS { ifExists = true; })? username
-      { $stmt = ::make_shared<drop_role_statement>(cql3::role_name($username.text, cql3::preserve_role_case::yes), ifExists); }
+    : K_DROP K_USER (K_IF K_EXISTS { ifExists = true; })? u=username
+      { $stmt = std::make_unique<drop_role_statement>(cql3::role_name(u, cql3::preserve_role_case::yes), ifExists); }
     ;
 
 /**
  * LIST USERS
  */
-listUsersStatement returns [::shared_ptr<list_users_statement> stmt]
-    : K_LIST K_USERS { $stmt = ::make_shared<list_users_statement>(); }
+listUsersStatement returns [std::unique_ptr<list_users_statement> stmt]
+    : K_LIST K_USERS { $stmt = std::make_unique<list_users_statement>(); }
     ;
 
 /**
  * CREATE ROLE [IF NOT EXISTS] <role_name> [WITH <roleOption> [AND <roleOption>]*]
  */
-createRoleStatement returns [::shared_ptr<create_role_statement> stmt]
+createRoleStatement returns [std::unique_ptr<create_role_statement> stmt]
     @init {
         cql3::role_options opts;
         opts.is_superuser = false;
@@ -1144,36 +1187,36 @@ createRoleStatement returns [::shared_ptr<create_role_statement> stmt]
     }
     : K_CREATE K_ROLE (K_IF K_NOT K_EXISTS { if_not_exists = true; })? name=userOrRoleName
       (K_WITH roleOptions[opts])?
-      { $stmt = ::make_shared<create_role_statement>(name, std::move(opts), if_not_exists); }
+      { $stmt = std::make_unique<create_role_statement>(name, std::move(opts), if_not_exists); }
     ;
 
 /**
  * ALTER ROLE <rolename> [WITH <roleOption> [AND <roleOption>]*]
  */
-alterRoleStatement returns [::shared_ptr<alter_role_statement> stmt]
+alterRoleStatement returns [std::unique_ptr<alter_role_statement> stmt]
     @init {
         cql3::role_options opts;
     }
     : K_ALTER K_ROLE name=userOrRoleName
       (K_WITH roleOptions[opts])?
-      { $stmt = ::make_shared<alter_role_statement>(name, std::move(opts)); }
+      { $stmt = std::make_unique<alter_role_statement>(name, std::move(opts)); }
     ;
 
 /**
  * DROP ROLE [IF EXISTS] <rolename>
  */
-dropRoleStatement returns [::shared_ptr<drop_role_statement> stmt]
+dropRoleStatement returns [std::unique_ptr<drop_role_statement> stmt]
     @init {
         bool if_exists = false;
     }
     : K_DROP K_ROLE (K_IF K_EXISTS { if_exists = true; })? name=userOrRoleName
-      { $stmt = ::make_shared<drop_role_statement>(name, if_exists); }
+      { $stmt = std::make_unique<drop_role_statement>(name, if_exists); }
     ;
 
 /**
  * LIST ROLES [OF <rolename>] [NORECURSIVE]
  */
-listRolesStatement returns [::shared_ptr<list_roles_statement> stmt]
+listRolesStatement returns [std::unique_ptr<list_roles_statement> stmt]
     @init {
         bool recursive = true;
         std::optional<cql3::role_name> grantee;
@@ -1181,7 +1224,7 @@ listRolesStatement returns [::shared_ptr<list_roles_statement> stmt]
     : K_LIST K_ROLES
         (K_OF g=userOrRoleName { grantee = std::move(g); })?
         (K_NORECURSIVE { recursive = false; })?
-        { $stmt = ::make_shared<list_roles_statement>(grantee, recursive); }
+        { $stmt = std::make_unique<list_roles_statement>(grantee, recursive); }
     ;
 
 roleOptions[cql3::role_options& opts]
@@ -1201,32 +1244,32 @@ roleOption[cql3::role_options& opts]
 // identifiers because the underlying comparator is not necessarily text. See
 // CASSANDRA-8178 for details.
 cident returns [shared_ptr<cql3::column_identifier::raw> id]
-    : t=IDENT              { $id = make_shared<cql3::column_identifier::raw>(sstring{$t.text}, false); }
-    | t=QUOTED_NAME        { $id = make_shared<cql3::column_identifier::raw>(sstring{$t.text}, true); }
-    | k=unreserved_keyword { $id = make_shared<cql3::column_identifier::raw>(k, false); }
+    : t=IDENT              { $id = ::make_shared<cql3::column_identifier::raw>(sstring{$t.text}, false); }
+    | t=QUOTED_NAME        { $id = ::make_shared<cql3::column_identifier::raw>(sstring{$t.text}, true); }
+    | k=unreserved_keyword { $id = ::make_shared<cql3::column_identifier::raw>(k, false); }
     ;
 
 // Identifiers that do not refer to columns or where the comparator is known to be text
 ident returns [shared_ptr<cql3::column_identifier> id]
-    : t=IDENT              { $id = make_shared<cql3::column_identifier>(sstring{$t.text}, false); }
-    | t=QUOTED_NAME        { $id = make_shared<cql3::column_identifier>(sstring{$t.text}, true); }
-    | k=unreserved_keyword { $id = make_shared<cql3::column_identifier>(k, false); }
+    : t=IDENT              { $id = ::make_shared<cql3::column_identifier>(sstring{$t.text}, false); }
+    | t=QUOTED_NAME        { $id = ::make_shared<cql3::column_identifier>(sstring{$t.text}, true); }
+    | k=unreserved_keyword { $id = ::make_shared<cql3::column_identifier>(k, false); }
     ;
 
 // Keyspace & Column family names
 keyspaceName returns [sstring id]
     @init { auto name = make_shared<cql3::cf_name>(); }
-    : ksName[name] { $id = name->get_keyspace(); }
+    : ksName[*name] { $id = name->get_keyspace(); }
     ;
 
 indexName returns [::shared_ptr<cql3::index_name> name]
     @init { $name = ::make_shared<cql3::index_name>(); }
-    : (ksName[name] '.')? idxName[name]
+    : (ksName[*name] '.')? idxName[*name]
     ;
 
 columnFamilyName returns [::shared_ptr<cql3::cf_name> name]
     @init { $name = ::make_shared<cql3::cf_name>(); }
-    : (ksName[name] '.')? cfName[name]
+    : (ksName[*name] '.')? cfName[*name]
     ;
 
 userTypeName returns [uninitialized<cql3::ut_name> name]
@@ -1241,24 +1284,24 @@ userOrRoleName returns [uninitialized<cql3::role_name> name]
     | QMARK {add_recognition_error("Bind variables cannot be used for role names");}
     ;
 
-ksName[::shared_ptr<cql3::keyspace_element_name> name]
-    : t=IDENT              { $name->set_keyspace($t.text, false);}
-    | t=QUOTED_NAME        { $name->set_keyspace($t.text, true);}
-    | k=unreserved_keyword { $name->set_keyspace(k, false);}
+ksName[cql3::keyspace_element_name& name]
+    : t=IDENT              { $name.set_keyspace($t.text, false);}
+    | t=QUOTED_NAME        { $name.set_keyspace($t.text, true);}
+    | k=unreserved_keyword { $name.set_keyspace(k, false);}
     | QMARK {add_recognition_error("Bind variables cannot be used for keyspace names");}
     ;
 
-cfName[::shared_ptr<cql3::cf_name> name]
-    : t=IDENT              { $name->set_column_family($t.text, false); }
-    | t=QUOTED_NAME        { $name->set_column_family($t.text, true); }
-    | k=unreserved_keyword { $name->set_column_family(k, false); }
+cfName[cql3::cf_name& name]
+    : t=IDENT              { $name.set_column_family($t.text, false); }
+    | t=QUOTED_NAME        { $name.set_column_family($t.text, true); }
+    | k=unreserved_keyword { $name.set_column_family(k, false); }
     | QMARK {add_recognition_error("Bind variables cannot be used for table names");}
     ;
 
-idxName[::shared_ptr<cql3::index_name> name]
-    : t=IDENT              { $name->set_index($t.text, false); }
-    | t=QUOTED_NAME        { $name->set_index($t.text, true);}
-    | k=unreserved_keyword { $name->set_index(k, false); }
+idxName[cql3::index_name& name]
+    : t=IDENT              { $name.set_index($t.text, false); }
+    | t=QUOTED_NAME        { $name.set_index($t.text, true);}
+    | k=unreserved_keyword { $name.set_index(k, false); }
     | QMARK {add_recognition_error("Bind variables cannot be used for index names");}
     ;
 
@@ -1290,7 +1333,7 @@ setOrMapLiteral[shared_ptr<cql3::term::raw> t] returns [shared_ptr<cql3::term::r
       { $value = ::make_shared<cql3::maps::literal>(std::move(m)); }
     | { s.push_back(t); }
           ( ',' tn=term { s.push_back(tn); } )*
-      { $value = make_shared(cql3::sets::literal(std::move(s))); }
+      { $value = ::make_shared<cql3::sets::literal>(std::move(s)); }
     ;
 
 collectionLiteral returns [shared_ptr<cql3::term::raw> value]
@@ -1301,7 +1344,7 @@ collectionLiteral returns [shared_ptr<cql3::term::raw> value]
     | '{' t=term v=setOrMapLiteral[t] { $value = v; } '}'
     // Note that we have an ambiguity between maps and set for "{}". So we force it to a set literal,
     // and deal with it later based on the type of the column (SetLiteral.java).
-    | '{' '}' { $value = make_shared(cql3::sets::literal({})); }
+    | '{' '}' { $value = ::make_shared<cql3::sets::literal>(std::vector<shared_ptr<cql3::term::raw>>()); }
     ;
 
 usertypeLiteral returns [shared_ptr<cql3::user_types::literal> ut]
@@ -1365,20 +1408,21 @@ columnOperation[operations_type& operations]
 
 columnOperationDifferentiator[operations_type& operations, ::shared_ptr<cql3::column_identifier::raw> key]
     : '=' normalColumnOperation[operations, key]
-    | '[' k=term ']' specializedColumnOperation[operations, key, k, false]
-    | '[' K_SCYLLA_TIMEUUID_LIST_INDEX '(' k=term ')' ']' specializedColumnOperation[operations, key, k, true]
+    | '[' k=term ']' collectionColumnOperation[operations, key, k, false]
+    | '.' field=ident udtColumnOperation[operations, key, field]
+    | '[' K_SCYLLA_TIMEUUID_LIST_INDEX '(' k=term ')' ']' collectionColumnOperation[operations, key, k, true]
     ;
 
 normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_identifier::raw> key]
     : t=term ('+' c=cident )?
       {
           if (!c) {
-              add_raw_update(operations, key, ::make_shared<cql3::operation::set_value>(t));
+              add_raw_update(operations, key, std::make_unique<cql3::operation::set_value>(t));
           } else {
               if (*key != *c) {
                 add_recognition_error("Only expressions of the form X = <value> + X are supported.");
               }
-              add_raw_update(operations, key, ::make_shared<cql3::operation::prepend>(t));
+              add_raw_update(operations, key, std::make_unique<cql3::operation::prepend>(t));
           }
       }
     | c=cident sig=('+' | '-') t=term
@@ -1386,11 +1430,11 @@ normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_ide
           if (*key != *c) {
               add_recognition_error("Only expressions of the form X = X " + $sig.text + "<value> are supported.");
           }
-          shared_ptr<cql3::operation::raw_update> op;
+          std::unique_ptr<cql3::operation::raw_update> op;
           if ($sig.text == "+") {
-              op = make_shared<cql3::operation::addition>(t);
+              op = std::make_unique<cql3::operation::addition>(t);
           } else {
-              op = make_shared<cql3::operation::subtraction>(t);
+              op = std::make_unique<cql3::operation::subtraction>(t);
           }
           add_raw_update(operations, key, std::move(op));
       }
@@ -1401,51 +1445,58 @@ normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_ide
               // We don't yet allow a '+' in front of an integer, but we could in the future really, so let's be future-proof in our error message
               add_recognition_error("Only expressions of the form X = X " + sstring($i.text[0] == '-' ? "-" : "+") + " <value> are supported.");
           }
-          add_raw_update(operations, key, make_shared<cql3::operation::addition>(cql3::constants::literal::integer($i.text)));
+          add_raw_update(operations, key, std::make_unique<cql3::operation::addition>(cql3::constants::literal::integer($i.text)));
       }
     | K_SCYLLA_COUNTER_SHARD_LIST '(' t=term ')'
       {
-          add_raw_update(operations, key, ::make_shared<cql3::operation::set_counter_value_from_tuple_list>(t));      
+          add_raw_update(operations, key, std::make_unique<cql3::operation::set_counter_value_from_tuple_list>(t));
       }
     ;
 
-specializedColumnOperation[std::vector<std::pair<shared_ptr<cql3::column_identifier::raw>,
-                                                 shared_ptr<cql3::operation::raw_update>>>& operations,
-                           shared_ptr<cql3::column_identifier::raw> key,
-                           shared_ptr<cql3::term::raw> k,
-                           bool by_uuid]
-
+collectionColumnOperation[operations_type& operations,
+                          shared_ptr<cql3::column_identifier::raw> key,
+                          shared_ptr<cql3::term::raw> k,
+                          bool by_uuid]
     : '=' t=term
       {
-          add_raw_update(operations, key, make_shared<cql3::operation::set_element>(k, t, by_uuid));
+          add_raw_update(operations, key, std::make_unique<cql3::operation::set_element>(k, t, by_uuid));
+      }
+    ;
+
+udtColumnOperation[operations_type& operations,
+                   shared_ptr<cql3::column_identifier::raw> key,
+                   shared_ptr<cql3::column_identifier> field]
+    : '=' t=term
+      {
+          add_raw_update(operations, std::move(key), std::make_unique<cql3::operation::set_field>(std::move(field), std::move(t)));
       }
     ;
 
 columnCondition[conditions_type& conditions]
     // Note: we'll reject duplicates later
     : key=cident
-        ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, *op)); }
+        ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, {}, op)); }
         | K_IN
-            ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::simple_in_condition(values)); }
-            | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::simple_in_condition(marker)); }
+            ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::in_condition({}, {}, values)); }
+            | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::in_condition({}, marker, {})); }
             )
         | '[' element=term ']'
-            ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::collection_condition(t, element, *op)); }
+            ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, element, op)); }
             | K_IN
-                ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::collection_in_condition(element, values)); }
-                | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::collection_in_condition(element, marker)); }
+                ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::in_condition(element, {}, values)); }
+                | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::in_condition(element, marker, {})); }
                 )
             )
         )
     ;
 
-properties[::shared_ptr<cql3::statements::property_definitions> props]
+properties[cql3::statements::property_definitions& props]
     : property[props] (K_AND property[props])*
     ;
 
-property[::shared_ptr<cql3::statements::property_definitions> props]
-    : k=ident '=' simple=propertyValue { try { $props->add_property(k->to_string(), simple); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
-    | k=ident '=' map=mapLiteral { try { $props->add_property(k->to_string(), convert_property_map(map)); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
+property[cql3::statements::property_definitions& props]
+    : k=ident '=' simple=propertyValue { try { $props.add_property(k->to_string(), simple); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
+    | k=ident '=' map=mapLiteral { try { $props.add_property(k->to_string(), convert_property_map(map)); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
     ;
 
 propertyValue returns [sstring str]
@@ -1453,30 +1504,31 @@ propertyValue returns [sstring str]
     | u=unreserved_keyword { $str = u; }
     ;
 
-relationType returns [const cql3::operator_type* op = nullptr]
-    : '='  { $op = &cql3::operator_type::EQ; }
-    | '<'  { $op = &cql3::operator_type::LT; }
-    | '<=' { $op = &cql3::operator_type::LTE; }
-    | '>'  { $op = &cql3::operator_type::GT; }
-    | '>=' { $op = &cql3::operator_type::GTE; }
-    | '!=' { $op = &cql3::operator_type::NEQ; }
+relationType returns [cql3::expr::oper_t op]
+    : '='  { $op = cql3::expr::oper_t::EQ; }
+    | '<'  { $op = cql3::expr::oper_t::LT; }
+    | '<=' { $op = cql3::expr::oper_t::LTE; }
+    | '>'  { $op = cql3::expr::oper_t::GT; }
+    | '>=' { $op = cql3::expr::oper_t::GTE; }
+    | '!=' { $op = cql3::expr::oper_t::NEQ; }
+    | K_LIKE { $op = cql3::expr::oper_t::LIKE; }
     ;
 
 relation[std::vector<cql3::relation_ptr>& clauses]
-    @init{ const cql3::operator_type* rt = nullptr; }
-    : name=cident type=relationType t=term { $clauses.emplace_back(::make_shared<cql3::single_column_relation>(std::move(name), *type, std::move(t))); }
+    @init{ cql3::expr::oper_t rt; }
+    : name=cident type=relationType t=term { $clauses.emplace_back(::make_shared<cql3::single_column_relation>(std::move(name), type, std::move(t))); }
 
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
-        { $clauses.emplace_back(::make_shared<cql3::token_relation>(std::move(l), *type, std::move(t))); }
+        { $clauses.emplace_back(::make_shared<cql3::token_relation>(std::move(l), type, std::move(t))); }
     | name=cident K_IS K_NOT K_NULL {
-          $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::operator_type::IS_NOT, cql3::constants::NULL_LITERAL)); }
+          $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::expr::oper_t::IS_NOT, cql3::constants::NULL_LITERAL)); }
     | name=cident K_IN marker=inMarker
-        { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::operator_type::IN, std::move(marker))); }
+        { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::expr::oper_t::IN, std::move(marker))); }
     | name=cident K_IN in_values=singleColumnInValues
         { $clauses.emplace_back(cql3::single_column_relation::create_in_relation(std::move(name), std::move(in_values))); }
-    | name=cident K_CONTAINS { rt = &cql3::operator_type::CONTAINS; } (K_KEY { rt = &cql3::operator_type::CONTAINS_KEY; })?
-        t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), *rt, std::move(t))); }
-    | name=cident '[' key=term ']' type=relationType t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), std::move(key), *type, std::move(t))); }
+    | name=cident K_CONTAINS { rt = cql3::expr::oper_t::CONTAINS; } (K_KEY { rt = cql3::expr::oper_t::CONTAINS_KEY; })?
+        t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), rt, std::move(t))); }
+    | name=cident '[' key=term ']' type=relationType t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), std::move(key), type, std::move(t))); }
     | ids=tupleOfIdentifiers
       ( K_IN
           ( '(' ')'
@@ -1492,10 +1544,10 @@ relation[std::vector<cql3::relation_ptr>& clauses]
           )
       | type=relationType literal=tupleLiteral /* (a, b, c) > (1, 2, 3) or (a, b, c) > (?, ?, ?) */
           {
-              $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, *type, literal));
+              $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, type, literal));
           }
       | type=relationType tupleMarker=markerForTuple /* (a, b, c) >= ? */
-          { $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, *type, tupleMarker)); }
+          { $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, type, tupleMarker)); }
       )
     | '(' relation[$clauses] ')'
     ;
@@ -1507,6 +1559,10 @@ inMarker returns [shared_ptr<cql3::abstract_marker::in_raw> marker]
 
 tupleOfIdentifiers returns [std::vector<::shared_ptr<cql3::column_identifier::raw>> ids]
     : '(' n1=cident { $ids.push_back(n1); } (',' ni=cident { $ids.push_back(ni); })* ')'
+    ;
+
+listOfIdentifiers returns [std::vector<::shared_ptr<cql3::column_identifier::raw>> ids]
+    : n1=cident { $ids.push_back(n1); } (',' ni=cident { $ids.push_back(ni); })*
     ;
 
 singleColumnInValues returns [std::vector<::shared_ptr<cql3::term::raw>> terms]
@@ -1531,12 +1587,22 @@ inMarkerForTuple returns [shared_ptr<cql3::tuples::in_raw> marker]
     | ':' name=ident { $marker = new_tuple_in_bind_variables(name); }
     ;
 
-comparatorType returns [shared_ptr<cql3_type::raw> t]
-    : n=native_type     { $t = cql3_type::raw::from(n); }
-    | c=collection_type { $t = c; }
-    | tt=tuple_type     { $t = tt; }
+// The comparator_type rule is used for users' queries (internal=false)
+// and for internal calls from db::cql_type_parser::parse() (internal=true).
+// The latter is used for reading schemas stored in the system tables, and
+// may support additional column types that cannot be created through CQL,
+// but only internally through code. Today the only such type is "empty":
+// Scylla code internally creates columns with type "empty" or collections
+// "empty" to represent unselected columns in materialized views.
+// If a user (internal=false) tries to use "empty" as a type, it is treated -
+// as do all unknown types - as an attempt to use a user-defined type, and
+// we report this name is reserved (as for _reserved_type_names()).
+comparator_type [bool internal] returns [shared_ptr<cql3_type::raw> t]
+    : n=native_or_internal_type[internal]     { $t = cql3_type::raw::from(n); }
+    | c=collection_type[internal]   { $t = c; }
+    | tt=tuple_type[internal]       { $t = tt; }
     | id=userTypeName   { $t = cql3::cql3_type::raw::user_type(id); }
-    | K_FROZEN '<' f=comparatorType '>'
+    | K_FROZEN '<' f=comparator_type[internal] '>'
       {
         try {
             $t = cql3::cql3_type::raw::frozen(f);
@@ -1558,61 +1624,78 @@ comparatorType returns [shared_ptr<cql3_type::raw> t]
 #endif
     ;
 
-native_type returns [shared_ptr<cql3_type> t]
-    : K_ASCII     { $t = cql3_type::ascii; }
-    | K_BIGINT    { $t = cql3_type::bigint; }
-    | K_BLOB      { $t = cql3_type::blob; }
-    | K_BOOLEAN   { $t = cql3_type::boolean; }
-    | K_COUNTER   { $t = cql3_type::counter; }
-    | K_DECIMAL   { $t = cql3_type::decimal; }
-    | K_DOUBLE    { $t = cql3_type::double_; }
-    | K_DURATION  { $t = cql3_type::duration; }
-    | K_FLOAT     { $t = cql3_type::float_; }
-    | K_INET      { $t = cql3_type::inet; }
-    | K_INT       { $t = cql3_type::int_; }
-    | K_SMALLINT  { $t = cql3_type::smallint; }
-    | K_TEXT      { $t = cql3_type::text; }
-    | K_TIMESTAMP { $t = cql3_type::timestamp; }
-    | K_TINYINT   { $t = cql3_type::tinyint; }
-    | K_UUID      { $t = cql3_type::uuid; }
-    | K_VARCHAR   { $t = cql3_type::varchar; }
-    | K_VARINT    { $t = cql3_type::varint; }
-    | K_TIMEUUID  { $t = cql3_type::timeuuid; }
-    | K_DATE      { $t = cql3_type::date; }
-    | K_TIME      { $t = cql3_type::time; }
+native_or_internal_type [bool internal] returns [data_type t]
+    : n=native_type     { $t = n; }
+    // The "internal" types, only supported when internal==true:
+    | K_EMPTY   {
+        if (internal) {
+            $t = empty_type;
+        } else {
+            add_recognition_error("Invalid (reserved) user type name empty");
+        }
+      }
     ;
 
-collection_type returns [shared_ptr<cql3::cql3_type::raw> pt]
-    : K_MAP  '<' t1=comparatorType ',' t2=comparatorType '>'
+comparatorType returns [shared_ptr<cql3_type::raw> t]
+    : tt=comparator_type[false]    { $t = tt; }
+    ;
+
+native_type returns [data_type t]
+    : K_ASCII     { $t = ascii_type; }
+    | K_BIGINT    { $t = long_type; }
+    | K_BLOB      { $t = bytes_type; }
+    | K_BOOLEAN   { $t = boolean_type; }
+    | K_COUNTER   { $t = counter_type; }
+    | K_DECIMAL   { $t = decimal_type; }
+    | K_DOUBLE    { $t = double_type; }
+    | K_DURATION  { $t = duration_type; }
+    | K_FLOAT     { $t = float_type; }
+    | K_INET      { $t = inet_addr_type; }
+    | K_INT       { $t = int32_type; }
+    | K_SMALLINT  { $t = short_type; }
+    | K_TEXT      { $t = utf8_type; }
+    | K_TIMESTAMP { $t = timestamp_type; }
+    | K_TINYINT   { $t = byte_type; }
+    | K_UUID      { $t = uuid_type; }
+    | K_VARCHAR   { $t = utf8_type; }
+    | K_VARINT    { $t = varint_type; }
+    | K_TIMEUUID  { $t = timeuuid_type; }
+    | K_DATE      { $t = simple_date_type; }
+    | K_TIME      { $t = time_type; }
+    ;
+
+collection_type [bool internal] returns [shared_ptr<cql3::cql3_type::raw> pt]
+    : K_MAP  '<' t1=comparator_type[internal] ',' t2=comparator_type[internal] '>'
         {
             // if we can't parse either t1 or t2, antlr will "recover" and we may have t1 or t2 null.
             if (t1 && t2) {
                 $pt = cql3::cql3_type::raw::map(t1, t2);
             }
         }
-    | K_LIST '<' t=comparatorType '>'
+    | K_LIST '<' t=comparator_type[internal] '>'
         { if (t) { $pt = cql3::cql3_type::raw::list(t); } }
-    | K_SET  '<' t=comparatorType '>'
+    | K_SET  '<' t=comparator_type[internal] '>'
         { if (t) { $pt = cql3::cql3_type::raw::set(t); } }
     ;
 
-tuple_type returns [shared_ptr<cql3::cql3_type::raw> t]
+tuple_type [bool internal] returns [shared_ptr<cql3::cql3_type::raw> t]
         @init{ std::vector<shared_ptr<cql3::cql3_type::raw>> types; }
     : K_TUPLE '<'
-         t1=comparatorType { types.push_back(t1); } (',' tn=comparatorType { types.push_back(tn); })*
+         t1=comparator_type[internal] { types.push_back(t1); } (',' tn=comparator_type[internal] { types.push_back(tn); })*
       '>' { $t = cql3::cql3_type::raw::tuple(std::move(types)); }
     ;
 
-username
-    : IDENT
-    | STRING_LITERAL
+username returns [sstring str]
+    : t=IDENT { $str = $t.text; }
+    | t=STRING_LITERAL { $str = $t.text; }
+    | s=unreserved_keyword { $str = s; }
     | QUOTED_NAME { add_recognition_error("Quoted strings are not supported for user names"); }
     ;
 
 // Basically the same as cident, but we need to exlude existing CQL3 types
 // (which for some reason are not reserved otherwise)
 non_type_ident returns [shared_ptr<cql3::column_identifier> id]
-    : t=IDENT                    { if (_reserved_type_names().count($t.text)) { add_recognition_error("Invalid (reserved) user type name " + $t.text); } $id = ::make_shared<cql3::column_identifier>($t.text, false); }
+    : t=IDENT                    { if (_reserved_type_names().contains($t.text)) { add_recognition_error("Invalid (reserved) user type name " + $t.text); } $id = ::make_shared<cql3::column_identifier>($t.text, false); }
     | t=QUOTED_NAME              { $id = ::make_shared<cql3::column_identifier>($t.text, true); }
     | k=basic_unreserved_keyword { $id = ::make_shared<cql3::column_identifier>(k, false); }
     | kk=K_KEY                   { $id = ::make_shared<cql3::column_identifier>($kk.text, false); }
@@ -1625,7 +1708,7 @@ unreserved_keyword returns [sstring str]
 
 unreserved_function_keyword returns [sstring str]
     : u=basic_unreserved_keyword { $str = u; }
-    | t=native_type              { $str = t->to_string(); }
+    | t=native_or_internal_type[true]   { $str = t->as_cql3_type().to_string(); }
     ;
 
 basic_unreserved_keyword returns [sstring str]
@@ -1669,9 +1752,15 @@ basic_unreserved_keyword returns [sstring str]
         | K_INITCOND
         | K_RETURNS
         | K_LANGUAGE
-        | K_NON
-        | K_DETERMINISTIC
+        | K_CALLED
+        | K_INPUT
         | K_JSON
+        | K_CACHE
+        | K_BYPASS
+        | K_LIKE
+        | K_PER
+        | K_PARTITION
+        | K_GROUP
         ) { $str = $k.text; }
     ;
 
@@ -1803,15 +1892,29 @@ K_STYPE:       S T Y P E;
 K_FINALFUNC:   F I N A L F U N C;
 K_INITCOND:    I N I T C O N D;
 K_RETURNS:     R E T U R N S;
+K_CALLED:      C A L L E D;
+K_INPUT:       I N P U T;
 K_LANGUAGE:    L A N G U A G E;
-K_NON:         N O N;
 K_OR:          O R;
 K_REPLACE:     R E P L A C E;
-K_DETERMINISTIC: D E T E R M I N I S T I C;
 K_JSON:        J S O N;
+K_DEFAULT:     D E F A U L T;
+K_UNSET:       U N S E T;
+
+K_EMPTY:       E M P T Y;
+
+K_BYPASS:      B Y P A S S;
+K_CACHE:       C A C H E;
+
+K_PER:         P E R;
+K_PARTITION:   P A R T I T I O N;
 
 K_SCYLLA_TIMEUUID_LIST_INDEX: S C Y L L A '_' T I M E U U I D '_' L I S T '_' I N D E X;
 K_SCYLLA_COUNTER_SHARD_LIST: S C Y L L A '_' C O U N T E R '_' S H A R D '_' L I S T; 
+
+K_GROUP:       G R O U P;
+
+K_LIKE:        L I K E;
 
 // Case-insensitive alpha characters
 fragment A: ('a'|'A');

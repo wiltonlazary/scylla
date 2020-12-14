@@ -49,7 +49,7 @@ namespace selection {
 class aggregate_function_selector : public abstract_function_selector_for<functions::aggregate_function> {
     std::unique_ptr<functions::aggregate_function::aggregate> _aggregate;
 public:
-    virtual bool is_aggregate() override {
+    virtual bool is_aggregate() const override {
         return true;
     }
 
@@ -78,11 +78,6 @@ public:
             : abstract_function_selector_for<functions::aggregate_function>(
                     dynamic_pointer_cast<functions::aggregate_function>(func), std::move(arg_selectors))
             , _aggregate(fun()->new_aggregate()) {
-    }
-
-    virtual sstring assignment_testable_source_context() const override {
-        // FIXME:
-        return "FIXME";
     }
 };
 

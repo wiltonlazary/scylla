@@ -39,8 +39,7 @@
 #pragma once
 
 #include "gms/i_endpoint_state_change_subscriber.hh"
-#include "core/distributed.hh"
-#include "cql3/query_processor.hh"
+#include <seastar/core/distributed.hh>
 #include "message/messaging_service_fwd.hh"
 #include "utils/UUID.hh"
 #include "streaming/stream_session_state.hh"
@@ -50,12 +49,20 @@
 #include "streaming/prepare_message.hh"
 #include "streaming/stream_detail.hh"
 #include "streaming/stream_manager.hh"
+#include "streaming/stream_reason.hh"
 #include "streaming/session_info.hh"
 #include "query-request.hh"
 #include "dht/i_partitioner.hh"
+#include "db/system_distributed_keyspace.hh"
 #include <map>
 #include <vector>
 #include <memory>
+
+namespace db::view {
+
+class view_update_generator;
+
+}
 
 namespace streaming {
 
@@ -134,15 +141,19 @@ private:
     using UUID = utils::UUID;
     using token = dht::token;
     using ring_position = dht::ring_position;
-    static void init_messaging_service_handler();
+    static void init_messaging_service_handler(netw::messaging_service& ms);
+    static future<> uninit_messaging_service_handler(netw::messaging_service& ms);
     static distributed<database>* _db;
+    static distributed<db::system_distributed_keyspace>* _sys_dist_ks;
+    static distributed<db::view::view_update_generator>* _view_update_generator;
+    static sharded<netw::messaging_service>* _messaging;
 public:
-    static netw::messaging_service& ms() {
-        return netw::get_local_messaging_service();
-    }
+    static netw::messaging_service& ms() { return _messaging->local(); }
     static database& get_local_db() { return _db->local(); }
     static distributed<database>& get_db() { return *_db; };
-    static future<> init_streaming_service(distributed<database>& db);
+    static future<> init_streaming_service(distributed<database>& db, distributed<db::system_distributed_keyspace>& sys_dist_ks,
+            distributed<db::view::view_update_generator>& view_update_generator, sharded<netw::messaging_service>& ms);
+    static future<> uninit_streaming_service();
 public:
     /**
      * Streaming endpoint.
@@ -175,18 +186,15 @@ private:
     bool _complete_sent = false;
     bool _received_failed_complete_message = false;
 
-    // If the session is idle for 10 minutes, close the session
-    std::chrono::seconds _keep_alive_timeout{60 * 10};
-    // Check every 1 minutes
-    std::chrono::seconds _keep_alive_interval{60};
-    timer<lowres_clock> _keep_alive;
-    stream_bytes _last_stream_bytes;
-    lowres_clock::time_point _last_stream_progress;
-
     session_info _session_info;
+
+    stream_reason _reason = stream_reason::unspecified;
 public:
-    void start_keep_alive_timer() {
-        _keep_alive.rearm(lowres_clock::now() + _keep_alive_interval);
+    stream_reason get_reason() const {
+        return _reason;
+    }
+    void set_reason(stream_reason reason) {
+        _reason = reason;
     }
 
     void add_bytes_sent(int64_t bytes) {
@@ -216,9 +224,9 @@ public:
     stream_session(inet_address peer_);
     ~stream_session();
 
-    UUID plan_id();
+    UUID plan_id() const;
 
-    sstring description();
+    sstring description() const;
 
 public:
     /**
@@ -274,7 +282,7 @@ public:
     /**
      * @return current state
      */
-    stream_session_state get_state() {
+    stream_session_state get_state() const {
         return _state;
     }
 
@@ -283,7 +291,7 @@ public:
      *
      * @return true if session completed successfully.
      */
-    bool is_success() {
+    bool is_success() const {
         return _state == stream_session_state::COMPLETE;
     }
 

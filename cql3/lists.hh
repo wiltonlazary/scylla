@@ -54,9 +54,9 @@ namespace cql3 {
 class lists {
     lists() = delete;
 public:
-    static shared_ptr<column_specification> index_spec_of(shared_ptr<column_specification> column);
-    static shared_ptr<column_specification> value_spec_of(shared_ptr<column_specification> column);
-    static shared_ptr<column_specification> uuid_index_spec_of(shared_ptr<column_specification>);
+    static lw_shared_ptr<column_specification> index_spec_of(const column_specification&);
+    static lw_shared_ptr<column_specification> value_spec_of(const column_specification&);
+    static lw_shared_ptr<column_specification> uuid_index_spec_of(const column_specification&);
 
     class literal : public term::raw {
         const std::vector<shared_ptr<term::raw>> _elements;
@@ -64,11 +64,11 @@ public:
         explicit literal(std::vector<shared_ptr<term::raw>> elements)
             : _elements(std::move(elements)) {
         }
-        shared_ptr<term> prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver);
+        virtual shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
-        void validate_assignable_to(database& db, const sstring keyspace, shared_ptr<column_specification> receiver);
+        void validate_assignable_to(database& db, const sstring keyspace, const column_specification& receiver) const;
     public:
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) override;
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override;
         virtual sstring to_string() const override;
     };
 
@@ -79,11 +79,11 @@ public:
         explicit value(std::vector<bytes_opt> elements)
             : _elements(std::move(elements)) {
         }
-        static value from_serialized(bytes_view v, list_type type, cql_serialization_format sf);
+        static value from_serialized(const fragmented_temporary_buffer::view& v, const list_type_impl& type, cql_serialization_format sf);
         virtual cql3::raw_value get(const query_options& options) override;
         virtual bytes get_with_protocol_version(cql_serialization_format sf) override;
-        bool equals(shared_ptr<list_type_impl> lt, const value& v);
-        virtual std::vector<bytes_opt> get_elements() override;
+        bool equals(const list_type_impl& lt, const value& v);
+        virtual const std::vector<bytes_opt>& get_elements() const override;
         virtual sstring to_string() const;
         friend class lists;
     };
@@ -103,8 +103,11 @@ public:
                 : _elements(std::move(elements)) {
         }
         virtual bool contains_bind_marker() const override;
-        virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names);
+        virtual void collect_marker_specification(variable_specifications& bound_names) const override;
         virtual shared_ptr<terminal> bind(const query_options& options) override;
+        const std::vector<shared_ptr<term>>& get_elements() const {
+            return _elements;
+        }
     };
 
     /**
@@ -112,7 +115,7 @@ public:
      */
     class marker : public abstract_marker {
     public:
-        marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+        marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
             : abstract_marker{bind_index, std::move(receiver)}
         { }
         virtual ::shared_ptr<terminal> bind(const query_options& options) override;
@@ -157,8 +160,8 @@ public:
         setter_by_index(const column_definition& column, shared_ptr<term> idx, shared_ptr<term> t)
             : operation(column, std::move(t)), _idx(std::move(idx)) {
         }
-        virtual bool requires_read() override;
-        virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names);
+        virtual bool requires_read() const override;
+        virtual void collect_marker_specification(variable_specifications& bound_names) const;
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
     };
 
@@ -167,7 +170,7 @@ public:
         setter_by_uuid(const column_definition& column, shared_ptr<term> idx, shared_ptr<term> t)
             : setter_by_index(column, std::move(idx), std::move(t)) {
         }
-        virtual bool requires_read() override;
+        virtual bool requires_read() const override;
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
     };
 
@@ -194,7 +197,7 @@ public:
         discarder(const column_definition& column, shared_ptr<term> t)
                 : operation(column, std::move(t)) {
         }
-        virtual bool requires_read() override;
+        virtual bool requires_read() const override;
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
     };
 
@@ -203,7 +206,7 @@ public:
         discarder_by_index(const column_definition& column, shared_ptr<term> idx)
                 : operation(column, std::move(idx)) {
         }
-        virtual bool requires_read() override;
+        virtual bool requires_read() const override;
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params);
     };
 };

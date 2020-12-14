@@ -24,9 +24,9 @@
 #include <boost/range/iterator_range.hpp>
 
 #include "bytes.hh"
-#include "core/unaligned.hh"
+#include <seastar/core/unaligned.hh>
 #include "hashing.hh"
-#include "seastar/core/simple-stream.hh"
+#include <seastar/core/simple-stream.hh>
 /**
  * Utility for writing data into a buffer when its final size is not known up front.
  *
@@ -38,7 +38,8 @@ class bytes_ostream {
 public:
     using size_type = bytes::size_type;
     using value_type = bytes::value_type;
-    static constexpr size_type max_chunk_size() { return 16 * 1024; }
+    using fragment_type = bytes_view;
+    static constexpr size_type max_chunk_size() { return 128 * 1024; }
 private:
     static_assert(sizeof(value_type) == 1, "value_type is assumed to be one byte long");
     struct chunk {
@@ -57,16 +58,24 @@ private:
         value_type data[0];
         void operator delete(void* ptr) { free(ptr); }
     };
-    // FIXME: consider increasing chunk size as the buffer grows
-    static constexpr size_type chunk_size{512};
+    static constexpr size_type default_chunk_size{512};
 private:
     std::unique_ptr<chunk> _begin;
     chunk* _current;
     size_type _size;
+    size_type _initial_chunk_size = default_chunk_size;
 public:
-    class fragment_iterator : public std::iterator<std::input_iterator_tag, bytes_view> {
-        chunk* _current;
+    class fragment_iterator {
     public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = bytes_view;
+        using difference_type = std::ptrdiff_t;
+        using pointer = bytes_view*;
+        using reference = bytes_view&;
+    private:
+        chunk* _current = nullptr;
+    public:
+        fragment_iterator() = default;
         fragment_iterator(chunk* current) : _current(current) {}
         fragment_iterator(const fragment_iterator&) = default;
         fragment_iterator& operator=(const fragment_iterator&) = default;
@@ -92,6 +101,29 @@ public:
             return _current != other._current;
         }
     };
+    using const_iterator = fragment_iterator;
+
+    class output_iterator {
+    public:
+        using iterator_category = std::output_iterator_tag;
+        using difference_type = std::ptrdiff_t;
+        using value_type = bytes_ostream::value_type;
+        using pointer = bytes_ostream::value_type*;
+        using reference = bytes_ostream::value_type&;
+
+        friend class bytes_ostream;
+
+    private:
+        bytes_ostream* _ostream = nullptr;
+
+    private:
+        explicit output_iterator(bytes_ostream& os) : _ostream(&os) { }
+
+    public:
+        reference operator*() const { return *_ostream->write_place_holder(1); }
+        output_iterator& operator++() { return *this; }
+        output_iterator operator++(int) { return *this; }
+    };
 private:
     inline size_type current_space_left() const {
         if (!_current) {
@@ -101,13 +133,13 @@ private:
     }
     // Figure out next chunk size.
     //   - must be enough for data_size
-    //   - must be at least chunk_size
+    //   - must be at least _initial_chunk_size
     //   - try to double each time to prevent too many allocations
     //   - do not exceed max_chunk_size
     size_type next_alloc_size(size_t data_size) const {
         auto next_size = _current
                 ? _current->size * 2
-                : chunk_size;
+                : _initial_chunk_size;
         next_size = std::min(next_size, max_chunk_size());
         // FIXME: check for overflow?
         return std::max<size_type>(next_size, data_size + sizeof(chunk));
@@ -115,13 +147,19 @@ private:
     // Makes room for a contiguous region of given size.
     // The region is accounted for as already written.
     // size must not be zero.
+    [[gnu::always_inline]]
     value_type* alloc(size_type size) {
-        if (size <= current_space_left()) {
+        if (__builtin_expect(size <= current_space_left(), true)) {
             auto ret = _current->data + _current->offset;
             _current->offset += size;
             _size += size;
             return ret;
         } else {
+            return alloc_new(size);
+        }
+    }
+    [[gnu::noinline]]
+    value_type* alloc_new(size_type size) {
             auto alloc_size = next_alloc_size(size);
             auto space = malloc(alloc_size);
             if (!space) {
@@ -139,19 +177,22 @@ private:
             }
             _size += size;
             return _current->data;
-        };
     }
 public:
-    bytes_ostream() noexcept
+    explicit bytes_ostream(size_t initial_chunk_size) noexcept
         : _begin()
         , _current(nullptr)
         , _size(0)
+        , _initial_chunk_size(initial_chunk_size)
     { }
+
+    bytes_ostream() noexcept : bytes_ostream(default_chunk_size) {}
 
     bytes_ostream(bytes_ostream&& o) noexcept
         : _begin(std::move(o._begin))
         , _current(o._current)
         , _size(o._size)
+        , _initial_chunk_size(o._initial_chunk_size)
     {
         o._current = nullptr;
         o._size = 0;
@@ -161,6 +202,7 @@ public:
         : _begin()
         , _current(nullptr)
         , _size(0)
+        , _initial_chunk_size(o._initial_chunk_size)
     {
         append(o);
     }
@@ -198,18 +240,20 @@ public:
         return place_holder<T>{alloc(sizeof(T))};
     }
 
+    [[gnu::always_inline]]
     value_type* write_place_holder(size_type size) {
         return alloc(size);
     }
 
     // Writes given sequence of bytes
+    [[gnu::always_inline]]
     inline void write(bytes_view v) {
         if (v.empty()) {
             return;
         }
 
         auto this_size = std::min(v.size(), size_t(current_space_left()));
-        if (this_size) {
+        if (__builtin_expect(this_size, true)) {
             memcpy(_current->data + _current->offset, v.begin(), this_size);
             _current->offset += this_size;
             _size += this_size;
@@ -218,11 +262,12 @@ public:
 
         while (!v.empty()) {
             auto this_size = std::min(v.size(), size_t(max_chunk_size()));
-            std::copy_n(v.begin(), this_size, alloc(this_size));
+            std::copy_n(v.begin(), this_size, alloc_new(this_size));
             v.remove_prefix(this_size);
         }
     }
 
+    [[gnu::always_inline]]
     void write(const char* ptr, size_t size) {
         write(bytes_view(reinterpret_cast<const signed char*>(ptr), size));
     }
@@ -275,6 +320,11 @@ public:
         return _size;
     }
 
+    // For the FragmentRange concept
+    size_type size_bytes() const {
+        return _size;
+    }
+
     bool empty() const {
         return _size == 0;
     }
@@ -289,10 +339,30 @@ public:
         }
     }
 
+    // Removes n bytes from the end of the bytes_ostream.
+    // Beware of O(n) algorithm.
+    void remove_suffix(size_t n) {
+        _size -= n;
+        auto left = _size;
+        auto current = _begin.get();
+        while (current) {
+            if (current->offset >= left) {
+                current->offset = left;
+                _current = current;
+                current->next.reset();
+                return;
+            }
+            left -= current->offset;
+            current = current->next.get();
+        }
+    }
+
     // begin() and end() form an input range to bytes_view representing fragments.
     // Any modification of this instance invalidates iterators.
     fragment_iterator begin() const { return { _begin.get() }; }
     fragment_iterator end() const { return { nullptr }; }
+
+    output_iterator write_begin() { return output_iterator(*this); }
 
     boost::iterator_range<fragment_iterator> fragments() const {
         return { begin(), end() };
@@ -374,14 +444,19 @@ public:
     bool operator!=(const bytes_ostream& other) const {
         return !(*this == other);
     }
-};
 
-template<>
-struct appending_hash<bytes_ostream> {
-    template<typename Hasher>
-    void operator()(Hasher& h, const bytes_ostream& b) const {
-        for (auto&& frag : b.fragments()) {
-            feed_hash(h, frag);
+    // Makes this instance empty.
+    //
+    // The first buffer is not deallocated, so callers may rely on the
+    // fact that if they write less than the initial chunk size between
+    // the clear() calls then writes will not involve any memory allocations,
+    // except for the first write made on this instance.
+    void clear() {
+        if (_begin) {
+            _begin->offset = 0;
+            _size = 0;
+            _current = _begin.get();
+            _begin->next.reset();
         }
     }
 };

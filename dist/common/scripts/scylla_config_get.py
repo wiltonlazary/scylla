@@ -1,4 +1,5 @@
-#!/usr/bin/python2
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 #
 # Copyright 2016 ScyllaDB
 #
@@ -19,13 +20,14 @@
 # You should have received a copy of the GNU General Public License
 # along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
 
+import argparse
 import sys
 import yaml
-import argparse
+
 
 def get(config, key):
     s = open(config).read()
-    cfg = yaml.load(s)
+    cfg = yaml.safe_load(s)
     try:
         val = cfg[key]
     except KeyError:
@@ -40,6 +42,7 @@ def get(config, key):
     else:
         print(val)
 
+
 def main():
     parser = argparse.ArgumentParser(description='scylla.yaml config reader/writer from shellscript.')
     parser.add_argument('-c', '--config', dest='config', action='store',
@@ -49,6 +52,7 @@ def main():
                         required=True, help='get parameter')
     args = parser.parse_args()
     get(args.config, args.get)
+
 
 if __name__ == "__main__":
     main()

@@ -45,7 +45,6 @@
 #include "auth/default_authorizer.hh"
 #include "auth/password_authenticator.hh"
 #include "auth/permission.hh"
-#include "db/config.hh"
 #include "utils/class_registrator.hh"
 
 namespace auth {
@@ -83,7 +82,7 @@ public:
         return _authenticator->stop();
     }
 
-    virtual const sstring& qualified_java_name() const override {
+    virtual std::string_view qualified_java_name() const override {
         return transitional_authenticator_name();
     }
 
@@ -102,7 +101,7 @@ public:
     virtual future<authenticated_user> authenticate(const credentials_map& credentials) const override {
         auto i = credentials.find(authenticator::USERNAME_KEY);
         if ((i == credentials.end() || i->second.empty())
-                && (!credentials.count(PASSWORD_KEY) || credentials.at(PASSWORD_KEY).empty())) {
+                && (!credentials.contains(PASSWORD_KEY) || credentials.at(PASSWORD_KEY).empty())) {
             // return anon user
             return make_ready_future<authenticated_user>(anonymous_user());
         }
@@ -118,19 +117,19 @@ public:
         });
     }
 
-    virtual future<> create(stdx::string_view role_name, const authentication_options& options) const override {
+    virtual future<> create(std::string_view role_name, const authentication_options& options) const override {
         return _authenticator->create(role_name, options);
     }
 
-    virtual future<> alter(stdx::string_view role_name, const authentication_options& options) const override {
+    virtual future<> alter(std::string_view role_name, const authentication_options& options) const override {
         return _authenticator->alter(role_name, options);
     }
 
-    virtual future<> drop(stdx::string_view role_name) const override {
+    virtual future<> drop(std::string_view role_name) const override {
         return _authenticator->drop(role_name);
     }
 
-    virtual future<custom_options> query_custom_options(stdx::string_view role_name) const override {
+    virtual future<custom_options> query_custom_options(std::string_view role_name) const override {
         return _authenticator->query_custom_options(role_name);
     }
 
@@ -159,7 +158,7 @@ public:
             }
 
             virtual future<authenticated_user> get_authenticated_user() const {
-                return futurize_apply([this] {
+                return futurize_invoke([this] {
                     return _sasl->get_authenticated_user().handle_exception([](auto ep) {
                         try {
                             std::rethrow_exception(ep);
@@ -202,7 +201,7 @@ public:
         return _authorizer->stop();
     }
 
-    virtual const sstring& qualified_java_name() const override {
+    virtual std::string_view qualified_java_name() const override {
         return transitional_authorizer_name();
     }
 
@@ -218,11 +217,11 @@ public:
         return make_ready_future<permission_set>(transitional_permissions);
     }
 
-    virtual future<> grant(stdx::string_view s, permission_set ps, const resource& r) const override {
+    virtual future<> grant(std::string_view s, permission_set ps, const resource& r) const override {
         return _authorizer->grant(s, std::move(ps), r);
     }
 
-    virtual future<> revoke(stdx::string_view s, permission_set ps, const resource& r) const override {
+    virtual future<> revoke(std::string_view s, permission_set ps, const resource& r) const override {
         return _authorizer->revoke(s, std::move(ps), r);
     }
 
@@ -230,7 +229,7 @@ public:
         return _authorizer->list_all();
     }
 
-    virtual future<> revoke_all(stdx::string_view s) const override {
+    virtual future<> revoke_all(std::string_view s) const override {
         return _authorizer->revoke_all(s);
     }
 

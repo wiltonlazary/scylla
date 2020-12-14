@@ -27,7 +27,7 @@
 #include "mutation_fragment.hh"
 #include "mutation_reader.hh"
 #include "query-request.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "tracing/tracing.hh"
 
 #include <boost/range/iterator_range.hpp>
@@ -44,6 +44,11 @@ namespace db::view {
 // columns. When reading the results from the scylla_views_builds_in_progress
 // table, we adjust the clustering key (we shed the cpu_id column) and map
 // back the regular columns.
+// Since mutation fragment consumers expect clustering_row fragments
+// not to be duplicated for given primary key, previous clustering key
+// is stored between mutation fragments. If the clustering key becomes
+// the same as the previous one (as a result of trimming cpu_id),
+// the duplicated fragment is ignored.
 class build_progress_virtual_reader {
     database& _db;
 
@@ -55,9 +60,11 @@ class build_progress_virtual_reader {
         const query::partition_slice& _legacy_slice;
         query::partition_slice _slice;
         flat_mutation_reader _underlying;
+        std::optional<clustering_key> _previous_clustering_key;
 
         build_progress_reader(
                 schema_ptr legacy_schema,
+                reader_permit permit,
                 column_family& scylla_views_build_progress,
                 const dht::partition_range& range,
                 const query::partition_slice& slice,
@@ -65,7 +72,7 @@ class build_progress_virtual_reader {
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd,
                 mutation_reader::forwarding fwd_mr)
-                : flat_mutation_reader::impl(std::move(legacy_schema))
+                : flat_mutation_reader::impl(std::move(legacy_schema), permit)
                 , _scylla_next_token_col(scylla_views_build_progress.schema()->get_column_definition("next_token")->id)
                 , _scylla_generation_number_col(scylla_views_build_progress.schema()->get_column_definition("generation_number")->id)
                 , _legacy_last_token_col(_schema->get_column_definition("last_token")->id)
@@ -74,12 +81,14 @@ class build_progress_virtual_reader {
                 , _slice(adjust_partition_slice())
                 , _underlying(scylla_views_build_progress.make_reader(
                         scylla_views_build_progress.schema(),
+                        std::move(permit),
                         range,
                         slice,
                         pc,
                         std::move(trace_state),
                         fwd,
-                        fwd_mr)) {
+                        fwd_mr))
+                , _previous_clustering_key() {
         }
 
         const schema& underlying_schema() const {
@@ -88,7 +97,7 @@ class build_progress_virtual_reader {
 
         query::partition_slice adjust_partition_slice() {
             auto slice = _legacy_slice;
-            std::vector<column_id> adjusted_columns;
+            query::column_id_vector adjusted_columns;
             for (auto col_id : slice.regular_columns) {
                 if (col_id == _legacy_last_token_col) {
                     adjusted_columns.push_back(_scylla_next_token_col);
@@ -100,14 +109,14 @@ class build_progress_virtual_reader {
             return slice;
         }
 
-        clustering_key adjust_ckey(clustering_key& ck) {
-            if (ck.size(underlying_schema()) < 3) {
-                return std::move(ck);
+        clustering_key adjust_ckey(clustering_key& underlying_ck) {
+            if (!underlying_ck.is_full(underlying_schema())) {
+                return std::move(underlying_ck);
             }
             // Drop the cpu_id from the clustering key
-            auto end = ck.begin(*_schema);
-            std::advance(end, 1);
-            auto r = boost::make_iterator_range(ck.begin(*_schema), std::move(end));
+            auto end = underlying_ck.begin(underlying_schema());
+            std::advance(end, underlying_schema().clustering_key_size() - 1);
+            auto r = boost::make_iterator_range(underlying_ck.begin(underlying_schema()), std::move(end));
             return clustering_key_prefix::from_exploded(r);
         }
 
@@ -127,19 +136,26 @@ class build_progress_virtual_reader {
                                 legacy_in_progress_row.append_cell(_legacy_generation_number_col, std::move(c));
                             }
                         });
-                        mf = clustering_row(
-                                adjust_ckey(scylla_in_progress_row.key()),
+                        auto ck = adjust_ckey(scylla_in_progress_row.key());
+                        if (_previous_clustering_key && ck.equal(*_schema, *_previous_clustering_key)) {
+                            continue;
+                        }
+                        _previous_clustering_key = ck;
+                        mf = mutation_fragment(*_schema, _permit, clustering_row(
+                                std::move(ck),
                                 std::move(scylla_in_progress_row.tomb()),
                                 std::move(scylla_in_progress_row.marker()),
-                                std::move(legacy_in_progress_row));
+                                std::move(legacy_in_progress_row)));
                     } else if (mf.is_range_tombstone()) {
                         auto scylla_in_progress_rt = std::move(mf).as_range_tombstone();
-                        mf = range_tombstone(
+                        mf = mutation_fragment(*_schema, _permit, range_tombstone(
                                 adjust_ckey(scylla_in_progress_rt.start),
                                 scylla_in_progress_rt.start_kind,
-                                scylla_in_progress_rt.end,
+                                adjust_ckey(scylla_in_progress_rt.end),
                                 scylla_in_progress_rt.end_kind,
-                                scylla_in_progress_rt.tomb);
+                                scylla_in_progress_rt.tomb));
+                    } else if (mf.is_end_of_partition()) {
+                        _previous_clustering_key.reset();
                     }
                     push_mutation_fragment(std::move(mf));
                 }
@@ -174,6 +190,7 @@ public:
 
     flat_mutation_reader operator()(
             schema_ptr s,
+            reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             const io_priority_class& pc,
@@ -182,6 +199,7 @@ public:
             mutation_reader::forwarding fwd_mr) {
         return flat_mutation_reader(std::make_unique<build_progress_reader>(
                 std::move(s),
+                std::move(permit),
                 _db.find_column_family(s->ks_name(), system_keyspace::v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS),
                 range,
                 slice,

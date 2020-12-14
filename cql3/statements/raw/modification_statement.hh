@@ -51,10 +51,8 @@
 #include "cql3/operation.hh"
 #include "cql3/relation.hh"
 
-#include "db/consistency_level.hh"
-
-#include "core/shared_ptr.hh"
-#include "core/future-util.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/future-util.hh>
 
 #include "unimplemented.hh"
 #include "validation.hh"
@@ -72,22 +70,28 @@ namespace raw {
 
 class modification_statement : public cf_statement {
 public:
-    using conditions_vector = std::vector<std::pair<::shared_ptr<column_identifier::raw>, ::shared_ptr<column_condition::raw>>>;
+    using conditions_vector = std::vector<std::pair<::shared_ptr<column_identifier::raw>, lw_shared_ptr<column_condition::raw>>>;
 protected:
-    const ::shared_ptr<attributes::raw> _attrs;
-    const std::vector<std::pair<::shared_ptr<column_identifier::raw>, ::shared_ptr<column_condition::raw>>> _conditions;
+    const std::unique_ptr<attributes::raw> _attrs;
+    const std::vector<std::pair<::shared_ptr<column_identifier::raw>, lw_shared_ptr<column_condition::raw>>> _conditions;
 private:
     const bool _if_not_exists;
     const bool _if_exists;
 protected:
-    modification_statement(::shared_ptr<cf_name> name, ::shared_ptr<attributes::raw> attrs, conditions_vector conditions, bool if_not_exists, bool if_exists);
+    modification_statement(::shared_ptr<cf_name> name, std::unique_ptr<attributes::raw> attrs, conditions_vector conditions, bool if_not_exists, bool if_exists);
 
 public:
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
-    ::shared_ptr<cql3::statements::modification_statement> prepare(database& db, ::shared_ptr<variable_specifications> bound_names, cql_stats& stats);
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
+    ::shared_ptr<cql3::statements::modification_statement> prepare(database& db, variable_specifications& bound_names, cql_stats& stats) const;
 protected:
     virtual ::shared_ptr<cql3::statements::modification_statement> prepare_internal(database& db, schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats) = 0;
+        variable_specifications& bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats) const = 0;
+
+    // Helper function used by child classes to prepare conditions for a prepared statement.
+    // Must be called before processing WHERE clause, because to perform sanity checks there
+    // we need to know what kinds of conditions (static, regular) the statement has.
+    void prepare_conditions(database& db, const schema& schema, variable_specifications& bound_names,
+            cql3::statements::modification_statement& stmt) const;
 };
 
 }

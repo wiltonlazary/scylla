@@ -44,19 +44,19 @@
 #include "term.hh"
 #include "to_string.hh"
 
-std::vector<const column_definition*> cql3::token_relation::get_column_definitions(schema_ptr s) {
+std::vector<const column_definition*> cql3::token_relation::get_column_definitions(const schema& s) {
     std::vector<const column_definition*> res;
     std::transform(_entities.begin(), _entities.end(), std::back_inserter(res),
-            [this, s](auto& cr) {
-                return &this->to_column_definition(s, cr);
+            [this, &s](const auto& cr) {
+                return &this->to_column_definition(s, *cr);
             });
     return res;
 }
 
-std::vector<::shared_ptr<cql3::column_specification>> cql3::token_relation::to_receivers(
-        schema_ptr schema,
-        const std::vector<const column_definition*>& column_defs) {
-    auto pk = schema->partition_key_columns();
+std::vector<lw_shared_ptr<cql3::column_specification>> cql3::token_relation::to_receivers(
+        const schema& schema,
+        const std::vector<const column_definition*>& column_defs) const {
+    auto pk = schema.partition_key_columns();
     if (!std::equal(column_defs.begin(), column_defs.end(), pk.begin(),
             pk.end(), [](auto* c1, auto& c2) {
                 return c1 == &c2; // same, not "equal".
@@ -70,62 +70,71 @@ std::vector<::shared_ptr<cql3::column_specification>> cql3::token_relation::to_r
         checkContainsOnly(columnDefs, cfm.partitionKeyColumns(), "The token() function must contains only partition key components");
 #endif
         throw exceptions::invalid_request_exception(
-                sprint(
-                        "The token function arguments must be in the partition key order: %s",
+                format("The token function arguments must be in the partition key order: {}",
                         std::to_string(column_defs)));
     }
     //auto* c = column_defs.front();
-    return {::make_shared<column_specification>(schema->ks_name(), schema->cf_name(),
+    return {make_lw_shared<column_specification>(schema.ks_name(), schema.cf_name(),
                 ::make_shared<column_identifier>("partition key token", true),
-                dht::global_partitioner().get_token_validator())};
+                dht::token::get_token_validator())};
 }
 
 ::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_EQ_restriction(
         database& db, schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names) {
-    auto column_defs = get_column_definitions(schema);
-    auto term = to_term(to_receivers(schema, column_defs), _value, db,
+        variable_specifications& bound_names) {
+    auto column_defs = get_column_definitions(*schema);
+    auto term = to_term(to_receivers(*schema, column_defs), *_value, db,
             schema->ks_name(), bound_names);
-    return ::make_shared<restrictions::token_restriction::EQ>(column_defs, term);
+    auto r = ::make_shared<restrictions::token_restriction>(column_defs);
+    using namespace expr;
+    r->expression = binary_operator{token{}, oper_t::EQ, std::move(term)};
+    return r;
 }
 
 ::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_IN_restriction(
         database& db, schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names) {
+        variable_specifications& bound_names) {
     throw exceptions::invalid_request_exception(
-            sprint("%s cannot be used with the token function",
+            format("{} cannot be used with the token function",
                     get_operator()));
 }
 
 ::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_slice_restriction(
         database& db, schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names,
+        variable_specifications& bound_names,
         statements::bound bound,
         bool inclusive) {
-    auto column_defs = get_column_definitions(schema);
-    auto term = to_term(to_receivers(schema, column_defs), _value, db,
+    auto column_defs = get_column_definitions(*schema);
+    auto term = to_term(to_receivers(*schema, column_defs), *_value, db,
             schema->ks_name(), bound_names);
-    return ::make_shared<restrictions::token_restriction::slice>(column_defs,
-            bound, inclusive, term);
+    auto r = ::make_shared<restrictions::token_restriction>(column_defs);
+    using namespace expr;
+    r->expression = binary_operator{token{}, pick_operator(bound, inclusive), std::move(term)};
+    return r;
 }
 
 ::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_contains_restriction(
         database& db, schema_ptr schema,
-        ::shared_ptr<variable_specifications> bound_names, bool isKey) {
+        variable_specifications& bound_names, bool isKey) {
     throw exceptions::invalid_request_exception(
-            sprint("%s cannot be used with the token function",
+            format("{} cannot be used with the token function",
                     get_operator()));
 }
 
+::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_LIKE_restriction(
+        database&, schema_ptr, variable_specifications&) {
+    throw exceptions::invalid_request_exception("LIKE cannot be used with the token function");
+}
+
 sstring cql3::token_relation::to_string() const {
-    return sprint("token(%s) %s %s", join(", ", _entities), get_operator(), _value);
+    return format("token({}) {} {}", join(", ", _entities), get_operator(), _value);
 }
 
 ::shared_ptr<cql3::term> cql3::token_relation::to_term(
-        const std::vector<::shared_ptr<column_specification>>& receivers,
-        ::shared_ptr<term::raw> raw, database& db, const sstring& keyspace,
-        ::shared_ptr<variable_specifications> bound_names) {
-    auto term = raw->prepare(db, keyspace, receivers.front());
+        const std::vector<lw_shared_ptr<column_specification>>& receivers,
+        const term::raw& raw, database& db, const sstring& keyspace,
+        variable_specifications& bound_names) const {
+    auto term = raw.prepare(db, keyspace, receivers.front());
     term->collect_marker_specification(bound_names);
     return term;
 }

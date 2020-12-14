@@ -41,22 +41,20 @@
 
 #pragma once
 
-#include <experimental/string_view>
+#include <string_view>
 #include <unordered_map>
 
-#include <seastar/core/distributed.hh>
 #include <seastar/core/metrics_registration.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 
 #include "cql3/prepared_statements_cache.hh"
+#include "cql3/authorized_prepared_statements_cache.hh"
 #include "cql3/query_options.hh"
 #include "cql3/statements/prepared_statement.hh"
-#include "cql3/statements/raw/parsed_statement.hh"
-#include "cql3/statements/raw/cf_statement.hh"
-#include "cql3/untyped_result_set.hh"
 #include "exceptions/exceptions.hh"
 #include "log.hh"
-#include "service/migration_manager.hh"
+#include "service/migration_listener.hh"
 #include "service/query_state.hh"
 #include "transport/messages/result_message.hh"
 
@@ -64,6 +62,12 @@ namespace cql3 {
 
 namespace statements {
 class batch_statement;
+
+namespace raw {
+
+class parsed_statement;
+
+}
 }
 
 class untyped_result_set;
@@ -96,17 +100,26 @@ public:
     }
 };
 
+class cql_config;
+
 class query_processor {
 public:
     class migration_subscriber;
+    struct memory_config {
+        size_t prepared_statment_cache_size = 0;
+        size_t authorized_prepared_cache_size = 0;
+    };
 
 private:
     std::unique_ptr<migration_subscriber> _migration_subscriber;
     service::storage_proxy& _proxy;
-    distributed<database>& _db;
+    database& _db;
+    service::migration_notifier& _mnotifier;
+    const cql_config& _cql_config;
 
     struct stats {
         uint64_t prepare_invocations = 0;
+        uint64_t queries_by_cl[size_t(db::consistency_level::MAX_VALUE) + 1] = {};
     } _stats;
 
     cql_stats _cql_stats;
@@ -117,6 +130,7 @@ private:
     std::unique_ptr<internal_state> _internal_state;
 
     prepared_statements_cache _prepared_cache;
+    authorized_prepared_statements_cache _authorized_prepared_cache;
 
     // A map for prepared statements used internally (which we don't want to mix with user statement, in particular we
     // don't bother with expiration on those.
@@ -126,21 +140,25 @@ public:
     static const sstring CQL_VERSION;
 
     static prepared_cache_key_type compute_id(
-            const std::experimental::string_view& query_string,
-            const sstring& keyspace);
+            std::string_view query_string,
+            std::string_view keyspace);
 
     static prepared_cache_key_type compute_thrift_id(
-            const std::experimental::string_view& query_string,
+            const std::string_view& query_string,
             const sstring& keyspace);
 
-    static ::shared_ptr<statements::raw::parsed_statement> parse_statement(const std::experimental::string_view& query);
+    static std::unique_ptr<statements::raw::parsed_statement> parse_statement(const std::string_view& query);
 
-    query_processor(service::storage_proxy& proxy, distributed<database>& db);
+    query_processor(service::storage_proxy& proxy, database& db, service::migration_notifier& mn, memory_config mcfg, cql_config& cql_cfg);
 
     ~query_processor();
 
-    distributed<database>& db() {
+    database& db() {
         return _db;
+    }
+
+    const cql_config& get_cql_config() const {
+        return _cql_config;
     }
 
     service::storage_proxy& proxy() {
@@ -149,6 +167,21 @@ public:
 
     cql_stats& get_cql_stats() {
         return _cql_stats;
+    }
+
+    statements::prepared_statement::checked_weak_ptr get_prepared(const std::optional<auth::authenticated_user>& user, const prepared_cache_key_type& key) {
+        if (user) {
+            auto it = _authorized_prepared_cache.find(*user, key);
+            if (it != _authorized_prepared_cache.end()) {
+                try {
+                    return it->get()->checked_weak_from_this();
+                } catch (seastar::checked_ptr_is_null_exception&) {
+                    // If the prepared statement got invalidated - remove the corresponding authorized_prepared_statements_cache entry as well.
+                    _authorized_prepared_cache.remove(*user, key);
+                }
+            }
+        }
+        return statements::prepared_statement::checked_weak_ptr();
     }
 
     statements::prepared_statement::checked_weak_ptr get_prepared(const prepared_cache_key_type& key) {
@@ -160,24 +193,33 @@ public:
     }
 
     future<::shared_ptr<cql_transport::messages::result_message>>
-    process_statement(
-            ::shared_ptr<cql_statement> statement,
+    execute_prepared(
+            statements::prepared_statement::checked_weak_ptr statement,
+            cql3::prepared_cache_key_type cache_key,
             service::query_state& query_state,
-            const query_options& options);
+            const query_options& options,
+            bool needs_authorization);
 
+    /// Execute a client statement that was not prepared.
     future<::shared_ptr<cql_transport::messages::result_message>>
-    process(
-            const std::experimental::string_view& query_string,
+    execute_direct(
+            const std::string_view& query_string,
             service::query_state& query_state,
             query_options& options);
 
+    // NOTICE: Internal queries should be used with care, as they are expected
+    // to be used for local tables (e.g. from the `system` keyspace).
+    // Data modifications will usually be performed with consistency level ONE
+    // and schema changes will not be announced to other nodes.
+    // Because of that, changing global schema state (e.g. modifying non-local tables,
+    // creating namespaces, etc) is explicitly forbidden via this interface.
     future<::shared_ptr<untyped_result_set>>
-    execute_internal(const sstring& query_string, const std::initializer_list<data_value>& = { });
+    execute_internal(const sstring& query_string, const std::initializer_list<data_value>& values = { }) {
+        return execute_internal(query_string, db::consistency_level::ONE,
+                infinite_timeout_config, values, true);
+    }
 
     statements::prepared_statement::checked_weak_ptr prepare_internal(const sstring& query);
-
-    future<::shared_ptr<untyped_result_set>>
-    execute_internal(statements::prepared_statement::checked_weak_ptr p, const std::initializer_list<data_value>& = { });
 
     /*!
      * \brief iterate over all cql results using paging
@@ -212,26 +254,66 @@ public:
                 create_paged_state(query_string, { data_value(std::forward<Args>(args))... }), std::move(f));
     }
 
-    future<::shared_ptr<untyped_result_set>> process(
+    /*!
+     * \brief iterate over all cql results using paging
+     *
+     * You Create a statement with optional paraemter and pass
+     * a function that goes over the results.
+     *
+     * The passed function would be called for all the results, return future<stop_iteration::yes>
+     * to stop during iteration.
+     *
+     * For example:
+            return query("SELECT * from system.compaction_history",
+                         [&history] (const cql3::untyped_result_set::row& row) mutable {
+                ....
+                ....
+                return make_ready_future<stop_iteration>(stop_iteration::no);
+            });
+
+     * You can use place holder in the query, the prepared statement will only be done once.
+     *
+     *
+     * query_string - the cql string, can contain place holder
+     * values - query parameters value
+     * f - a function to be run on each of the query result, if the function return stop_iteration::no the iteration
+     * would stop
+     */
+    future<> query(
+            const sstring& query_string,
+            const std::initializer_list<data_value>& values,
+            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
+
+    /*
+     * \brief iterate over all cql results using paging
+     * An overload of the query with future function without query parameters.
+     *
+     * query_string - the cql string, can contain place holder
+     * f - a function to be run on each of the query result, if the function return stop_iteration::no the iteration
+     * would stop
+     */
+    future<> query(
+            const sstring& query_string,
+            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
+
+    // NOTICE: Internal queries should be used with care, as they are expected
+    // to be used for local tables (e.g. from the `system` keyspace).
+    // Data modifications will usually be performed with consistency level ONE
+    // and schema changes will not be announced to other nodes.
+    // Because of that, changing global schema state (e.g. modifying non-local tables,
+    // creating namespaces, etc) is explicitly forbidden via this interface.
+    future<::shared_ptr<untyped_result_set>> execute_internal(
             const sstring& query_string,
             db::consistency_level,
+            const timeout_config& timeout_config,
             const std::initializer_list<data_value>& = { },
             bool cache = false);
 
-    future<::shared_ptr<untyped_result_set>> process(
+    future<::shared_ptr<untyped_result_set>> execute_with_params(
             statements::prepared_statement::checked_weak_ptr p,
             db::consistency_level,
+            const timeout_config& timeout_config,
             const std::initializer_list<data_value>& = { });
-
-    /*
-     * This function provides a timestamp that is guaranteed to be higher than any timestamp
-     * previously used in internal queries.
-     *
-     * This is useful because the client_state have a built-in mechanism to guarantee monotonicity.
-     * Bypassing that mechanism by the use of some other clock may yield times in the past, even if the operation
-     * was done in the future.
-     */
-    api::timestamp_type next_timestamp();
 
     future<::shared_ptr<cql_transport::messages::result_message::prepared>>
     prepare(sstring query_string, service::query_state& query_state);
@@ -242,10 +324,14 @@ public:
     future<> stop();
 
     future<::shared_ptr<cql_transport::messages::result_message>>
-    process_batch(::shared_ptr<statements::batch_statement>, service::query_state& query_state, query_options& options);
+    execute_batch(
+            ::shared_ptr<statements::batch_statement>,
+            service::query_state& query_state,
+            query_options& options,
+            std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries);
 
     std::unique_ptr<statements::prepared_statement> get_statement(
-            const std::experimental::string_view& query,
+            const std::string_view& query,
             const service::client_state& client_state);
 
     friend class migration_subscriber;
@@ -254,8 +340,12 @@ private:
     query_options make_internal_options(
             const statements::prepared_statement::checked_weak_ptr& p,
             const std::initializer_list<data_value>&,
-            db::consistency_level = db::consistency_level::ONE,
-            int32_t page_size = -1);
+            db::consistency_level,
+            const timeout_config& timeout_config,
+            int32_t page_size = -1) const;
+
+    future<::shared_ptr<cql_transport::messages::result_message>>
+    process_authorized_statement(const ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options);
 
     /*!
      * \brief created a state object for paging
@@ -278,6 +368,13 @@ private:
     future<> for_each_cql_result(
             ::shared_ptr<cql3::internal_query_state> state,
             std::function<stop_iteration(const cql3::untyped_result_set_row&)>&& f);
+
+    /*!
+     * \brief iterate over all results using paging, accept a function that returns a future
+     */
+    future<> for_each_cql_result(
+            ::shared_ptr<cql3::internal_query_state> state,
+             noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
 
     /*!
      * \brief check, based on the state if there are additional results
@@ -313,44 +410,22 @@ private:
                 auto bound_terms = prepared->statement->get_bound_terms();
                 if (bound_terms > std::numeric_limits<uint16_t>::max()) {
                     throw exceptions::invalid_request_exception(
-                            sprint("Too many markers(?). %d markers exceed the allowed maximum of %d",
+                            format("Too many markers(?). {:d} markers exceed the allowed maximum of {:d}",
                                    bound_terms,
                                    std::numeric_limits<uint16_t>::max()));
                 }
                 assert(bound_terms == prepared->bound_names.size());
-                prepared->raw_cql_statement = query_string;
                 return make_ready_future<std::unique_ptr<statements::prepared_statement>>(std::move(prepared));
-            }).then([&key, &id_getter] (auto prep_ptr) {
+            }).then([&key, &id_getter, &client_state] (auto prep_ptr) {
                 return make_ready_future<::shared_ptr<cql_transport::messages::result_message::prepared>>(
-                        ::make_shared<ResultMsgType>(id_getter(key), std::move(prep_ptr)));
+                        ::make_shared<ResultMsgType>(id_getter(key), std::move(prep_ptr),
+                            client_state.is_protocol_extension_set(cql_transport::cql_protocol_extension::LWT_ADD_METADATA_MARK)));
             }).handle_exception_type([&query_string] (typename prepared_statements_cache::statement_is_too_big&) {
                 return make_exception_future<::shared_ptr<cql_transport::messages::result_message::prepared>>(
                         prepared_statement_is_too_big(query_string));
             });
         });
     };
-
-    template <typename ResultMsgType, typename KeyGenerator, typename IdGetter>
-    ::shared_ptr<cql_transport::messages::result_message::prepared>
-    get_stored_prepared_statement_one(
-            const std::experimental::string_view& query_string,
-            const sstring& keyspace,
-            KeyGenerator&& key_gen,
-            IdGetter&& id_getter) {
-        auto cache_key = key_gen(query_string, keyspace);
-        auto it = _prepared_cache.find(cache_key);
-        if (it == _prepared_cache.end()) {
-            return ::shared_ptr<cql_transport::messages::result_message::prepared>();
-        }
-
-        return ::make_shared<ResultMsgType>(id_getter(cache_key), *it);
-    }
-
-    ::shared_ptr<cql_transport::messages::result_message::prepared>
-    get_stored_prepared_statement(
-            const std::experimental::string_view& query_string,
-            const sstring& keyspace,
-            bool for_thrift);
 };
 
 class query_processor::migration_subscriber : public service::migration_listener {
@@ -381,22 +456,12 @@ public:
     virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override;
 
 private:
-    void remove_invalid_prepared_statements(sstring ks_name, std::experimental::optional<sstring> cf_name);
+    void remove_invalid_prepared_statements(sstring ks_name, std::optional<sstring> cf_name);
 
     bool should_invalidate(
             sstring ks_name,
-            std::experimental::optional<sstring> cf_name,
+            std::optional<sstring> cf_name,
             ::shared_ptr<cql_statement> statement);
 };
-
-extern distributed<query_processor> _the_query_processor;
-
-inline distributed<query_processor>& get_query_processor() {
-    return _the_query_processor;
-}
-
-inline query_processor& get_local_query_processor() {
-    return _the_query_processor.local();
-}
 
 }

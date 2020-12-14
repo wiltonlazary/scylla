@@ -58,14 +58,19 @@ cql3::statements::list_permissions_statement::list_permissions_statement(
             , _recursive(recursive) {
 }
 
+std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::list_permissions_statement::prepare(
+                database& db, cql_stats& stats) {
+    return std::make_unique<prepared_statement>(::make_shared<list_permissions_statement>(*this));
+}
+
 void cql3::statements::list_permissions_statement::validate(
         service::storage_proxy& proxy,
-        const service::client_state& state) {
+        const service::client_state& state) const {
     // a check to ensure the existence of the user isn't being leaked by user existence check.
     state.ensure_not_anonymous();
 }
 
-future<> cql3::statements::list_permissions_statement::check_access(const service::client_state& state) {
+future<> cql3::statements::list_permissions_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
     if (_resource) {
         maybe_correct_resource(*_resource, state);
         return state.ensure_exists(*_resource);
@@ -88,7 +93,7 @@ future<> cql3::statements::list_permissions_statement::check_access(const servic
             if (!has_role) {
                 return make_exception_future<>(
                         exceptions::unauthorized_exception(
-                                sprint("You are not authorized to view %s's permissions", *_role_name)));
+                                format("You are not authorized to view {}'s permissions", *_role_name)));
             }
 
             return make_ready_future<>();
@@ -103,16 +108,16 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 cql3::statements::list_permissions_statement::execute(
         service::storage_proxy& proxy,
         service::query_state& state,
-        const query_options& options) {
+        const query_options& options) const {
     static auto make_column = [](sstring name) {
-        return ::make_shared<column_specification>(
+        return make_lw_shared<column_specification>(
                 auth::meta::AUTH_KS,
                 "permissions",
                 ::make_shared<column_identifier>(std::move(name), true),
                 utf8_type);
     };
 
-    static thread_local const std::vector<::shared_ptr<column_specification>> metadata({
+    static thread_local const std::vector<lw_shared_ptr<column_specification>> metadata({
         make_column("role"), make_column("username"), make_column("resource"), make_column("permission")
     });
 
@@ -154,7 +159,7 @@ cql3::statements::list_permissions_statement::execute(
                 }();
 
                 const auto decomposed_role_name = utf8_type->decompose(pd.role_name);
-                const auto decomposed_resource = utf8_type->decompose(sstring(sprint("%s", pd.resource)));
+                const auto decomposed_resource = utf8_type->decompose(sstring(format("{}", pd.resource)));
 
                 for (const auto& ps : sorted_permission_names) {
                     rs->add_row(
@@ -166,8 +171,8 @@ cql3::statements::list_permissions_statement::execute(
                 }
             }
 
-            auto rows = ::make_shared<cql_transport::messages::result_message::rows>(std::move(rs));
-            return ::shared_ptr<cql_transport::messages::result_message>(std::move(rows));
+            auto rows = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(std::move(rs))));
+            return ::shared_ptr<cql_transport::messages::result_message>(rows);
         }).handle_exception_type([](const auth::nonexistant_role& e) {
             return make_exception_future<::shared_ptr<cql_transport::messages::result_message>>(
                     exceptions::invalid_request_exception(e.what()));

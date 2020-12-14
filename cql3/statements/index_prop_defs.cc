@@ -49,7 +49,7 @@ void cql3::statements::index_prop_defs::validate() {
     property_definitions::validate(keywords);
 
     if (is_custom && !custom_class) {
-        throw exceptions::invalid_request_exception("CUSTOM index requires specifiying the index class");
+        throw exceptions::invalid_request_exception("CUSTOM index requires specifying the index class");
     }
 
     if (!is_custom && custom_class) {
@@ -61,8 +61,18 @@ void cql3::statements::index_prop_defs::validate() {
     if (get_raw_options().count(
             db::index::secondary_index::custom_index_option_name)) {
         throw exceptions::invalid_request_exception(
-                sprint("Cannot specify %s as a CUSTOM option",
+                format("Cannot specify {} as a CUSTOM option",
                         db::index::secondary_index::custom_index_option_name));
+    }
+
+    // Currently, Scylla does not support *any* class of custom index
+    // implementation. If in the future we do (e.g., SASI, or something
+    // new), we'll need to check for valid values here.
+    if (is_custom && custom_class) {
+        throw exceptions::invalid_request_exception(
+                format("Unsupported CUSTOM INDEX class {}. Note that currently, Scylla does not support SASI or any other CUSTOM INDEX class.",
+                        *custom_class));
+
     }
 }
 

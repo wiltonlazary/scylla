@@ -42,11 +42,17 @@
 #include <vector>
 
 #include "gms/inet_address.hh"
-#include "core/shared_ptr.hh"
-#include "core/thread.hh"
-#include "core/distributed.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/core/distributed.hh>
 #include "utils/class_registrator.hh"
 #include "log.hh"
+
+namespace gms {
+
+enum class application_state;
+
+}
 
 namespace locator {
 
@@ -83,7 +89,7 @@ public:
      */
     virtual std::vector<inet_address> get_sorted_list_by_proximity(
         inet_address address,
-        std::unordered_set<inet_address>& unsorted_address) = 0;
+        std::vector<inet_address>& unsorted_address) = 0;
 
     /**
      * This method will sort the <tt>List</tt> by proximity to the given
@@ -175,8 +181,9 @@ public:
         return _gossip_started;
     }
 
-    virtual void reload_gossiper_state() {
+    virtual future<> reload_gossiper_state() {
         // noop by default
+        return make_ready_future<>();
     }
 
 protected:
@@ -407,7 +414,7 @@ public:
 
     virtual std::vector<inet_address> get_sorted_list_by_proximity(
         inet_address address,
-        std::unordered_set<inet_address>& unsorted_address) override;
+        std::vector<inet_address>& unsorted_address) override;
 
     virtual void sort_by_proximity(
         inet_address address, std::vector<inet_address>& addresses) override;
@@ -424,6 +431,8 @@ private:
     bool has_remote_node(std::vector<inet_address>& l);
 
 protected:
+    static std::optional<sstring> get_endpoint_info(inet_address endpoint,
+                                                    gms::application_state key);
     sstring _my_dc;
     sstring _my_rack;
     bool _prefer_local = false;

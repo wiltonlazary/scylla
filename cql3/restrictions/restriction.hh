@@ -17,7 +17,7 @@
  */
 
 /*
- * Copyright (C) 2015 ScyllaDB
+ * Copyright (C) 2019 ScyllaDB
  *
  * Modified by ScyllaDB
  */
@@ -41,96 +41,21 @@
 
 #pragma once
 
-#include <vector>
-
-#include "index/secondary_index_manager.hh"
-#include "cql3/query_options.hh"
-#include "cql3/statements/bound.hh"
-#include "types.hh"
+#include "cql3/expr/expression.hh"
 
 namespace cql3 {
 
 namespace restrictions {
 
 /**
- * A restriction/clause on a column.
- * The goal of this class being to group all conditions for a column in a SELECT.
+ * Result of relation::to_restriction().  TODO: remove this class and rewrite to_restriction to return
+ * expression.
  */
 class restriction {
 public:
+    // Init to false for now, to easily detect errors.  This whole class is going away.
+    cql3::expr::expression expression = false;
     virtual ~restriction() {}
-    virtual bool is_on_token() const = 0;
-    virtual bool is_slice() const = 0;
-    virtual bool is_EQ() const = 0;
-    virtual bool is_IN() const = 0;
-    virtual bool is_contains() const = 0;
-    virtual bool is_multi_column() const = 0;
-
-    virtual std::vector<bytes_opt> values(const query_options& options) const = 0;
-
-    virtual bytes_opt value(const query_options& options) const {
-        auto vec = values(options);
-        assert(vec.size() == 1);
-        return std::move(vec[0]);
-    }
-
-    /**
-     * Returns <code>true</code> if one of the restrictions use the specified function.
-     *
-     * @param ks_name the keyspace name
-     * @param function_name the function name
-     * @return <code>true</code> if one of the restrictions use the specified function, <code>false</code> otherwise.
-     */
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const = 0;
-
-    /**
-     * Checks if the specified bound is set or not.
-     * @param b the bound type
-     * @return <code>true</code> if the specified bound is set, <code>false</code> otherwise
-     */
-    virtual bool has_bound(statements::bound b) const = 0;
-
-    virtual std::vector<bytes_opt> bounds(statements::bound b, const query_options& options) const = 0;
-
-    /**
-     * Checks if the specified bound is inclusive or not.
-     * @param b the bound type
-     * @return <code>true</code> if the specified bound is inclusive, <code>false</code> otherwise
-     */
-    virtual bool is_inclusive(statements::bound b) const = 0;
-
-    /**
-     * Merges this restriction with the specified one.
-     *
-     * @param otherRestriction the restriction to merge into this one
-     * @return the restriction resulting of the merge
-     * @throws InvalidRequestException if the restrictions cannot be merged
-     */
-    virtual void merge_with(::shared_ptr<restriction> other) = 0;
-
-    /**
-     * Check if the restriction is on indexed columns.
-     *
-     * @param indexManager the index manager
-     * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
-     */
-    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager) const = 0;
-
-#if 0
-    /**
-     * Adds to the specified list the <code>IndexExpression</code>s corresponding to this <code>Restriction</code>.
-     *
-     * @param expressions the list to add the <code>IndexExpression</code>s to
-     * @param options the query options
-     * @throws InvalidRequestException if this <code>Restriction</code> cannot be converted into 
-     * <code>IndexExpression</code>s
-     */
-    public void addIndexExpressionTo(List<IndexExpression> expressions,
-                                     QueryOptions options)
-                                     throws InvalidRequestException;
-#endif
-
-    virtual sstring to_string() const = 0;
 };
 
 }

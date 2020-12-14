@@ -47,7 +47,7 @@ extern logging::logger sslog;
 
 future<stream_state> stream_result_future::init_sending_side(UUID plan_id_, sstring description_,
         std::vector<stream_event_handler*> listeners_, shared_ptr<stream_coordinator> coordinator_) {
-    auto sr = make_shared<stream_result_future>(plan_id_, description_, coordinator_);
+    auto sr = ::make_shared<stream_result_future>(plan_id_, description_, coordinator_);
     get_local_stream_manager().register_sending(sr);
 
     for (auto& listener : listeners_) {
@@ -76,7 +76,7 @@ shared_ptr<stream_result_future> stream_result_future::init_receiving_side(UUID 
     }
     sslog.info("[Stream #{}] Executing streaming plan for {} with peers={}, slave", plan_id, description, from);
     bool is_receiving = true;
-    sr = make_shared<stream_result_future>(plan_id, description, is_receiving);
+    sr = ::make_shared<stream_result_future>(plan_id, description, is_receiving);
     sm.register_receiving(sr);
     return sr;
 }
@@ -121,16 +121,17 @@ void stream_result_future::maybe_complete() {
         }
         auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(lowres_clock::now() - _start_time).count();
         auto stats = make_lw_shared<sstring>("");
-        sm.get_progress_on_all_shards(plan_id).then([plan_id, duration, stats] (auto sbytes) {
+        //FIXME: discarded future.
+        (void)sm.get_progress_on_all_shards(plan_id).then([plan_id, duration, stats] (auto sbytes) {
             auto tx_bw = sstring("0");
             auto rx_bw = sstring("0");
             if (std::fabs(duration) > FLT_EPSILON) {
-                tx_bw = sprint("%.2f", sbytes.bytes_sent / duration / 1024);
-                rx_bw = sprint("%.2f", sbytes.bytes_received  / duration / 1024);
+                tx_bw = format("{:.2f}", sbytes.bytes_sent / duration / 1024);
+                rx_bw = format("{:.2f}", sbytes.bytes_received  / duration / 1024);
             }
-            *stats = sprint("tx=%ld KiB, %s KiB/s, rx=%ld KiB, %s KiB/s", sbytes.bytes_sent / 1024, tx_bw, sbytes.bytes_received / 1024, rx_bw);
+            *stats = format("tx={:d} KiB, {} KiB/s, rx={:d} KiB, {} KiB/s", sbytes.bytes_sent / 1024, tx_bw, sbytes.bytes_received / 1024, rx_bw);
         }).handle_exception([plan_id] (auto ep) {
-            sslog.warn("[Stream #{}] Fail to get progess on all shards: {}", plan_id, ep);
+            sslog.warn("[Stream #{}] Fail to get progress on all shards: {}", plan_id, ep);
         }).finally([this, plan_id, stats, &sm] () {
             sm.remove_stream(plan_id);
             auto final_state = get_current_state();

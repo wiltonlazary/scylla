@@ -52,11 +52,6 @@ attributes::attributes(::shared_ptr<term>&& timestamp, ::shared_ptr<term>&& time
     , _time_to_live{std::move(time_to_live)}
 { }
 
-bool attributes::uses_function(const sstring& ks_name, const sstring& function_name) const {
-    return (_timestamp && _timestamp->uses_function(ks_name, function_name))
-        || (_time_to_live && _time_to_live->uses_function(ks_name, function_name));
-}
-
 bool attributes::is_timestamp_set() const {
     return bool(_timestamp);
 }
@@ -78,7 +73,7 @@ int64_t attributes::get_timestamp(int64_t now, const query_options& options) {
         return now;
     }
     try {
-        data_type_for<int64_t>()->validate(*tval);
+        data_type_for<int64_t>()->validate(*tval, options.get_cql_serialization_format());
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception("Invalid timestamp value");
     }
@@ -96,14 +91,15 @@ int32_t attributes::get_time_to_live(const query_options& options) {
     if (tval.is_unset_value()) {
         return 0;
     }
+
     try {
-        data_type_for<int32_t>()->validate(*tval);
+        data_type_for<int32_t>()->validate(*tval, options.get_cql_serialization_format());
     }
     catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception("Invalid TTL value");
     }
-
     auto ttl = value_cast<int32_t>(data_type_for<int32_t>()->deserialize(*tval));
+
     if (ttl < 0) {
         throw exceptions::invalid_request_exception("A TTL must be greater or equal to 0");
     }
@@ -116,7 +112,7 @@ int32_t attributes::get_time_to_live(const query_options& options) {
     return ttl;
 }
 
-void attributes::collect_marker_specification(::shared_ptr<variable_specifications> bound_names) {
+void attributes::collect_marker_specification(variable_specifications& bound_names) const {
     if (_timestamp) {
         _timestamp->collect_marker_specification(bound_names);
     }
@@ -125,18 +121,18 @@ void attributes::collect_marker_specification(::shared_ptr<variable_specificatio
     }
 }
 
-std::unique_ptr<attributes> attributes::raw::prepare(database& db, const sstring& ks_name, const sstring& cf_name) {
+std::unique_ptr<attributes> attributes::raw::prepare(database& db, const sstring& ks_name, const sstring& cf_name) const {
     auto ts = !timestamp ? ::shared_ptr<term>{} : timestamp->prepare(db, ks_name, timestamp_receiver(ks_name, cf_name));
     auto ttl = !time_to_live ? ::shared_ptr<term>{} : time_to_live->prepare(db, ks_name, time_to_live_receiver(ks_name, cf_name));
     return std::unique_ptr<attributes>{new attributes{std::move(ts), std::move(ttl)}};
 }
 
-::shared_ptr<column_specification> attributes::raw::timestamp_receiver(const sstring& ks_name, const sstring& cf_name) {
-    return ::make_shared<column_specification>(ks_name, cf_name, ::make_shared<column_identifier>("[timestamp]", true), data_type_for<int64_t>());
+lw_shared_ptr<column_specification> attributes::raw::timestamp_receiver(const sstring& ks_name, const sstring& cf_name) const {
+    return make_lw_shared<column_specification>(ks_name, cf_name, ::make_shared<column_identifier>("[timestamp]", true), data_type_for<int64_t>());
 }
 
-::shared_ptr<column_specification> attributes::raw::time_to_live_receiver(const sstring& ks_name, const sstring& cf_name) {
-    return ::make_shared<column_specification>(ks_name, cf_name, ::make_shared<column_identifier>("[ttl]", true), data_type_for<int32_t>());
+lw_shared_ptr<column_specification> attributes::raw::time_to_live_receiver(const sstring& ks_name, const sstring& cf_name) const {
+    return make_lw_shared<column_specification>(ks_name, cf_name, ::make_shared<column_identifier>("[ttl]", true), data_type_for<int32_t>());
 }
 
 }

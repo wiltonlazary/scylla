@@ -44,7 +44,8 @@
 #include <vector>
 #include "cql3/assignment_testable.hh"
 #include "types.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
+#include "counters.hh"
 
 namespace cql3 {
 
@@ -87,7 +88,9 @@ public:
      *
      * @return the <code>selector</code> output type.
      */
-    virtual data_type get_type() = 0;
+    virtual data_type get_type() const = 0;
+
+    virtual bool requires_thread() const;
 
     /**
      * Checks if this <code>selector</code> is creating aggregates.
@@ -95,7 +98,7 @@ public:
      * @return <code>true</code> if this <code>selector</code> is creating aggregates <code>false</code>
      * otherwise.
      */
-    virtual bool is_aggregate() {
+    virtual bool is_aggregate() const {
         return false;
     }
 
@@ -104,10 +107,16 @@ public:
      */
     virtual void reset() = 0;
 
-    virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) override {
-        if (receiver->type == get_type()) {
+    virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override {
+        auto t1 = receiver.type->underlying_type();
+        auto t2 = get_type()->underlying_type();
+        // We want columns of `counter_type' to be served by underlying type's overloads
+        // (here: `counter_cell_view::total_value_type()') with an `EXACT_MATCH'.
+        // Weak assignability between the two would lead to ambiguity because
+        // `WEAKLY_ASSIGNABLE' counter->blob conversion exists and would compete.
+        if (t1 == t2 || (t1 == counter_cell_view::total_value_type() && t2->is_counter())) {
             return assignment_testable::test_result::EXACT_MATCH;
-        } else if (receiver->type->is_value_compatible_with(*get_type())) {
+        } else if (t1->is_value_compatible_with(*t2)) {
             return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         } else {
             return assignment_testable::test_result::NOT_ASSIGNABLE;
@@ -122,10 +131,6 @@ class selector::factory {
 public:
     virtual ~factory() {}
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) {
-        return false;
-    }
-
     /**
      * Returns the column specification corresponding to the output value of the selector instances created by
      * this factory.
@@ -133,14 +138,14 @@ public:
      * @param schema the column family schema
      * @return a column specification
      */
-    ::shared_ptr<column_specification> get_column_specification(schema_ptr schema);
+    lw_shared_ptr<column_specification> get_column_specification(const schema& schema) const;
 
     /**
      * Creates a new <code>selector</code> instance.
      *
      * @return a new <code>selector</code> instance
      */
-    virtual ::shared_ptr<selector> new_instance() = 0;
+    virtual ::shared_ptr<selector> new_instance() const = 0;
 
     /**
      * Checks if this factory creates selectors instances that creates aggregates.
@@ -148,7 +153,7 @@ public:
      * @return <code>true</code> if this factory creates selectors instances that creates aggregates,
      * <code>false</code> otherwise
      */
-    virtual bool is_aggregate_selector_factory() {
+    virtual bool is_aggregate_selector_factory() const {
         return false;
     }
 
@@ -158,7 +163,7 @@ public:
      * @return <code>true</code> if this factory creates <code>writetime</code> selectors instances,
      * <code>false</code> otherwise
      */
-    virtual bool is_write_time_selector_factory() {
+    virtual bool is_write_time_selector_factory() const {
         return false;
     }
 
@@ -168,7 +173,7 @@ public:
      * @return <code>true</code> if this factory creates <code>TTL</code> selectors instances,
      * <code>false</code> otherwise
      */
-    virtual bool is_ttl_selector_factory() {
+    virtual bool is_ttl_selector_factory() const {
         return false;
     }
 
@@ -178,14 +183,14 @@ public:
      *
      * @return a column name
      */
-    virtual sstring column_name() = 0;
+    virtual sstring column_name() const = 0;
 
     /**
      * Returns the type of the values returned by the selector instances created by this factory.
      *
      * @return the selector output type
      */
-    virtual data_type get_return_type() = 0;
+    virtual data_type get_return_type() const = 0;
 };
 
 }

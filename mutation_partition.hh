@@ -32,7 +32,7 @@
 #include <seastar/core/bitset-iter.hh>
 #include <seastar/util/optimized_optional.hh>
 
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "tombstone.hh"
 #include "keys.hh"
 #include "position_in_partition.hh"
@@ -45,10 +45,10 @@
 #include "range_tombstone_list.hh"
 #include "clustering_key_filter.hh"
 #include "intrusive_set_external_comparator.hh"
-#include "utils/with_relational_operators.hh"
+#include "utils/preempt.hh"
+#include "utils/managed_ref.hh"
 
 class mutation_fragment;
-class clustering_row;
 
 struct cell_hash {
     using size_type = uint64_t;
@@ -74,7 +74,18 @@ using cell_hash_opt = seastar::optimized_optional<cell_hash>;
 struct cell_and_hash {
     atomic_cell_or_collection cell;
     mutable cell_hash_opt hash;
+
+    cell_and_hash() = default;
+    cell_and_hash(cell_and_hash&&) noexcept = default;
+    cell_and_hash& operator=(cell_and_hash&&) noexcept = default;
+
+    cell_and_hash(atomic_cell_or_collection&& cell, cell_hash_opt hash)
+        : cell(std::move(cell))
+        , hash(hash)
+    { }
 };
+
+class compaction_garbage_collector;
 
 //
 // Container for cells of a row. Cells are identified by column_id.
@@ -104,7 +115,7 @@ class row {
             : _id(id)
         { }
         cell_entry(cell_entry&&) noexcept;
-        cell_entry(const cell_entry&);
+        cell_entry(const abstract_type&, const cell_entry&);
 
         column_id id() const { return _id; }
         const atomic_cell_or_collection& cell() const { return _cell_and_hash.cell; }
@@ -166,7 +177,7 @@ private:
 public:
     row();
     ~row();
-    row(const row&);
+    row(const schema&, column_kind, const row&);
     row(row&& other) noexcept;
     row& operator=(row&& other) noexcept;
     size_t size() const { return _size; }
@@ -180,7 +191,7 @@ public:
     const atomic_cell_or_collection* find_cell(column_id id) const;
     // Returns a pointer to cell's value and hash or nullptr if column is not set.
     const cell_and_hash* find_cell_and_hash(column_id id) const;
-private:
+
     template<typename Func>
     void remove_if(Func&& func) {
         if (_type == storage_type::vector) {
@@ -321,7 +332,8 @@ public:
             gc_clock::time_point query_time,
             can_gc_fn&,
             gc_clock::time_point gc_before,
-            const row_marker& marker);
+            const row_marker& marker,
+            compaction_garbage_collector* collector = nullptr);
 
     bool compact_and_expire(
             const schema& s,
@@ -329,13 +341,14 @@ public:
             row_tombstone tomb,
             gc_clock::time_point query_time,
             can_gc_fn&,
-            gc_clock::time_point gc_before);
+            gc_clock::time_point gc_before,
+            compaction_garbage_collector* collector = nullptr);
 
     row difference(const schema&, column_kind, const row& other) const;
 
     bool equal(column_kind kind, const schema& this_schema, const row& other, const schema& other_schema) const;
 
-    size_t external_memory_usage() const;
+    size_t external_memory_usage(const schema&, column_kind) const;
 
     cell_hash_opt cell_hash_for(column_id id) const;
 
@@ -344,10 +357,312 @@ public:
 
     bool is_live(const schema&, column_kind kind, tombstone tomb = tombstone(), gc_clock::time_point now = gc_clock::time_point::min()) const;
 
-    friend std::ostream& operator<<(std::ostream& os, const row& r);
+    class printer {
+        const schema& _schema;
+        column_kind _kind;
+        const row& _row;
+    public:
+        printer(const schema& s, column_kind k, const row& r) : _schema(s), _kind(k), _row(r) { }
+        printer(const printer&) = delete;
+        printer(printer&&) = delete;
+
+        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    };
+    friend std::ostream& operator<<(std::ostream& os, const printer& p);
 };
 
-std::ostream& operator<<(std::ostream& os, const std::pair<column_id, const atomic_cell_or_collection&>& c);
+// Like row, but optimized for the case where the row doesn't exist (e.g. static rows)
+class lazy_row {
+    managed_ref<row> _row;
+    static inline const row _empty_row;
+public:
+    lazy_row() = default;
+    explicit lazy_row(row&& r) {
+        if (!r.empty()) {
+            _row = make_managed<row>(std::move(r));
+        }
+    }
+
+    lazy_row(const schema& s, column_kind kind, const lazy_row& r) {
+        if (!r.empty()) {
+            _row = make_managed<row>(s, kind, *r._row);
+        }
+    }
+
+    lazy_row(const schema& s, column_kind kind, const row& r) {
+        if (!r.empty()) {
+            _row = make_managed<row>(s, kind, r);
+        }
+    }
+
+    row& maybe_create() {
+        if (!_row) {
+            _row = make_managed<row>();
+        }
+        return *_row;
+    }
+
+    const row& get_existing() const & {
+        return *_row;
+    }
+
+    row& get_existing() & {
+        return *_row;
+    }
+
+    row&& get_existing() && {
+        return std::move(*_row);
+    }
+
+    const row& get() const {
+        return _row ? *_row : _empty_row;
+    }
+
+    size_t size() const {
+        if (!_row) {
+            return 0;
+        }
+        return _row->size();
+    }
+
+    bool empty() const {
+        if (!_row) {
+            return true;
+        }
+        return _row->empty();
+    }
+
+    void reserve(column_id nr) {
+        if (nr) {
+            maybe_create().reserve(nr);
+        }
+    }
+
+    const atomic_cell_or_collection& cell_at(column_id id) const {
+        if (!_row) {
+            throw_with_backtrace<std::out_of_range>(format("Column not found for id = {:d}", id));
+        } else {
+            return _row->cell_at(id);
+        }
+    }
+
+    // Returns a pointer to cell's value or nullptr if column is not set.
+    const atomic_cell_or_collection* find_cell(column_id id) const {
+        if (!_row) {
+            return nullptr;
+        }
+        return _row->find_cell(id);
+    }
+
+    // Returns a pointer to cell's value and hash or nullptr if column is not set.
+    const cell_and_hash* find_cell_and_hash(column_id id) const {
+        if (!_row) {
+            return nullptr;
+        }
+        return _row->find_cell_and_hash(id);
+    }
+
+    // Calls Func(column_id, cell_and_hash&) or Func(column_id, atomic_cell_and_collection&)
+    // for each cell in this row, depending on the concrete Func type.
+    // noexcept if Func doesn't throw.
+    template<typename Func>
+    void for_each_cell(Func&& func) {
+        if (!_row) {
+            return;
+        }
+        _row->for_each_cell(std::forward<Func>(func));
+    }
+
+    template<typename Func>
+    void for_each_cell(Func&& func) const {
+        if (!_row) {
+            return;
+        }
+        _row->for_each_cell(std::forward<Func>(func));
+    }
+
+    template<typename Func>
+    void for_each_cell_until(Func&& func) const {
+        if (!_row) {
+            return;
+        }
+        _row->for_each_cell_until(std::forward<Func>(func));
+    }
+
+    // Merges cell's value into the row.
+    // Weak exception guarantees.
+    void apply(const column_definition& column, const atomic_cell_or_collection& cell, cell_hash_opt hash = cell_hash_opt()) {
+        maybe_create().apply(column, cell, std::move(hash));
+    }
+
+    // Merges cell's value into the row.
+    // Weak exception guarantees.
+    void apply(const column_definition& column, atomic_cell_or_collection&& cell, cell_hash_opt hash = cell_hash_opt()) {
+        maybe_create().apply(column, std::move(cell), std::move(hash));
+    }
+
+    // Monotonic exception guarantees. In case of exception the sum of cell and this remains the same as before the exception.
+    void apply_monotonically(const column_definition& column, atomic_cell_or_collection&& cell, cell_hash_opt hash = cell_hash_opt()) {
+        maybe_create().apply_monotonically(column, std::move(cell), std::move(hash));
+    }
+
+    // Adds cell to the row. The column must not be already set.
+    void append_cell(column_id id, atomic_cell_or_collection cell) {
+        maybe_create().append_cell(id, std::move(cell));
+    }
+
+    // Weak exception guarantees
+    void apply(const schema& s, column_kind kind, const row& src) {
+        if (src.empty()) {
+            return;
+        }
+        maybe_create().apply(s, kind, src);
+    }
+
+    // Weak exception guarantees
+    void apply(const schema& s, column_kind kind, const lazy_row& src) {
+        if (src.empty()) {
+            return;
+        }
+        maybe_create().apply(s, kind, src.get_existing());
+    }
+
+    // Weak exception guarantees
+    void apply(const schema& s, column_kind kind, row&& src) {
+        if (src.empty()) {
+            return;
+        }
+        maybe_create().apply(s, kind, std::move(src));
+    }
+
+    // Monotonic exception guarantees
+    void apply_monotonically(const schema& s, column_kind kind, row&& src) {
+        if (src.empty()) {
+            return;
+        }
+        maybe_create().apply_monotonically(s, kind, std::move(src));
+    }
+
+    // Monotonic exception guarantees
+    void apply_monotonically(const schema& s, column_kind kind, lazy_row&& src) {
+        if (src.empty()) {
+            return;
+        }
+        if (!_row) {
+            _row = std::move(src._row);
+            return;
+        }
+        get_existing().apply_monotonically(s, kind, std::move(src.get_existing()));
+    }
+
+    // Expires cells based on query_time. Expires tombstones based on gc_before
+    // and max_purgeable. Removes cells covered by tomb.
+    // Returns true iff there are any live cells left.
+    bool compact_and_expire(
+            const schema& s,
+            column_kind kind,
+            row_tombstone tomb,
+            gc_clock::time_point query_time,
+            can_gc_fn& can_gc,
+            gc_clock::time_point gc_before,
+            const row_marker& marker,
+            compaction_garbage_collector* collector = nullptr);
+
+    bool compact_and_expire(
+            const schema& s,
+            column_kind kind,
+            row_tombstone tomb,
+            gc_clock::time_point query_time,
+            can_gc_fn& can_gc,
+            gc_clock::time_point gc_before,
+            compaction_garbage_collector* collector = nullptr);
+
+    lazy_row difference(const schema& s, column_kind kind, const lazy_row& other) const {
+        if (!_row) {
+            return lazy_row();
+        }
+        if (!other._row) {
+            return lazy_row(s, kind, *_row);
+        }
+        return lazy_row(_row->difference(s, kind, *other._row));
+    }
+
+    bool equal(column_kind kind, const schema& this_schema, const lazy_row& other, const schema& other_schema) const {
+        bool e1 = empty();
+        bool e2 = other.empty();
+        if (e1 && e2) {
+            return true;
+        }
+        if (e1 != e2) {
+            return false;
+        }
+        // both non-empty
+        return _row->equal(kind, this_schema, *other._row, other_schema);
+    }
+
+    size_t external_memory_usage(const schema& s, column_kind kind) const {
+        if (!_row) {
+            return 0;
+        }
+        return _row.external_memory_usage() + _row->external_memory_usage(s, kind);
+    }
+
+    cell_hash_opt cell_hash_for(column_id id) const {
+        if (!_row) {
+            return cell_hash_opt{};
+        }
+        return _row->cell_hash_for(id);
+    }
+
+    void prepare_hash(const schema& s, column_kind kind) const {
+        if (!_row) {
+            return;
+        }
+        _row->prepare_hash(s, kind);
+    }
+
+    void clear_hash() const {
+        if (!_row) {
+            return;
+        }
+        _row->clear_hash();
+    }
+
+    bool is_live(const schema& s, column_kind kind, tombstone tomb = tombstone(), gc_clock::time_point now = gc_clock::time_point::min()) const {
+        if (!_row) {
+            return false;
+        }
+        return _row->is_live(s, kind, tomb, now);
+    }
+
+    class printer {
+        const schema& _schema;
+        column_kind _kind;
+        const lazy_row& _row;
+    public:
+        printer(const schema& s, column_kind k, const lazy_row& r) : _schema(s), _kind(k), _row(r) { }
+        printer(const printer&) = delete;
+        printer(printer&&) = delete;
+
+        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    };
+};
+
+// Used to return the timestamp of the latest update to the row
+struct max_timestamp {
+    api::timestamp_type max = api::missing_timestamp;
+
+    void update(api::timestamp_type ts) {
+        max = std::max(max, ts);
+    }
+};
+
+template<>
+struct appending_hash<row> {
+    static constexpr int null_hash_value = 0xbeefcafe;
+    template<typename Hasher>
+    void operator()(Hasher& h, const row& cells, const schema& s, column_kind kind, const query::column_id_vector& columns, max_timestamp& max_ts) const;
+};
 
 class row_marker;
 int compare_row_marker_for_merge(const row_marker& left, const row_marker& right) noexcept;
@@ -355,9 +670,10 @@ int compare_row_marker_for_merge(const row_marker& left, const row_marker& right
 class row_marker {
     static constexpr gc_clock::duration no_ttl { 0 };
     static constexpr gc_clock::duration dead { -1 };
+    static constexpr gc_clock::time_point no_expiry { gc_clock::duration(0) };
     api::timestamp_type _timestamp = api::missing_timestamp;
     gc_clock::duration _ttl = no_ttl;
-    gc_clock::time_point _expiry;
+    gc_clock::time_point _expiry = no_expiry;
 public:
     row_marker() = default;
     explicit row_marker(api::timestamp_type created_at) : _timestamp(created_at) { }
@@ -377,7 +693,7 @@ public:
         if (is_missing() || _ttl == dead) {
             return false;
         }
-        if (_ttl != no_ttl && _expiry < now) {
+        if (_ttl != no_ttl && _expiry <= now) {
             return false;
         }
         return _timestamp > t.timestamp;
@@ -387,7 +703,7 @@ public:
         if (_ttl == dead) {
             return true;
         }
-        return _ttl != no_ttl && _expiry < now;
+        return _ttl != no_ttl && _expiry <= now;
     }
     // Can be called only when is_live().
     bool is_expiring() const {
@@ -401,7 +717,9 @@ public:
     gc_clock::time_point expiry() const {
         return _expiry;
     }
-    // Can be called only when is_dead().
+    // Should be called when is_dead() or is_expiring().
+    // Safe to be called when is_missing().
+    // When is_expiring(), returns the the deletion time of the marker when it finally expires.
     gc_clock::time_point deletion_time() const {
         return _ttl == dead ? _expiry : _expiry - _ttl;
     }
@@ -417,23 +735,7 @@ public:
     // tombstones.
     // Returns true if row marker is live.
     bool compact_and_expire(tombstone tomb, gc_clock::time_point now,
-            can_gc_fn& can_gc, gc_clock::time_point gc_before) {
-        if (is_missing()) {
-            return false;
-        }
-        if (_timestamp <= tomb.timestamp) {
-            _timestamp = api::missing_timestamp;
-            return false;
-        }
-        if (_ttl > no_ttl && _expiry < now) {
-            _expiry -= _ttl;
-            _ttl = dead;
-        }
-        if (_ttl == dead && _expiry < gc_before && can_gc(tombstone(_timestamp, _expiry))) {
-            _timestamp = api::missing_timestamp;
-        }
-        return !is_missing() && _ttl != dead;
-    }
+            can_gc_fn& can_gc, gc_clock::time_point gc_before, compaction_garbage_collector* collector = nullptr);
     // Consistent with feed_hash()
     bool operator==(const row_marker& other) const {
         if (_timestamp != other._timestamp) {
@@ -472,9 +774,7 @@ struct appending_hash<row_marker> {
     }
 };
 
-class clustering_row;
-
-class shadowable_tombstone : public with_relational_operators<shadowable_tombstone> {
+class shadowable_tombstone {
     tombstone _tomb;
 public:
 
@@ -486,9 +786,12 @@ public:
             : _tomb(std::move(tomb)) {
     }
 
-    int compare(const shadowable_tombstone& t) const {
-        return _tomb.compare(t._tomb);
+    std::strong_ordering operator<=>(const shadowable_tombstone& t) const {
+        return _tomb <=> t._tomb;
     }
+
+    bool operator==(const shadowable_tombstone&) const = default;
+    bool operator!=(const shadowable_tombstone&) const = default;
 
     explicit operator bool() const {
         return bool(_tomb);
@@ -557,7 +860,7 @@ The rules for row_tombstones are as follows:
   - The shadowable tombstone can be erased or compacted away by a newer
     row marker.
 */
-class row_tombstone : public with_relational_operators<row_tombstone> {
+class row_tombstone {
     tombstone _regular;
     shadowable_tombstone _shadowable; // _shadowable is always >= _regular
 public:
@@ -572,8 +875,14 @@ public:
 
     row_tombstone() = default;
 
-    int compare(const row_tombstone& t) const {
-        return _shadowable.compare(t._shadowable);
+    std::strong_ordering operator<=>(const row_tombstone& t) const {
+        return _shadowable <=> t._shadowable;
+    }
+    bool operator==(const row_tombstone& t) const {
+        return _shadowable == t._shadowable;
+    }
+    bool operator!=(const row_tombstone& t) const {
+        return _shadowable != t._shadowable;
     }
 
     explicit operator bool() const {
@@ -646,12 +955,17 @@ class deletable_row final {
     row _cells;
 public:
     deletable_row() {}
-    explicit deletable_row(clustering_row&&);
-    deletable_row(row_tombstone tomb, const row_marker& marker, const row& cells)
-        : _deleted_at(tomb), _marker(marker), _cells(cells)
+    deletable_row(const schema& s, const deletable_row& other)
+        : _deleted_at(other._deleted_at)
+        , _marker(other._marker)
+        , _cells(s, column_kind::regular_column, other._cells)
+    { }
+    deletable_row(const schema& s, row_tombstone tomb, const row_marker& marker, const row& cells)
+        : _deleted_at(tomb), _marker(marker), _cells(s, column_kind::regular_column, cells)
     {}
-
-    void apply(const schema&, clustering_row);
+    deletable_row(row_tombstone&& tomb, row_marker&& marker, row&& cells)
+        : _deleted_at(std::move(tomb)), _marker(std::move(marker)), _cells(std::move(cells))
+    {}
 
     void apply(tombstone deleted_at) {
         _deleted_at.apply(deleted_at);
@@ -667,11 +981,15 @@ public:
 
     void apply(const row_marker& rm) {
         _marker.apply(rm);
-        _deleted_at.maybe_shadow(_marker);
+        maybe_shadow();
     }
 
     void remove_tombstone() {
         _deleted_at = {};
+    }
+
+    void maybe_shadow() {
+        _deleted_at.maybe_shadow(_marker);
     }
 
     // Weak exception guarantees. After exception, both src and this will commute to the same value as
@@ -685,18 +1003,28 @@ public:
     const row_marker& marker() const { return _marker; }
     const row& cells() const { return _cells; }
     row& cells() { return _cells; }
-    friend std::ostream& operator<<(std::ostream& os, const deletable_row& dr);
     bool equal(column_kind, const schema& s, const deletable_row& other, const schema& other_schema) const;
     bool is_live(const schema& s, tombstone base_tombstone = tombstone(), gc_clock::time_point query_time = gc_clock::time_point::min()) const;
     bool empty() const { return !_deleted_at && _marker.is_missing() && !_cells.size(); }
     deletable_row difference(const schema&, column_kind, const deletable_row& other) const;
+
+    class printer {
+        const schema& _schema;
+        const deletable_row& _deletable_row;
+    public:
+        printer(const schema& s, const deletable_row& r) : _schema(s), _deletable_row(r) { }
+        printer(const printer&) = delete;
+        printer(printer&&) = delete;
+
+        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    };
+    friend std::ostream& operator<<(std::ostream& os, const printer& p);
 };
 
 class cache_tracker;
 
 class rows_entry {
     using lru_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
-    friend class cache_tracker;
     friend class size_calculator;
     intrusive_set_external_comparator_member_hook _link;
     clustering_key _key;
@@ -713,8 +1041,13 @@ class rows_entry {
         bool _last_dummy : 1;
         flags() : _before_ck(0), _after_ck(0), _continuous(true), _dummy(false), _last_dummy(false) { }
     } _flags{};
-    friend class mutation_partition;
 public:
+    using container_type = intrusive_set_external_comparator<rows_entry, &rows_entry::_link>;
+    using lru_type = bi::list<rows_entry,
+        bi::member_hook<rows_entry, rows_entry::lru_link_type, &rows_entry::_lru_link>,
+        bi::constant_time_size<false>>; // we need this to have bi::auto_unlink on hooks.
+
+    void unlink_from_lru() noexcept { _lru_link.unlink(); }
     struct last_dummy_tag {};
     explicit rows_entry(clustering_key&& key)
         : _key(std::move(key))
@@ -737,16 +1070,16 @@ public:
     rows_entry(const clustering_key& key, deletable_row&& row)
         : _key(key), _row(std::move(row))
     { }
-    rows_entry(const clustering_key& key, const deletable_row& row)
-        : _key(key), _row(row)
+    rows_entry(const schema& s, const clustering_key& key, const deletable_row& row)
+        : _key(key), _row(s, row)
     { }
-    rows_entry(const clustering_key& key, row_tombstone tomb, const row_marker& marker, const row& row)
-        : _key(key), _row(tomb, marker, row)
+    rows_entry(const schema& s, const clustering_key& key, row_tombstone tomb, const row_marker& marker, const row& row)
+        : _key(key), _row(s, tomb, marker, row)
     { }
     rows_entry(rows_entry&& o) noexcept;
-    rows_entry(const rows_entry& e)
+    rows_entry(const schema& s, const rows_entry& e)
         : _key(e._key)
-        , _row(e._row)
+        , _row(s, e._row)
         , _flags(e._flags)
     { }
     // Valid only if !dummy()
@@ -764,7 +1097,7 @@ public:
         return _row;
     }
     position_in_partition_view position() const {
-        return position_in_partition_view(partition_region::clustered, _flags._after_ck - _flags._before_ck, &_key);
+        return position_in_partition_view(partition_region::clustered, bound_weight(_flags._after_ck - _flags._before_ck), &_key);
     }
 
     is_continuous continuous() const { return is_continuous(_flags._continuous); }
@@ -774,6 +1107,8 @@ public:
     bool is_last_dummy() const { return _flags._last_dummy; }
     void set_dummy(bool value) { _flags._dummy = value; }
     void set_dummy(is_dummy value) { _flags._dummy = bool(value); }
+    void replace_with(rows_entry&& other) noexcept;
+
     void apply(row_tombstone t) {
         _row.apply(t);
     }
@@ -833,12 +1168,34 @@ public:
             return _c(p1, p2) < 0;
         }
     };
-    friend std::ostream& operator<<(std::ostream& os, const rows_entry& re);
     bool equal(const schema& s, const rows_entry& other) const;
     bool equal(const schema& s, const rows_entry& other, const schema& other_schema) const;
 
-    size_t memory_usage() const;
+    size_t memory_usage(const schema&) const;
     void on_evicted(cache_tracker&) noexcept;
+
+    class printer {
+        const schema& _schema;
+        const rows_entry& _rows_entry;
+    public:
+        printer(const schema& s, const rows_entry& r) : _schema(s), _rows_entry(r) { }
+        printer(const printer&) = delete;
+        printer(printer&&) = delete;
+
+        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    };
+    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+};
+
+struct mutation_application_stats {
+    uint64_t row_hits = 0;
+    uint64_t row_writes = 0;
+
+    mutation_application_stats& operator+=(const mutation_application_stats& other) {
+        row_hits += other.row_hits;
+        row_writes += other.row_writes;
+        return *this;
+    }
 };
 
 // Represents a set of writes made to a single partition.
@@ -880,19 +1237,20 @@ public:
 // in the doc in partition_version.hh.
 class mutation_partition final {
 public:
-    using rows_type = intrusive_set_external_comparator<rows_entry, &rows_entry::_link>;
-    friend class rows_entry;
+    using rows_type = rows_entry::container_type;
     friend class size_calculator;
 private:
     tombstone _tombstone;
-    row _static_row;
+    lazy_row _static_row;
     bool _static_row_continuous = true;
     rows_type _rows;
     // Contains only strict prefixes so that we don't have to lookup full keys
     // in both _row_tombstones and _rows.
     range_tombstone_list _row_tombstones;
+#ifdef SEASTAR_DEBUG
+    table_schema_version _schema_version;
+#endif
 
-    friend class mutation_partition_applier;
     friend class converting_mutation_partition_applier;
 public:
     struct copy_comparators_only {};
@@ -905,18 +1263,23 @@ public:
     mutation_partition(schema_ptr s)
         : _rows()
         , _row_tombstones(*s)
+#ifdef SEASTAR_DEBUG
+        , _schema_version(s->version())
+#endif
     { }
     mutation_partition(mutation_partition& other, copy_comparators_only)
         : _rows()
         , _row_tombstones(other._row_tombstones, range_tombstone_list::copy_comparator_only())
+#ifdef SEASTAR_DEBUG
+        , _schema_version(other._schema_version)
+#endif
     { }
     mutation_partition(mutation_partition&&) = default;
-    mutation_partition(const mutation_partition&);
+    mutation_partition(const schema& s, const mutation_partition&);
     mutation_partition(const mutation_partition&, const schema&, query::clustering_key_filter_ranges);
     mutation_partition(mutation_partition&&, const schema&, query::clustering_key_filter_ranges);
     ~mutation_partition();
     static mutation_partition& container_of(rows_type&);
-    mutation_partition& operator=(const mutation_partition& x);
     mutation_partition& operator=(mutation_partition&& x) noexcept;
     bool equal(const schema&, const mutation_partition&) const;
     bool equal(const schema& this_schema, const mutation_partition& p, const schema& p_schema) const;
@@ -927,7 +1290,18 @@ public:
         hashing_partition_visitor<Hasher> v(h, s);
         accept(s, v);
     }
-    friend std::ostream& operator<<(std::ostream& os, const mutation_partition& mp);
+
+    class printer {
+        const schema& _schema;
+        const mutation_partition& _mutation_partition;
+    public:
+        printer(const schema& s, const mutation_partition& mp) : _schema(s), _mutation_partition(mp) { }
+        printer(const printer&) = delete;
+        printer(printer&&) = delete;
+
+        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    };
+    friend std::ostream& operator<<(std::ostream& os, const printer& p);
 public:
     // Makes sure there is a dummy entry after all clustered rows. Doesn't affect continuity.
     // Doesn't invalidate iterators.
@@ -936,6 +1310,8 @@ public:
     void set_static_row_continuous(bool value) { _static_row_continuous = value; }
     bool is_fully_continuous() const;
     void make_fully_continuous();
+    // Sets or clears continuity of clustering ranges between existing rows.
+    void set_continuity(const schema&, const position_range& pr, is_continuous);
     // Returns clustering row ranges which have continuity matching the is_continuous argument.
     clustering_interval_set get_continuity(const schema&, is_continuous = is_continuous::yes) const;
     // Returns true iff all keys from given range are marked as continuous, or range is empty.
@@ -944,6 +1320,10 @@ public:
     bool fully_discontinuous(const schema&, const position_range&);
     // Returns true iff all keys from given range have continuity membership as specified by is_continuous.
     bool check_continuity(const schema&, const position_range&, is_continuous) const;
+    // Frees elements of the partition in batches.
+    // Returns stop_iteration::yes iff there are no more elements to free.
+    // Continuity is unspecified after this.
+    stop_iteration clear_gently(cache_tracker*) noexcept;
     // Applies mutation_fragment.
     // The fragment must be goverened by the same schema as this object.
     void apply(const schema& s, const mutation_fragment&);
@@ -966,12 +1346,14 @@ public:
     // is not representable in this_schema is dropped, thus apply() loses commutativity.
     //
     // Weak exception guarantees.
-    void apply(const schema& this_schema, const mutation_partition& p, const schema& p_schema);
+    void apply(const schema& this_schema, const mutation_partition& p, const schema& p_schema,
+            mutation_application_stats& app_stats);
     // Use in case this instance and p share the same schema.
     // Same guarantees as apply(const schema&, mutation_partition&&, const schema&);
-    void apply(const schema& s, mutation_partition&& p);
+    void apply(const schema& s, mutation_partition&& p, mutation_application_stats& app_stats);
     // Same guarantees and constraints as for apply(const schema&, const mutation_partition&, const schema&).
-    void apply(const schema& this_schema, mutation_partition_view p, const schema& p_schema);
+    void apply(const schema& this_schema, mutation_partition_view p, const schema& p_schema,
+            mutation_application_stats& app_stats);
 
     // Applies p to this instance.
     //
@@ -979,14 +1361,30 @@ public:
     // This instance and p are governed by the same schema.
     //
     // Must be provided with a pointer to the cache_tracker, which owns both this and p.
-    void apply_monotonically(const schema& s, mutation_partition&& p, cache_tracker*);
-    void apply_monotonically(const schema& s, mutation_partition&& p, const schema& p_schema);
+    //
+    // Returns stop_iteration::no if the operation was preempted before finished, and stop_iteration::yes otherwise.
+    // On preemption the sum of this and p stays the same (represents the same set of writes), and the state of this
+    // object contains at least all the writes it contained before the call (monotonicity). It may contain partial writes.
+    // Also, some progress is always guaranteed (liveness).
+    //
+    // The operation can be driven to completion like this:
+    //
+    //   while (apply_monotonically(..., is_preemtable::yes) == stop_iteration::no) { }
+    //
+    // If is_preemptible::no is passed as argument then stop_iteration::no is never returned.
+    stop_iteration apply_monotonically(const schema& s, mutation_partition&& p, cache_tracker*,
+            mutation_application_stats& app_stats, is_preemptible = is_preemptible::no);
+    stop_iteration apply_monotonically(const schema& s, mutation_partition&& p, const schema& p_schema,
+            mutation_application_stats& app_stats, is_preemptible = is_preemptible::no);
 
     // Weak exception guarantees.
     // Assumes this and p are not owned by a cache_tracker.
-    void apply_weak(const schema& s, const mutation_partition& p, const schema& p_schema);
-    void apply_weak(const schema& s, mutation_partition&&);
-    void apply_weak(const schema& s, mutation_partition_view p, const schema& p_schema);
+    void apply_weak(const schema& s, const mutation_partition& p, const schema& p_schema,
+            mutation_application_stats& app_stats);
+    void apply_weak(const schema& s, mutation_partition&&,
+            mutation_application_stats& app_stats);
+    void apply_weak(const schema& s, mutation_partition_view p, const schema& p_schema,
+            mutation_application_stats& app_stats);
 
     // Converts partition to the new schema. When succeeds the partition should only be accessed
     // using the new schema.
@@ -1000,8 +1398,9 @@ private:
     uint32_t do_compact(const schema& s,
         gc_clock::time_point now,
         const std::vector<query::clustering_range>& row_ranges,
+        bool always_return_static_content,
         bool reverse,
-        uint32_t row_limit,
+        uint64_t row_limit,
         can_gc_fn&);
 
     // Calls func for each row entry inside row_ranges until func returns stop_iteration::yes.
@@ -1030,8 +1429,9 @@ public:
     //
     // The row_limit parameter must be > 0.
     //
-    uint32_t compact_for_query(const schema& s, gc_clock::time_point query_time,
-        const std::vector<query::clustering_range>& row_ranges, bool reversed, uint32_t row_limit);
+    uint64_t compact_for_query(const schema& s, gc_clock::time_point query_time,
+        const std::vector<query::clustering_range>& row_ranges, bool always_return_static_content,
+        bool reversed, uint64_t row_limit);
 
     // Performs the following:
     //   - expires cells based on compaction_time
@@ -1058,8 +1458,8 @@ public:
     deletable_row& clustered_row(const schema& s, position_in_partition_view pos, is_dummy, is_continuous);
 public:
     tombstone partition_tombstone() const { return _tombstone; }
-    row& static_row() { return _static_row; }
-    const row& static_row() const { return _static_row; }
+    lazy_row& static_row() { return _static_row; }
+    const lazy_row& static_row() const { return _static_row; }
     // return a set of rows_entry where each entry represents a CQL row sharing the same clustering key.
     const rows_type& clustered_rows() const { return _rows; }
     const range_tombstone_list& row_tombstones() const { return _row_tombstones; }
@@ -1085,7 +1485,7 @@ public:
     // The partition should be first compacted with compact_for_query(), otherwise
     // results may include data which is deleted/expired.
     // At most row_limit CQL rows will be written and digested.
-    void query_compacted(query::result::partition_writer& pw, const schema& s, uint32_t row_limit) const;
+    void query_compacted(query::result::partition_writer& pw, const schema& s, uint64_t row_limit) const;
     void accept(const schema&, mutation_partition_visitor&) const;
 
     // Returns the number of live CQL rows in this partition.
@@ -1094,17 +1494,25 @@ public:
     // static row, the static row counts as one row. If there is at least one
     // regular row live, static row doesn't count.
     //
-    size_t live_row_count(const schema&,
+    uint64_t live_row_count(const schema&,
         gc_clock::time_point query_time = gc_clock::time_point::min()) const;
 
     bool is_static_row_live(const schema&,
         gc_clock::time_point query_time = gc_clock::time_point::min()) const;
 
-    size_t external_memory_usage() const;
+    uint64_t row_count() const;
+
+    size_t external_memory_usage(const schema&) const;
 private:
     template<typename Func>
     void for_each_row(const schema& schema, const query::clustering_range& row_range, bool reversed, Func&& func) const;
     friend class counter_write_query_result_builder;
+
+    void check_schema(const schema& s) const {
+#ifdef SEASTAR_DEBUG
+        assert(s.version() == _schema_version);
+#endif
+    }
 };
 
 inline

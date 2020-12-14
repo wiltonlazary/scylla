@@ -21,28 +21,102 @@
 
 #pragma once
 
+#include <functional>
+#include <optional>
 #include <unordered_map>
 #include <boost/range/iterator_range.hpp>
 #include <boost/range/join.hpp>
 #include <boost/range/algorithm/transform.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/dynamic_bitset.hpp>
 
 #include "cql3/column_specification.hh"
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/util/backtrace.hh>
 #include "types.hh"
 #include "compound.hh"
 #include "gc_clock.hh"
 #include "unimplemented.hh"
 #include "utils/UUID.hh"
 #include "compress.hh"
-#include "compaction_strategy.hh"
+#include "compaction_strategy_type.hh"
 #include "caching_options.hh"
-#include "stdx.hh"
+#include "column_computation.hh"
+
+namespace dht {
+
+class i_partitioner;
+class sharder;
+
+}
+
+namespace cdc {
+class options;
+}
+
+class database;
 
 using column_count_type = uint32_t;
 
 // Column ID, unique within column_kind
 using column_id = column_count_type;
+
+// Column ID unique within a schema. Enum class to avoid
+// mixing wtih column id.
+enum class ordinal_column_id: column_count_type {};
+
+std::ostream& operator<<(std::ostream& os, ordinal_column_id id);
+
+// Maintains a set of columns used in a query. The columns are
+// identified by ordinal_id.
+//
+// @sa column_definition::ordinal_id.
+class column_set {
+public:
+    using bitset = boost::dynamic_bitset<uint64_t>;
+    using size_type = bitset::size_type;
+
+    // column_count_type is more narrow than size_type, but truncating a size_type max value does
+    // give column_count_type max value. This is used to avoid extra branching in
+    // find_first()/find_next().
+    static_assert(static_cast<column_count_type>(boost::dynamic_bitset<uint64_t>::npos) == ~static_cast<column_count_type>(0));
+    static constexpr ordinal_column_id npos = static_cast<ordinal_column_id>(bitset::npos);
+
+    explicit column_set(column_count_type num_bits = 0)
+        : _mask(num_bits)
+    {
+    }
+
+    void resize(column_count_type num_bits) {
+        _mask.resize(num_bits);
+    }
+
+    // Set the appropriate bit for column id.
+    void set(ordinal_column_id id) {
+        column_count_type bit = static_cast<column_count_type>(id);
+        _mask.set(bit);
+    }
+    // Test the mask for use of a given column id.
+    bool test(ordinal_column_id id) const {
+        column_count_type bit = static_cast<column_count_type>(id);
+        return _mask.test(bit);
+    }
+    // @sa boost::dynamic_bistet docs
+    size_type count() const { return _mask.count(); }
+    ordinal_column_id find_first() const {
+        return static_cast<ordinal_column_id>(_mask.find_first());
+    }
+    ordinal_column_id find_next(ordinal_column_id pos) const {
+        return static_cast<ordinal_column_id>(_mask.find_next(static_cast<column_count_type>(pos)));
+    }
+    // Logical or
+    void union_with(const column_set& with) {
+        _mask |= with._mask;
+    }
+
+private:
+    bitset _mask;
+};
 
 // Cluster-wide identifier of schema version of particular table.
 //
@@ -75,6 +149,8 @@ class extensions;
 // make sure these match the order we like columns back from schema
 enum class column_kind { partition_key, clustering_key, static_column, regular_column };
 
+enum class column_view_virtual { no, yes };
+
 sstring to_sstring(column_kind k);
 bool is_compatible(column_kind k1, column_kind k2);
 
@@ -89,7 +165,7 @@ inline sstring cf_type_to_sstring(cf_type t) {
     } else if (t == cf_type::super) {
         return "Super";
     }
-    throw std::invalid_argument(sprint("unknown type: %d\n", uint8_t(t)));
+    throw std::invalid_argument(format("unknown type: {:d}\n", uint8_t(t)));
 }
 
 inline cf_type sstring_to_cf_type(sstring name) {
@@ -98,7 +174,7 @@ inline cf_type sstring_to_cf_type(sstring name) {
     } else if (name == "Super") {
         return cf_type::super;
     }
-    throw std::invalid_argument(sprint("unknown type: %s\n", name));
+    throw std::invalid_argument(format("unknown type: {}\n", name));
 }
 
 struct speculative_retry {
@@ -117,11 +193,11 @@ public:
         } else if (_t == type::ALWAYS) {
             return "ALWAYS";
         } else if (_t == type::CUSTOM) {
-            return sprint("%.2fms", _v);
+            return format("{:.2f}ms", _v);
         } else if (_t == type::PERCENTILE) {
-            return sprint("%.1fPERCENTILE", 100 * _v);
+            return format("{:.1f}PERCENTILE", 100 * _v);
         } else {
-            throw std::invalid_argument(sprint("unknown type: %d\n", uint8_t(_t)));
+            throw std::invalid_argument(format("unknown type: {:d}\n", uint8_t(_t)));
         }
     }
     static speculative_retry from_sstring(sstring str) {
@@ -134,7 +210,7 @@ public:
             try {
                 return boost::lexical_cast<double>(str.substr(0, str.size() - t.size()));
             } catch (boost::bad_lexical_cast& e) {
-                throw std::invalid_argument(sprint("cannot convert %s to speculative_retry\n", str));
+                throw std::invalid_argument(format("cannot convert {} to speculative_retry\n", str));
             }
         };
 
@@ -151,7 +227,7 @@ public:
             t = type::PERCENTILE;
             v = convert(percentile) / 100;
         } else {
-            throw std::invalid_argument(sprint("cannot convert %s to speculative_retry\n", str));
+            throw std::invalid_argument(format("cannot convert {} to speculative_retry\n", str));
         }
         return speculative_retry(t, v);
     }
@@ -178,19 +254,25 @@ enum class index_metadata_kind {
 };
 
 class index_metadata final {
+public:
+    struct is_local_index_tag {};
+    using is_local_index = bool_class<is_local_index_tag>;
+private:
     utils::UUID _id;
     sstring _name;
     index_metadata_kind _kind;
     index_options_map _options;
+    bool _local;
 public:
-    index_metadata(const sstring& name, const index_options_map& options, index_metadata_kind kind);
+    index_metadata(const sstring& name, const index_options_map& options, index_metadata_kind kind, is_local_index local);
     bool operator==(const index_metadata& other) const;
     bool equals_noname(const index_metadata& other) const;
     const utils::UUID& id() const;
     const sstring& name() const;
     const index_metadata_kind kind() const;
     const index_options_map& options() const;
-    static sstring get_default_index_name(const sstring& cf_name, std::experimental::optional<sstring> root);
+    bool local() const;
+    static sstring get_default_index_name(const sstring& cf_name, std::optional<sstring> root);
 };
 
 class column_definition final {
@@ -207,6 +289,8 @@ private:
     api::timestamp_type _dropped_at;
     bool _is_atomic;
     bool _is_counter;
+    column_view_virtual _is_view_virtual;
+    column_computation_ptr _computation;
 
     struct thrift_bits {
         thrift_bits()
@@ -221,6 +305,8 @@ private:
 public:
     column_definition(bytes name, data_type type, column_kind kind,
         column_id component_index = 0,
+        column_view_virtual view_virtual = column_view_virtual::no,
+        column_computation_ptr = nullptr,
         api::timestamp_type dropped_at = api::missing_timestamp);
 
     data_type type;
@@ -230,8 +316,41 @@ public:
     // equivalent to component index.
     column_id id;
 
+    // Unique within schema instance
+    ordinal_column_id ordinal_id;
+
     column_kind kind;
-    ::shared_ptr<cql3::column_specification> column_specification;
+    lw_shared_ptr<cql3::column_specification> column_specification;
+
+    // NOTICE(sarna): This copy constructor is hand-written instead of default,
+    // because it involves deep copying of the computation object.
+    // Computation has a strict ownership policy provided by
+    // unique_ptr, and as such cannot rely on default copying.
+    column_definition(const column_definition& other)
+            : _name(other._name)
+            , _dropped_at(other._dropped_at)
+            , _is_atomic(other._is_atomic)
+            , _is_counter(other._is_counter)
+            , _is_view_virtual(other._is_view_virtual)
+            , _computation(other.get_computation_ptr())
+            , _thrift_bits(other._thrift_bits)
+            , type(other.type)
+            , id(other.id)
+            , ordinal_id(other.ordinal_id)
+            , kind(other.kind)
+            , column_specification(other.column_specification)
+        {}
+
+    column_definition& operator=(const column_definition& other) {
+        if (this == &other) {
+            return *this;
+        }
+        column_definition tmp(other);
+        *this = std::move(tmp);
+        return *this;
+    }
+
+    column_definition& operator=(column_definition&& other) = default;
 
     bool is_static() const { return kind == column_kind::static_column; }
     bool is_regular() const { return kind == column_kind::regular_column; }
@@ -241,6 +360,23 @@ public:
     bool is_atomic() const { return _is_atomic; }
     bool is_multi_cell() const { return !_is_atomic; }
     bool is_counter() const { return _is_counter; }
+    // "virtual columns" appear in a materialized view as placeholders for
+    // unselected columns, with liveness information but without data, and
+    // allow view rows to remain alive despite having no data (issue #3362).
+    // These columns should be hidden from the user's SELECT queries.
+    bool is_view_virtual() const { return _is_view_virtual == column_view_virtual::yes; }
+    column_view_virtual view_virtual() const { return _is_view_virtual; }
+    // Computed column values are generated from other columns (and possibly other sources) during updates.
+    // Their values are still stored on disk, same as a regular columns.
+    bool is_computed() const { return bool(_computation); }
+    const column_computation& get_computation() const { return *_computation; }
+    column_computation_ptr get_computation_ptr() const {
+        return _computation ? _computation->clone() : nullptr;
+    }
+    void set_computed(column_computation_ptr computation) { _computation = std::move(computation); }
+    // Columns hidden from CQL cannot be in any way retrieved by the user,
+    // either explicitly or via the '*' operator, or functions, aggregates, etc.
+    bool is_hidden_from_cql() const { return is_view_virtual(); }
     const sstring& name_as_text() const;
     const bytes& name() const;
     sstring name_as_cql_string() const;
@@ -284,6 +420,7 @@ public:
 };
 
 bool operator==(const column_definition&, const column_definition&);
+inline bool operator!=(const column_definition& a, const column_definition& b) { return !(a == b); }
 
 static constexpr int DEFAULT_MIN_COMPACTION_THRESHOLD = 4;
 static constexpr int DEFAULT_MAX_COMPACTION_THRESHOLD = 32;
@@ -295,9 +432,10 @@ static constexpr int DEFAULT_GC_GRACE_SECONDS = 864000;
 class column_mapping_entry {
     bytes _name;
     data_type _type;
+    bool _is_atomic;
 public:
     column_mapping_entry(bytes name, data_type type)
-        : _name(std::move(name)), _type(std::move(type)) { }
+        : _name(std::move(name)), _type(std::move(type)), _is_atomic(_type->is_atomic()) { }
     column_mapping_entry(bytes name, sstring type_name);
     column_mapping_entry(const column_mapping_entry&);
     column_mapping_entry& operator=(const column_mapping_entry&);
@@ -306,7 +444,11 @@ public:
     const bytes& name() const { return _name; }
     const data_type& type() const { return _type; }
     const sstring& type_name() const { return _type->name(); }
+    bool is_atomic() const { return _is_atomic; }
 };
+
+bool operator==(const column_mapping_entry& lhs, const column_mapping_entry& rhs);
+bool operator!=(const column_mapping_entry& lhs, const column_mapping_entry& rhs);
 
 // Encapsulates information needed for converting mutations between different schema versions.
 //
@@ -333,19 +475,21 @@ public:
     }
     const column_mapping_entry& static_column_at(column_id id) const {
         if (id >= _n_static) {
-            throw std::out_of_range(sprint("static column id %d >= %d", id, _n_static));
+            throw std::out_of_range(format("static column id {:d} >= {:d}", id, _n_static));
         }
         return _columns[id];
     }
     const column_mapping_entry& regular_column_at(column_id id) const {
         auto n_regular = _columns.size() - _n_static;
         if (id >= n_regular) {
-            throw std::out_of_range(sprint("regular column id %d >= %d", id, n_regular));
+            throw std::out_of_range(format("regular column id {:d} >= {:d}", id, n_regular));
         }
         return _columns[id + _n_static];
     }
     friend std::ostream& operator<<(std::ostream& out, const column_mapping& cm);
 };
+
+bool operator==(const column_mapping& lhs, const column_mapping& rhs);
 
 /**
  * Augments a schema with fields related to materialized views.
@@ -480,7 +624,8 @@ private:
         bool _is_counter = false;
         cf_type _type = cf_type::standard;
         int32_t _gc_grace_seconds = DEFAULT_GC_GRACE_SECONDS;
-        double _dc_local_read_repair_chance = 0.1;
+        std::optional<int32_t> _paxos_grace_seconds;
+        double _dc_local_read_repair_chance = 0.0;
         double _read_repair_chance = 0.0;
         double _crc_check_chance = 1;
         int32_t _min_compaction_threshold = DEFAULT_MIN_COMPACTION_THRESHOLD;
@@ -499,6 +644,13 @@ private:
         std::unordered_map<sstring, dropped_column> _dropped_columns;
         std::map<bytes, data_type> _collections;
         std::unordered_map<sstring, index_metadata> _indices_by_name;
+        // The flag is not stored in the schema mutation and does not affects schema digest.
+        // It is set locally on a system tables that should be extra durable
+        bool _wait_for_sync = false; // true if all writes using this schema have to be synced immediately by commitlog
+        std::reference_wrapper<const dht::i_partitioner> _partitioner;
+        // Sharding info is not stored in the schema mutation and does not affect
+        // schema digest. It is also not set locally on a schema tables.
+        std::reference_wrapper<const dht::sharder> _sharder;
     };
     raw_schema _raw;
     thrift_schema _thrift;
@@ -517,6 +669,9 @@ private:
     lw_shared_ptr<compound_type<allow_prefixes::yes>> _clustering_key_type;
     column_mapping _column_mapping;
     shared_ptr<query::partition_slice> _full_slice;
+    column_count_type _clustering_key_size;
+    column_count_type _regular_column_count;
+    column_count_type _static_column_count;
 
     extensions_map& extensions() {
         return _raw._extensions;
@@ -541,20 +696,20 @@ public:
         data_type type;
     };
 private:
-    ::shared_ptr<cql3::column_specification> make_column_specification(const column_definition& def);
+    lw_shared_ptr<cql3::column_specification> make_column_specification(const column_definition& def);
     void rebuild();
-    schema(const raw_schema&, stdx::optional<raw_view_info>);
+    schema(const raw_schema&, std::optional<raw_view_info>);
 public:
     // deprecated, use schema_builder.
-    schema(std::experimental::optional<utils::UUID> id,
-        sstring ks_name,
-        sstring cf_name,
+    schema(std::optional<utils::UUID> id,
+        std::string_view ks_name,
+        std::string_view cf_name,
         std::vector<column> partition_key,
         std::vector<column> clustering_key,
         std::vector<column> regular_columns,
         std::vector<column> static_columns,
         data_type regular_column_name_type,
-        sstring comment = {});
+        std::string_view comment = {});
     schema(const schema&);
     ~schema();
     table_schema_version version() const {
@@ -617,6 +772,8 @@ public:
         return std::chrono::duration_cast<gc_clock::duration>(seconds);
     }
 
+    gc_clock::duration paxos_grace_seconds() const;
+
     double dc_local_read_repair_chance() const {
         return _raw._dc_local_read_repair_chance;
     }
@@ -664,6 +821,8 @@ public:
         return _raw._compaction_enabled;
     }
 
+    const cdc::options& cdc_options() const;
+
     const ::speculative_retry& speculative_retry() const {
         return _raw._speculative_retry;
     }
@@ -672,8 +831,15 @@ public:
         return _raw._caching_options;
     }
 
+    static void set_default_partitioner(const sstring& class_name, unsigned ignore_msb = 0);
+    const dht::i_partitioner& get_partitioner() const;
+    const dht::sharder& get_sharder() const;
+    bool has_custom_partitioner() const;
+
     const column_definition* get_column_definition(const bytes& name) const;
     const column_definition& column_at(column_kind, column_id) const;
+    // Find a column definition given column ordinal id in the schema
+    const column_definition& column_at(ordinal_column_id ordinal_id) const;
     const_iterator regular_begin() const;
     const_iterator regular_end() const;
     const_iterator regular_lower_bound(const bytes& name) const;
@@ -689,10 +855,12 @@ public:
     bool is_last_partition_key(const column_definition& def) const;
     bool has_multi_cell_collections() const;
     bool has_static_columns() const;
+    column_count_type columns_count(column_kind kind) const;
     column_count_type partition_key_size() const;
-    column_count_type clustering_key_size() const;
-    column_count_type static_columns_count() const;
-    column_count_type regular_columns_count() const;
+    column_count_type clustering_key_size() const { return _clustering_key_size; }
+    column_count_type static_columns_count() const { return _static_column_count; }
+    column_count_type regular_columns_count() const { return _regular_column_count; }
+    column_count_type all_columns_count() const { return _raw._columns.size(); }
     // Returns a range of column definitions
     const_iterator_range_type partition_key_columns() const;
     // Returns a range of column definitions
@@ -701,6 +869,8 @@ public:
     const_iterator_range_type static_columns() const;
     // Returns a range of column definitions
     const_iterator_range_type regular_columns() const;
+    // Returns a range of column definitions
+    const_iterator_range_type columns(column_kind) const;
     // Returns a range of column definitions
 
     typedef boost::range::joined_range<const_iterator_range_type, const_iterator_range_type>
@@ -769,8 +939,26 @@ public:
     // Search for an index with a given name.
     bool has_index(const sstring& index_name) const;
     // Search for an existing index with same kind and options.
-    stdx::optional<index_metadata> find_index_noname(const index_metadata& target) const;
+    std::optional<index_metadata> find_index_noname(const index_metadata& target) const;
     friend std::ostream& operator<<(std::ostream& os, const schema& s);
+    /*!
+     * \brief stream the CQL DESCRIBE output.
+     *
+     * CQL DESCRIBE is implemented at the driver level. This method mimic that functionality
+     * inside Scylla.
+     *
+     * The output of DESCRIBE is the CQL command to create the described table with its indexes and views.
+     *
+     * For tables with Indexes or Materialized Views, the CQL DESCRIBE is split between the base and view tables.
+     * Calling the describe method on the base table schema would result with the CQL "CREATE TABLE"
+     * command for creating that table only.
+     *
+     * Calling the describe method on a view schema would result with the appropriate "CREATE MATERIALIZED VIEW"
+     * or "CREATE INDEX" depends on the type of index that schema describes (ie. Materialized View, Global
+     * Index or Local Index).
+     *
+     */
+    std::ostream& describe(database& db, std::ostream& os) const;
     friend bool operator==(const schema&, const schema&);
     const column_mapping& get_column_mapping() const;
     friend class schema_registry_entry;
@@ -782,11 +970,18 @@ public:
     // recent as this version.
     bool is_synced() const;
     bool equal_columns(const schema&) const;
+    bool wait_for_sync_to_commitlog() const {
+        return _raw._wait_for_sync;
+    }
 public:
     const v3_columns& v3() const {
         return _v3_columns;
     }
 };
+
+lw_shared_ptr<schema> make_shared_schema(std::optional<utils::UUID> id, std::string_view ks_name, std::string_view cf_name,
+    std::vector<schema::column> partition_key, std::vector<schema::column> clustering_key, std::vector<schema::column> regular_columns,
+    std::vector<schema::column> static_columns, data_type regular_column_name_type, std::string_view comment = {});
 
 bool operator==(const schema&, const schema&);
 
@@ -822,3 +1017,19 @@ public:
 std::ostream& operator<<(std::ostream& os, const view_ptr& view);
 
 utils::UUID generate_legacy_id(const sstring& ks_name, const sstring& cf_name);
+
+
+// Thrown when attempted to access a schema-dependent object using
+// an incompatible version of the schema object.
+class schema_mismatch_error : public std::runtime_error {
+public:
+    schema_mismatch_error(table_schema_version expected, const schema& access);
+};
+
+// Throws schema_mismatch_error when a schema-dependent object of "expected" version
+// cannot be accessed using "access" schema.
+inline void check_schema_version(table_schema_version expected, const schema& access) {
+    if (expected != access.version()) {
+        throw_with_backtrace<schema_mismatch_error>(expected, access);
+    }
+}

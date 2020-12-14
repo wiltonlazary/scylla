@@ -23,36 +23,33 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/distributed.hh>
-#include "auth/service.hh"
+#include <seastar/core/abort_source.hh>
 #include "db/config.hh"
-#include "db/system_distributed_keyspace.hh"
-#include "database.hh"
 #include "log.hh"
+#include "seastarx.hh"
 
 namespace db {
 class extensions;
+class seed_provider_type;
+namespace view {
+class view_update_generator;
+}
+}
+
+namespace gms {
+class feature_service;
+class gossiper;
 }
 
 extern logging::logger startlog;
 
 class bad_configuration_error : public std::exception {};
 
-void init_storage_service(distributed<database>& db, sharded<auth::service>&, sharded<db::system_distributed_keyspace>&);
-void init_ms_fd_gossiper(sstring listen_address
-                , uint16_t storage_port
-                , uint16_t ssl_storage_port
-                , bool tcp_nodelay_inter_dc
-                , sstring ms_encrypt_what
-                , sstring ms_trust_store
-                , sstring ms_cert
-                , sstring ms_key
-                , sstring ms_tls_prio
-                , bool ms_client_auth
-                , sstring ms_compress
+void init_gossiper(sharded<gms::gossiper>& gossiper
+                , db::config& cfg
+                , sstring listen_address
                 , db::seed_provider_type seed_provider
-                , sstring cluster_name = "Test Cluster"
-                , double phi = 8
-                , bool sltba = false);
+                , sstring cluster_name = "Test Cluster");
 
 /**
  * Very simplistic config registry. Allows hooking in a config object

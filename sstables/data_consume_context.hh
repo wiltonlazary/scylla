@@ -26,7 +26,6 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/util/optimized_optional.hh>
-#include <seastar/util/gcc6-concepts.hh>
 
 #include "shared_sstable.hh"
 #include "row.hh"
@@ -38,15 +37,15 @@ class reader_position_tracker;
 
 template <typename DataConsumeRowsContext>
 data_consume_context<DataConsumeRowsContext>
-data_consume_rows(shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range, uint64_t);
+data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range, uint64_t);
 
 template <typename DataConsumeRowsContext>
 data_consume_context<DataConsumeRowsContext>
-data_consume_single_partition(shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range);
+data_consume_single_partition(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range);
 
 template <typename DataConsumeRowsContext>
 data_consume_context<DataConsumeRowsContext>
-data_consume_rows(shared_sstable, typename DataConsumeRowsContext::consumer&);
+data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&);
 
 // data_consume_context is an object returned by sstable::data_consume_rows()
 // which allows knowing when the consumer stops reading, and starting it again
@@ -63,33 +62,25 @@ data_consume_rows(shared_sstable, typename DataConsumeRowsContext::consumer&);
 // and the time the returned future is completed, the object lives on.
 // Moreover, the sstable object used for the sstable::data_consume_rows()
 // call which created this data_consume_context, must also be kept alive.
-//
-// data_consume_rows() and data_consume_rows_at_once() both can read just a
-// single row or many rows. The difference is that data_consume_rows_at_once()
-// is optimized to reading one or few rows (reading it all into memory), while
-// data_consume_rows() uses a read buffer, so not all the rows need to fit
-// memory in the same time (they are delivered to the consumer one by one).
 template <typename DataConsumeRowsContext>
-GCC6_CONCEPT(
-    requires ConsumeRowsContext<DataConsumeRowsContext>()
-)
+requires ConsumeRowsContext<DataConsumeRowsContext>
 class data_consume_context {
     shared_sstable _sst;
     std::unique_ptr<DataConsumeRowsContext> _ctx;
 
-    // This object can only be constructed by sstable::data_consume_rows()
     template <typename Consumer>
-    data_consume_context(shared_sstable sst, Consumer &consumer, input_stream<char> &&input, uint64_t start, uint64_t maxlen)
-        : _sst(std::move(sst)), _ctx(new DataConsumeRowsContext(consumer, std::move(input), start, maxlen))
+    data_consume_context(const schema& s, shared_sstable sst, Consumer &consumer, input_stream<char> &&input, uint64_t start, uint64_t maxlen)
+        : _sst(std::move(sst))
+        , _ctx(std::make_unique<DataConsumeRowsContext>(s, _sst, consumer, std::move(input), start, maxlen))
     { }
 
     friend class sstable;
     friend data_consume_context<DataConsumeRowsContext>
-    data_consume_rows<DataConsumeRowsContext>(shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range, uint64_t);
+    data_consume_rows<DataConsumeRowsContext>(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range, uint64_t);
     friend data_consume_context<DataConsumeRowsContext>
-    data_consume_single_partition<DataConsumeRowsContext>(shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range);
+    data_consume_single_partition<DataConsumeRowsContext>(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, sstable::disk_read_range);
     friend data_consume_context<DataConsumeRowsContext>
-    data_consume_rows<DataConsumeRowsContext>(shared_sstable, typename DataConsumeRowsContext::consumer&);
+    data_consume_rows<DataConsumeRowsContext>(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&);
 
     data_consume_context() = default;
 
@@ -109,8 +100,12 @@ public:
         return _ctx->fast_forward_to(begin, end);
     }
 
+    bool need_skip(uint64_t pos) const {
+        return pos > _ctx->position();
+    }
+
     future<> skip_to(indexable_element el, uint64_t begin) {
-        sstlog.trace("data_consume_rows_context {}: skip_to({} -> {}, el={})", _ctx.get(), _ctx->position(), begin, static_cast<int>(el));
+        sstlog.trace("data_consume_rows_context {}: skip_to({} -> {}, el={})", fmt::ptr(_ctx.get()), _ctx->position(), begin, static_cast<int>(el));
         if (begin <= _ctx->position()) {
             return make_ready_future<>();
         }
@@ -129,7 +124,8 @@ public:
     ~data_consume_context() {
         if (_ctx) {
             auto f = _ctx->close();
-            f.handle_exception([ctx = std::move(_ctx), sst = std::move(_sst)](auto) {});
+            //FIXME: discarded future.
+            (void)f.handle_exception([ctx = std::move(_ctx), sst = std::move(_sst)](auto) {});
         }
     }
 
@@ -174,27 +170,29 @@ using data_consume_context_opt = optimized_optional<data_consume_context<DataCon
 // The amount of this excessive read is controlled by read ahead
 // hueristics which learn from the usefulness of previous read aheads.
 template <typename DataConsumeRowsContext>
-inline data_consume_context<DataConsumeRowsContext> data_consume_rows(shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread, uint64_t last_end) {
+inline data_consume_context<DataConsumeRowsContext> data_consume_rows(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread, uint64_t last_end) {
     // Although we were only asked to read until toread.end, we'll not limit
     // the underlying file input stream to this end, but rather to last_end.
     // This potentially enables read-ahead beyond end, until last_end, which
     // can be beneficial if the user wants to fast_forward_to() on the
     // returned context, and may make small skips.
-    auto input = sst->data_stream(toread.start, last_end - toread.start, consumer.io_priority(), consumer.resource_tracker(), sst->_partition_range_history);
-    return { std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start };
+    auto input = sst->data_stream(toread.start, last_end - toread.start, consumer.io_priority(),
+            consumer.permit(), consumer.trace_state(), sst->_partition_range_history);
+    return {s, std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start };
 }
 
 template <typename DataConsumeRowsContext>
-inline data_consume_context<DataConsumeRowsContext> data_consume_single_partition(shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread) {
-    auto input = sst->data_stream(toread.start, toread.end - toread.start, consumer.io_priority(), consumer.resource_tracker(), sst->_single_partition_history);
-    return { std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start };
+inline data_consume_context<DataConsumeRowsContext> data_consume_single_partition(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread) {
+    auto input = sst->data_stream(toread.start, toread.end - toread.start, consumer.io_priority(),
+            consumer.permit(), consumer.trace_state(), sst->_single_partition_history);
+    return {s, std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start };
 }
 
 // Like data_consume_rows() with bounds, but iterates over whole range
 template <typename DataConsumeRowsContext>
-inline data_consume_context<DataConsumeRowsContext> data_consume_rows(shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer) {
+inline data_consume_context<DataConsumeRowsContext> data_consume_rows(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer) {
         auto data_size = sst->data_size();
-        return data_consume_rows<DataConsumeRowsContext>(std::move(sst), consumer, {0, data_size}, data_size);
+        return data_consume_rows<DataConsumeRowsContext>(s, std::move(sst), consumer, {0, data_size}, data_size);
 }
 
 }

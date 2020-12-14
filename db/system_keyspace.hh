@@ -44,7 +44,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "utils/UUID.hh"
 #include "gms/inet_address.hh"
 #include "query-result-set.hh"
@@ -54,15 +54,26 @@
 #include "mutation_query.hh"
 #include <map>
 #include <seastar/core/distributed.hh>
+#include "service/paxos/paxos_state.hh"
 
 namespace service {
 
 class storage_proxy;
+class storage_service;
 
+}
+
+namespace netw {
+    class messaging_service;
 }
 
 namespace cql3 {
     class query_processor;
+}
+
+namespace gms {
+    class feature;
+    class feature_service;
 }
 
 bool is_system_keyspace(const sstring& ks_name);
@@ -79,6 +90,7 @@ static constexpr auto BATCHLOG = "batchlog";
 static constexpr auto PAXOS = "paxos";
 static constexpr auto BUILT_INDEXES = "IndexInfo";
 static constexpr auto LOCAL = "local";
+static constexpr auto TRUNCATED = "truncated";
 static constexpr auto PEERS = "peers";
 static constexpr auto PEER_EVENTS = "peer_events";
 static constexpr auto RANGE_XFERS = "range_xfers";
@@ -87,6 +99,10 @@ static constexpr auto COMPACTION_HISTORY = "compaction_history";
 static constexpr auto SSTABLE_ACTIVITY = "sstable_activity";
 static constexpr auto SIZE_ESTIMATES = "size_estimates";
 static constexpr auto LARGE_PARTITIONS = "large_partitions";
+static constexpr auto LARGE_ROWS = "large_rows";
+static constexpr auto LARGE_CELLS = "large_cells";
+static constexpr auto SCYLLA_LOCAL = "scylla_local";
+extern const char *const CLIENTS;
 
 namespace v3 {
 static constexpr auto BATCHES = "batches";
@@ -103,6 +119,7 @@ static constexpr auto AVAILABLE_RANGES = "available_ranges";
 static constexpr auto VIEWS_BUILDS_IN_PROGRESS = "views_builds_in_progress";
 static constexpr auto BUILT_VIEWS = "built_views";
 static constexpr auto SCYLLA_VIEWS_BUILDS_IN_PROGRESS = "scylla_views_builds_in_progress";
+static constexpr auto CDC_LOCAL = "cdc_local";
 }
 
 namespace legacy {
@@ -117,6 +134,10 @@ static constexpr auto FUNCTIONS = "schema_functions";
 static constexpr auto AGGREGATES = "schema_aggregates";
 }
 
+static constexpr const char* extra_durable_tables[] = { PAXOS };
+
+bool is_extra_durable(const sstring& name);
+
 // Partition estimates for a given range of tokens.
 struct range_estimates {
     schema_ptr schema;
@@ -127,12 +148,7 @@ struct range_estimates {
 };
 
 using view_name = std::pair<sstring, sstring>;
-struct view_build_progress {
-    view_name view;
-    dht::token first_token;
-    std::optional<dht::token> next_token;
-    shard_id cpu_id;
-};
+struct view_build_progress;
 
 extern schema_ptr hints();
 extern schema_ptr batchlog();
@@ -151,17 +167,33 @@ schema_ptr aggregates();
 
 }
 
-table_schema_version generate_schema_version(utils::UUID table_id);
+table_schema_version generate_schema_version(utils::UUID table_id, uint16_t offset = 0);
 
 // Only for testing.
-void minimal_setup(distributed<database>& db, distributed<cql3::query_processor>& qp);
+void minimal_setup(distributed<cql3::query_processor>& qp);
 
 future<> init_local_cache();
 future<> deinit_local_cache();
-future<> setup(distributed<database>& db, distributed<cql3::query_processor>& qp);
+future<> setup(distributed<database>& db,
+               distributed<cql3::query_processor>& qp,
+               distributed<gms::feature_service>& feat,
+               sharded<netw::messaging_service>& ms);
 future<> update_schema_version(utils::UUID version);
-future<> update_tokens(std::unordered_set<dht::token> tokens);
-future<> update_tokens(gms::inet_address ep, std::unordered_set<dht::token> tokens);
+
+/*
+ * Save tokens used by this node in the LOCAL table.
+ */
+future<> update_tokens(const std::unordered_set<dht::token>& tokens);
+
+/**
+ * Record tokens being used by another node in the PEERS table.
+ */
+future<> update_tokens(gms::inet_address ep, const std::unordered_set<dht::token>& tokens);
+
+/*
+ * Save the CDC streams generation timestamp announced by this node in persistent storage.
+ */
+future<> update_cdc_streams_timestamp(db_clock::time_point);
 
 future<> update_preferred_ip(gms::inet_address ep, gms::inet_address preferred_ip);
 future<std::unordered_map<gms::inet_address, gms::inet_address>> get_preferred_ips();
@@ -171,32 +203,11 @@ future<> update_peer_info(gms::inet_address ep, sstring column_name, Value value
 
 future<> remove_endpoint(gms::inet_address ep);
 
-future<> update_hints_dropped(gms::inet_address ep, utils::UUID time_period, int value);
+future<> set_scylla_local_param(const sstring& key, const sstring& value);
+future<std::optional<sstring>> get_scylla_local_param(const sstring& key);
 
 std::vector<schema_ptr> all_tables();
 void make(database& db, bool durable, bool volatile_testing_only = false);
-
-future<bool>
-is_index_built(const sstring& ks_name, const sstring& index_name);
-future<>
-set_index_built(const sstring& ks_name, const sstring& index_name);
-future<>
-set_index_removed(const sstring& ks_name, const sstring& index_name);
-
-future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-query_mutations(distributed<service::storage_proxy>& proxy, const sstring& cf_name);
-
-// Returns all data from given system table.
-// Intended to be used by code which is not performance critical.
-future<lw_shared_ptr<query::result_set>> query(distributed<service::storage_proxy>& proxy, const sstring& cf_name);
-
-// Returns a slice of given system table.
-// Intended to be used by code which is not performance critical.
-future<lw_shared_ptr<query::result_set>> query(
-    distributed<service::storage_proxy>& proxy,
-    const sstring& cf_name,
-    const dht::decorated_key& key,
-    query::clustering_range row_ranges = query::clustering_range::make_open_ended_both_sides());
 
 /// overloads
 
@@ -377,15 +388,15 @@ enum class bootstrap_state {
         std::unordered_map<int32_t, int64_t> rows_merged;
     };
 
-    future<> update_compaction_history(sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
+    future<> update_compaction_history(utils::UUID uuid, sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
                                        std::unordered_map<int32_t, int64_t> rows_merged);
-    future<std::vector<compaction_history_entry>> get_compaction_history();
+    using compaction_history_consumer = noncopyable_function<future<>(const compaction_history_entry&)>;
+    future<> get_compaction_history(compaction_history_consumer&& f);
 
     typedef std::vector<db::replay_position> replay_positions;
 
+    future<> save_truncation_record(utils::UUID, db_clock::time_point truncated_at, db::replay_position);
     future<> save_truncation_record(const column_family&, db_clock::time_point truncated_at, db::replay_position);
-    future<> save_truncation_records(const column_family&, db_clock::time_point truncated_at, replay_positions);
-    future<> remove_truncation_record(utils::UUID);
     future<replay_positions> get_truncated_position(utils::UUID);
     future<db::replay_position> get_truncated_position(utils::UUID, uint32_t shard);
     future<db_clock::time_point> get_truncated_at(utils::UUID);
@@ -476,17 +487,6 @@ enum class bootstrap_state {
 #endif
 
     /**
-     * Convenience method to update the list of tokens in the local system keyspace.
-     *
-     * @param addTokens tokens to add
-     * @param rmTokens tokens to remove
-     * @return the collection of persisted tokens
-     */
-    future<std::unordered_set<dht::token>> update_local_tokens(
-        const std::unordered_set<dht::token> add_tokens,
-        const std::unordered_set<dht::token> rm_tokens);
-
-    /**
      * Return a map of stored tokens to IP addresses
      *
      */
@@ -498,7 +498,23 @@ enum class bootstrap_state {
      */
     future<std::unordered_map<gms::inet_address, utils::UUID>> load_host_ids();
 
+    /*
+     * Read this node's tokens stored in the LOCAL table.
+     * Used to initialize a restarting node.
+     */
     future<std::unordered_set<dht::token>> get_saved_tokens();
+
+    /*
+     * Gets this node's non-empty set of tokens.
+     * TODO: maybe get this data from token_metadata instance?
+     */
+    future<std::unordered_set<dht::token>> get_local_tokens();
+
+    /*
+     * Read the CDC streams generation timestamp announced by this node from persistent storage.
+     * Used to initialize a restarting node.
+     */
+    future<std::optional<db_clock::time_point>> get_saved_cdc_streams_timestamp();
 
     future<std::unordered_map<gms::inet_address, sstring>> load_peer_features();
 
@@ -547,69 +563,6 @@ future<> set_bootstrap_state(bootstrap_state state);
     future<utils::UUID> set_local_host_id(const utils::UUID& host_id);
 
 #if 0
-
-    public static PaxosState loadPaxosState(ByteBuffer key, CFMetaData metadata)
-    {
-        String req = "SELECT * FROM system.%s WHERE row_key = ? AND cf_id = ?";
-        UntypedResultSet results = executeInternal(String.format(req, PAXOS), key, metadata.cfId);
-        if (results.isEmpty())
-            return new PaxosState(key, metadata);
-        UntypedResultSet.Row row = results.one();
-        Commit promised = row.has("in_progress_ballot")
-                        ? new Commit(key, row.getUUID("in_progress_ballot"), ArrayBackedSortedColumns.factory.create(metadata))
-                        : Commit.emptyCommit(key, metadata);
-        // either we have both a recently accepted ballot and update or we have neither
-        Commit accepted = row.has("proposal")
-                        ? new Commit(key, row.getUUID("proposal_ballot"), ColumnFamily.fromBytes(row.getBytes("proposal")))
-                        : Commit.emptyCommit(key, metadata);
-        // either most_recent_commit and most_recent_commit_at will both be set, or neither
-        Commit mostRecent = row.has("most_recent_commit")
-                          ? new Commit(key, row.getUUID("most_recent_commit_at"), ColumnFamily.fromBytes(row.getBytes("most_recent_commit")))
-                          : Commit.emptyCommit(key, metadata);
-        return new PaxosState(promised, accepted, mostRecent);
-    }
-
-    public static void savePaxosPromise(Commit promise)
-    {
-        String req = "UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET in_progress_ballot = ? WHERE row_key = ? AND cf_id = ?";
-        executeInternal(String.format(req, PAXOS),
-                        UUIDGen.microsTimestamp(promise.ballot),
-                        paxosTtl(promise.update.metadata),
-                        promise.ballot,
-                        promise.key,
-                        promise.update.id());
-    }
-
-    public static void savePaxosProposal(Commit proposal)
-    {
-        executeInternal(String.format("UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET proposal_ballot = ?, proposal = ? WHERE row_key = ? AND cf_id = ?", PAXOS),
-                        UUIDGen.microsTimestamp(proposal.ballot),
-                        paxosTtl(proposal.update.metadata),
-                        proposal.ballot,
-                        proposal.update.toBytes(),
-                        proposal.key,
-                        proposal.update.id());
-    }
-
-    private static int paxosTtl(CFMetaData metadata)
-    {
-        // keep paxos state around for at least 3h
-        return Math.max(3 * 3600, metadata.getGcGraceSeconds());
-    }
-
-    public static void savePaxosCommit(Commit commit)
-    {
-        // We always erase the last proposal (with the commit timestamp to no erase more recent proposal in case the commit is old)
-        // even though that's really just an optimization  since SP.beginAndRepairPaxos will exclude accepted proposal older than the mrc.
-        String cql = "UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET proposal_ballot = null, proposal = null, most_recent_commit_at = ?, most_recent_commit = ? WHERE row_key = ? AND cf_id = ?";
-        executeInternal(String.format(cql, PAXOS),
-                        UUIDGen.microsTimestamp(commit.ballot),
-                        paxosTtl(commit.update.metadata),
-                        commit.ballot,
-                        commit.update.toBytes(),
-                        commit.key,
-                        commit.update.id());
-    }
 
     /**
      * Returns a RestorableMeter tracking the average read rate of a particular SSTable, restoring the last-seen rate
@@ -666,11 +619,20 @@ mutation make_size_estimates_mutation(const sstring& ks, std::vector<range_estim
 
 future<> register_view_for_building(sstring ks_name, sstring view_name, const dht::token& token);
 future<> update_view_build_progress(sstring ks_name, sstring view_name, const dht::token& token);
+future<> remove_view_build_progress(sstring ks_name, sstring view_name);
 future<> remove_view_build_progress_across_all_shards(sstring ks_name, sstring view_name);
 future<> mark_view_as_built(sstring ks_name, sstring view_name);
 future<> remove_built_view(sstring ks_name, sstring view_name);
 future<std::vector<view_name>> load_built_views();
 future<std::vector<view_build_progress>> load_view_build_progress();
+
+// Paxos related functions
+future<service::paxos::paxos_state> load_paxos_state(partition_key_view key, schema_ptr s, gc_clock::time_point now,
+        db::timeout_clock::time_point timeout);
+future<> save_paxos_promise(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
+future<> save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout);
+future<> save_paxos_decision(const schema& s, const service::paxos::proposal& decision, db::timeout_clock::time_point timeout);
+future<> delete_paxos_decision(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
 
 } // namespace system_keyspace
 } // namespace db

@@ -21,13 +21,13 @@
 
 #pragma once
 
-#include "schema.hh"
 #include "bytes.hh"
 #include "types.hh"
 #include "compound_compat.hh"
 #include "utils/managed_bytes.hh"
 #include "hashing.hh"
 #include "database_fwd.hh"
+#include "schema_fwd.hh"
 
 //
 // This header defines type system for primary key holders.
@@ -146,6 +146,19 @@ public:
     auto components(const schema& s) const {
         return components();
     }
+
+    bool is_empty() const {
+        return _bytes.empty();
+    }
+
+    explicit operator bool() const {
+        return !is_empty();
+    }
+
+    // For backward compatibility with existing code.
+    bool is_empty(const schema& s) const {
+        return is_empty();
+    }
 };
 
 template <typename TopLevel, typename TopLevelView>
@@ -159,6 +172,16 @@ protected:
         return TopLevel::get_compound_type(s);
     }
 public:
+    struct with_schema_wrapper {
+        with_schema_wrapper(const schema& s, const TopLevel& key) : s(s), key(key) {}
+        const schema& s;
+        const TopLevel& key;
+    };
+
+    with_schema_wrapper with_schema(const schema& s) const {
+        return with_schema_wrapper(s, *static_cast<const TopLevel*>(this));
+    }
+
     static TopLevel make_empty() {
         return from_exploded(std::vector<bytes>());
     }
@@ -304,8 +327,17 @@ public:
         return get_compound_type(s)->end(_bytes);
     }
 
+    bool is_empty() const {
+        return _bytes.empty();
+    }
+
+    explicit operator bool() const {
+        return !is_empty();
+    }
+
+    // For backward compatibility with existing code.
     bool is_empty(const schema& s) const {
-        return begin(s) == end(s);
+        return is_empty();
     }
 
     // Returns a range of bytes_view
@@ -520,10 +552,6 @@ public:
     bool is_full(const schema& s) const {
         return TopLevel::get_compound_type(s)->is_full(base::_bytes);
     }
-
-    bool is_empty(const schema& s) const {
-        return TopLevel::get_compound_type(s)->is_empty(base::_bytes);
-    }
 };
 
 template <typename TopLevel, typename TopLevelView, typename FullTopLevel>
@@ -540,10 +568,6 @@ public:
 
     bool is_full(const schema& s) const {
         return TopLevel::get_compound_type(s)->is_full(base::_bytes);
-    }
-
-    bool is_empty(const schema& s) const {
-        return TopLevel::get_compound_type(s)->is_empty(base::_bytes);
     }
 
     // Can be called only if is_full()
@@ -625,6 +649,10 @@ public:
         return legacy_tri_compare(s, o) == 0;
     }
 
+    void validate(const schema& s) const {
+        return s.partition_key_type()->validate(representation());
+    }
+
     // A trichotomic comparator which orders keys according to their ordering on the ring.
     int ring_order_tri_compare(const schema& s, partition_key_view o) const;
 
@@ -642,6 +670,15 @@ public:
     static partition_key from_range(RangeOfSerializedComponents&& v) {
         return partition_key(managed_bytes(c_type::serialize_value(std::forward<RangeOfSerializedComponents>(v))));
     }
+
+    /*!
+     * \brief create a partition_key from a nodetool style string
+     * takes a nodetool style string representation of a partition key and returns a partition_key.
+     * With composite keys, columns are concatenate using ':'.
+     * For example if a composite key is has two columns (col1, col2) to get the partition key that
+     * have col1=val1 and col2=val2 use the string 'val1:val2'
+     */
+    static partition_key from_nodetool_style_string(const schema_ptr s, const sstring& key);
 
     partition_key(std::vector<bytes> v)
         : compound_wrapper(managed_bytes(c_type::serialize_value(std::move(v))))
@@ -691,6 +728,8 @@ public:
     friend std::ostream& operator<<(std::ostream& out, const partition_key& pk);
 };
 
+std::ostream& operator<<(std::ostream& out, const partition_key::with_schema_wrapper& pk);
+
 class exploded_clustering_prefix {
     std::vector<bytes> _v;
 public:
@@ -724,6 +763,10 @@ public:
 
     static const compound& get_compound_type(const schema& s) {
         return s.clustering_key_prefix_type();
+    }
+
+    static clustering_key_prefix_view make_empty() {
+        return { bytes_view() };
     }
 };
 
@@ -766,13 +809,32 @@ public:
         return from_exploded(s, prefix.components());
     }
 
+    /* This function makes the passed clustering key full by filling its
+     * missing trailing components with empty values.
+     * This is used to represesent clustering keys of rows in compact tables that may be non-full.
+     * Returns whether a key wasn't full before the call.
+     */
+    static bool make_full(const schema& s, clustering_key_prefix& ck) {
+        if (!ck.is_full(s)) {
+            // TODO: avoid unnecessary copy here
+            auto full_ck_size = s.clustering_key_columns().size();
+            auto exploded = ck.explode(s);
+            exploded.resize(full_ck_size);
+            ck = clustering_key_prefix::from_exploded(std::move(exploded));
+            return true;
+        }
+        return false;
+    }
+
     friend std::ostream& operator<<(std::ostream& out, const clustering_key_prefix& ckp);
 };
+
+std::ostream& operator<<(std::ostream& out, const clustering_key_prefix::with_schema_wrapper& pk);
 
 template<>
 struct appending_hash<partition_key_view> {
     template<typename Hasher>
-    void operator()(Hasher& h, const partition_key& pk, const schema& s) const {
+    void operator()(Hasher& h, const partition_key_view& pk, const schema& s) const {
         for (bytes_view v : pk.components(s)) {
             ::feed_hash(h, v);
         }

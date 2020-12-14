@@ -172,6 +172,14 @@ public:
         return enum_set(mask);
     }
 
+    static constexpr mask_type full_mask() {
+        return ~(std::numeric_limits<mask_type>::max() << (Enum::max_sequence + 1));
+    }
+
+    static constexpr enum_set full() {
+        return enum_set(full_mask());
+    }
+
     static inline mask_type mask_for(enum_type e) {
         return mask_type(1) << Enum::sequence_for(e);
     }
@@ -231,6 +239,10 @@ public:
         _mask |= mask_for(e);
     }
 
+    void add(const enum_set& other) {
+        _mask |= other._mask;
+    }
+
     explicit operator bool() const {
         return bool(_mask);
     }
@@ -278,13 +290,13 @@ public:
             return mask & e.mask;
         }
 
-        static enum_set<Enum> unfreeze() {
+        static constexpr enum_set<Enum> unfreeze() {
             return enum_set<Enum>(mask);
         }
     };
 
     template<enum_type... items>
-    static enum_set<Enum> of() {
+    static constexpr enum_set<Enum> of() {
         return frozen<items...>::unfreeze();
     }
 };

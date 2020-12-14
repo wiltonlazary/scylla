@@ -25,7 +25,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/shared_future.hh>
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "frozen_schema.hh"
 
 namespace db {
@@ -72,7 +72,7 @@ class schema_registry_entry : public enable_lw_shared_from_this<schema_registry_
     async_schema_loader _loader; // valid when state == LOADING
     shared_promise<schema_ptr> _schema_promise; // valid when state == LOADING
 
-    std::experimental::optional<frozen_schema> _frozen_schema; // engaged when state == LOADED
+    std::optional<frozen_schema> _frozen_schema; // engaged when state == LOADED
     // valid when state == LOADED
     // This is != nullptr when there is an alive schema_ptr associated with this entry.
     const ::schema* _schema = nullptr;
@@ -120,10 +120,9 @@ class schema_registry {
     friend class schema_registry_entry;
     schema_registry_entry& get_entry(table_schema_version) const;
     // Duration for which unused entries are kept alive to avoid
-    // too frequent re-requests and syncs.
-    schema_registry_entry::erase_clock::duration grace_period() const {
-        return std::chrono::seconds(1);
-    }
+    // too frequent re-requests and syncs. Default is 1 second.
+    schema_registry_entry::erase_clock::duration grace_period() const;
+
 public:
     ~schema_registry();
     // workaround to this object being magically appearing from nowhere.
@@ -173,7 +172,7 @@ public:
     // The other may come from a different shard.
     global_schema_ptr(const global_schema_ptr& other);
     // The other must come from current shard.
-    global_schema_ptr(global_schema_ptr&& other);
+    global_schema_ptr(global_schema_ptr&& other) noexcept;
     // May be invoked across shards. Always returns an engaged pointer.
     schema_ptr get() const;
     operator schema_ptr() const { return get(); }

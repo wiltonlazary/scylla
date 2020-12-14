@@ -53,14 +53,17 @@
 #include "log.hh"
 #include "seastarx.hh"
 
+namespace cql3 { class query_processor; }
+
 namespace tracing {
 
 using elapsed_clock = std::chrono::steady_clock;
 
 extern logging::logger tracing_logger;
 
-class trace_state;
+class trace_state_ptr;
 class tracing;
+class backend_registry;
 
 enum class trace_type : uint8_t {
     NONE,
@@ -175,7 +178,7 @@ protected:
 public:
     i_tracing_backend_helper(tracing& tr) : _local_tracing(tr) {}
     virtual ~i_tracing_backend_helper() {}
-    virtual future<> start() = 0;
+    virtual future<> start(cql3::query_processor& qp) = 0;
     virtual future<> stop() = 0;
 
     /**
@@ -214,6 +217,8 @@ struct session_record {
     std::set<sstring> tables;
     sstring username;
     sstring request;
+    size_t request_size = 0;
+    size_t response_size = 0;
     std::chrono::system_clock::time_point started_at;
     trace_type command = trace_type::NONE;
     elapsed_clock::duration elapsed;
@@ -237,6 +242,8 @@ public:
 };
 
 class one_session_records {
+private:
+    shared_ptr<tracing> _local_tracing_ptr;
 public:
     utils::UUID session_id;
     session_record session_rec;
@@ -301,8 +308,6 @@ public:
 private:
     bool _is_pending_for_write = false;
 };
-
-using trace_state_ptr = lw_shared_ptr<trace_state>;
 
 class tracing : public seastar::async_sharded_service<tracing> {
 public:
@@ -390,6 +395,7 @@ private:
     bool _slow_query_logging_enabled = false;
     std::unique_ptr<i_tracing_backend_helper> _tracing_backend_helper_ptr;
     sstring _thread_name;
+    const backend_registry& _backend_registry;
     sstring _tracing_backend_helper_class_name;
     seastar::metrics::metric_groups _metrics;
     double _trace_probability = 0.0; // keep this one for querying purposes
@@ -426,12 +432,12 @@ public:
         return !_down;
     }
 
-    static future<> create_tracing(sstring tracing_backend_helper_class_name);
-    static future<> start_tracing();
-    tracing(sstring tracing_backend_helper_class_name);
+    static future<> create_tracing(const backend_registry& br, sstring tracing_backend_helper_class_name);
+    static future<> start_tracing(sharded<cql3::query_processor>& qp);
+    tracing(const backend_registry& br, sstring tracing_backend_helper_class_name);
 
     // Initialize a tracing backend (e.g. tracing_keyspace or logstash)
-    future<> start();
+    future<> start(cql3::query_processor& qp);
 
     future<> stop();
 
@@ -640,7 +646,7 @@ private:
      *
      * @return TRUE if conditions are allowing creating a new tracing session
      */
-    bool may_create_new_session(const std::experimental::optional<utils::UUID>& session_id = std::experimental::nullopt) {
+    bool may_create_new_session(const std::optional<utils::UUID>& session_id = std::nullopt) {
         // Don't create a session if its records are likely to be dropped
         if (!have_records_budget(exp_trace_events_per_session) || _active_sessions >= max_pending_sessions + write_event_sessions_threshold) {
             if (session_id) {
@@ -663,7 +669,7 @@ private:
 
 void one_session_records::set_pending_for_write() {
     _is_pending_for_write = true;
-    budget_ptr = tracing::get_local_tracing_instance().get_pending_records_ptr();
+    budget_ptr = _local_tracing_ptr->get_pending_records_ptr();
 }
 
 void one_session_records::data_consumed() {
@@ -672,7 +678,7 @@ void one_session_records::data_consumed() {
     }
 
     _is_pending_for_write = false;
-    budget_ptr = tracing::get_local_tracing_instance().get_cached_records_ptr();
+    budget_ptr = _local_tracing_ptr->get_cached_records_ptr();
 }
 
 inline span_id span_id::make_span_id() {

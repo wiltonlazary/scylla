@@ -24,14 +24,161 @@
 #include "mutation_compactor.hh"
 #include "mutation_reader.hh"
 
-#include <seastar/core/weak_ptr.hh>
+#include <boost/intrusive/set.hpp>
+
 #include <variant>
+
+namespace query {
+
+template <typename Consumer>
+class clustering_position_tracker {
+    Consumer _consumer;
+    lw_shared_ptr<std::optional<clustering_key_prefix>> _last_ckey;
+
+public:
+    clustering_position_tracker(Consumer&& consumer, lw_shared_ptr<std::optional<clustering_key_prefix>> last_ckey)
+        : _consumer(std::forward<Consumer>(consumer))
+        , _last_ckey(std::move(last_ckey)) {
+    }
+
+    void consume_new_partition(const dht::decorated_key& dk) {
+        _last_ckey->reset();
+        _consumer.consume_new_partition(dk);
+    }
+    void consume(tombstone t) {
+        _consumer.consume(t);
+    }
+    stop_iteration consume(static_row&& sr, tombstone t, bool is_live) {
+        return _consumer.consume(std::move(sr), std::move(t), is_live);
+    }
+    stop_iteration consume(clustering_row&& cr, row_tombstone t, bool is_live) {
+        *_last_ckey = cr.key();
+        return _consumer.consume(std::move(cr), std::move(t), is_live);
+    }
+    stop_iteration consume(range_tombstone&& rt) {
+        return _consumer.consume(std::move(rt));
+    }
+    stop_iteration consume_end_of_partition() {
+        return _consumer.consume_end_of_partition();
+    }
+    auto consume_end_of_stream() {
+        return _consumer.consume_end_of_stream();
+    }
+};
+
+/// Consume a page worth of data from the reader.
+///
+/// Uses `compaction_state` for compacting the fragments and `consumer` for
+/// building the results.
+/// Returns a future containing a tuple with the last consumed clustering key,
+/// or std::nullopt if the last row wasn't a clustering row, and whatever the
+/// consumer's `consume_end_of_stream()` method returns.
+template <emit_only_live_rows OnlyLive, typename Consumer>
+requires CompactedFragmentsConsumer<Consumer>
+auto consume_page(flat_mutation_reader& reader,
+        lw_shared_ptr<compact_for_query_state<OnlyLive>> compaction_state,
+        const query::partition_slice& slice,
+        Consumer&& consumer,
+        uint64_t row_limit,
+        uint32_t partition_limit,
+        gc_clock::time_point query_time,
+        db::timeout_clock::time_point timeout,
+        query::max_result_size max_size) {
+    return reader.peek(timeout).then([=, &reader, consumer = std::move(consumer), &slice] (
+                mutation_fragment* next_fragment) mutable {
+        const auto next_fragment_kind = next_fragment ? next_fragment->mutation_fragment_kind() : mutation_fragment::kind::partition_end;
+        compaction_state->start_new_page(row_limit, partition_limit, query_time, next_fragment_kind, consumer);
+
+        auto last_ckey = make_lw_shared<std::optional<clustering_key_prefix>>();
+        auto reader_consumer = make_stable_flattened_mutations_consumer<compact_for_query<OnlyLive, clustering_position_tracker<Consumer>>>(
+                compaction_state,
+                clustering_position_tracker(std::move(consumer), last_ckey));
+
+        auto consume = [&reader, &slice, reader_consumer = std::move(reader_consumer), timeout, max_size] () mutable {
+            if (slice.options.contains(query::partition_slice::option::reversed)) {
+                return do_with(make_reversing_reader(reader, max_size),
+                        [reader_consumer = std::move(reader_consumer), timeout] (flat_mutation_reader& reversing_reader) mutable {
+                    return reversing_reader.consume(std::move(reader_consumer), timeout);
+                });
+            }
+            return reader.consume(std::move(reader_consumer), timeout);
+        };
+
+        return consume().then([last_ckey] (auto&&... results) mutable {
+            static_assert(sizeof...(results) <= 1);
+            return make_ready_future<std::tuple<std::optional<clustering_key_prefix>, std::decay_t<decltype(results)>...>>(std::tuple(std::move(*last_ckey), std::move(results)...));
+        });
+    });
+}
+
+struct position_view {
+    const dht::decorated_key* partition_key;
+    const clustering_key_prefix* clustering_key;
+};
+
+class querier_base {
+protected:
+    schema_ptr _schema;
+    reader_permit _permit;
+    std::unique_ptr<const dht::partition_range> _range;
+    std::unique_ptr<const query::partition_slice> _slice;
+    flat_mutation_reader _reader;
+    dht::partition_ranges_view _query_ranges;
+
+public:
+    querier_base(reader_permit permit, std::unique_ptr<const dht::partition_range> range,
+            std::unique_ptr<const query::partition_slice> slice, flat_mutation_reader reader, dht::partition_ranges_view query_ranges)
+        : _schema(reader.schema())
+        , _permit(std::move(permit))
+        , _range(std::move(range))
+        , _slice(std::move(slice))
+        , _reader(std::move(reader))
+        , _query_ranges(query_ranges)
+    { }
+
+    querier_base(schema_ptr schema, reader_permit permit, dht::partition_range range,
+            query::partition_slice slice, const mutation_source& ms, const io_priority_class& pc, tracing::trace_state_ptr trace_ptr)
+        : _schema(std::move(schema))
+        , _permit(std::move(permit))
+        , _range(std::make_unique<const dht::partition_range>(std::move(range)))
+        , _slice(std::make_unique<const query::partition_slice>(std::move(slice)))
+        , _reader(ms.make_reader(_schema, _permit, *_range, *_slice, pc, std::move(trace_ptr), streamed_mutation::forwarding::no, mutation_reader::forwarding::no))
+        , _query_ranges(*_range)
+    { }
+
+    querier_base(querier_base&&) = default;
+    querier_base& operator=(querier_base&&) = default;
+
+    virtual ~querier_base() = default;
+
+    const ::schema& schema() const {
+        return *_schema;
+    }
+
+    reader_permit& permit() {
+        return _permit;
+    }
+
+    bool is_reversed() const {
+        return _slice->options.contains(query::partition_slice::option::reversed);
+    }
+
+    virtual position_view current_position() const = 0;
+
+    dht::partition_ranges_view ranges() const {
+        return _query_ranges;
+    }
+
+    size_t memory_usage() const {
+        return _permit.consumed_resources().memory;
+    }
+};
 
 /// One-stop object for serving queries.
 ///
 /// Encapsulates all state and logic for serving all pages for a given range
-/// of a query on a given shard. Can serve mutation or data queries. Can be
-/// used with any CompactedMutationsConsumer certified result-builder.
+/// of a query on a given shard. Can be used with any CompactedMutationsConsumer
+/// certified result-builder.
 /// Intended to be created on the first page of a query then saved and reused on
 /// subsequent pages.
 /// (1) Create with the parameters of your query.
@@ -43,169 +190,121 @@
 ///     Most result builders have memory-accounters that will stop the read
 ///     once some memory limit was reached. This is called a short read as the
 ///     read stops before the row and/or partition limits are reached.
-/// (4) At the beginning of the next page use can_be_used_for_page() to
-///     determine whether it can be used with the page's schema and start
-///     position. If a schema or position mismatch is detected the querier
-///     cannot be used to produce the next page and a new one has to be created
+/// (4) At the beginning of the next page validate whether it can be used with
+///     the page's schema and start position. In case a schema or position
+///     mismatch is detected the querier shouldn't be used to produce the next
+///     page. It should be dropped instead and a new one should be created
 ///     instead.
-class querier {
-public:
-    enum class can_use {
-        yes,
-        no_emit_only_live_rows_mismatch,
-        no_schema_version_mismatch,
-        no_ring_pos_mismatch,
-        no_clustering_pos_mismatch
-    };
-private:
-    template <typename Consumer>
-    class clustering_position_tracker {
-        std::unique_ptr<Consumer> _consumer;
-        lw_shared_ptr<std::optional<clustering_key_prefix>> _last_ckey;
-
-    public:
-        clustering_position_tracker(std::unique_ptr<Consumer>&& consumer, lw_shared_ptr<std::optional<clustering_key_prefix>> last_ckey)
-            : _consumer(std::move(consumer))
-            , _last_ckey(std::move(last_ckey)) {
-        }
-
-        void consume_new_partition(const dht::decorated_key& dk) {
-            _last_ckey->reset();
-            _consumer->consume_new_partition(dk);
-        }
-        void consume(tombstone t) {
-            _consumer->consume(t);
-        }
-        stop_iteration consume(static_row&& sr, tombstone t, bool is_live) {
-            return _consumer->consume(std::move(sr), std::move(t), is_live);
-        }
-        stop_iteration consume(clustering_row&& cr, row_tombstone t, bool is_live) {
-            *_last_ckey = cr.key();
-            return _consumer->consume(std::move(cr), std::move(t), is_live);
-        }
-        stop_iteration consume(range_tombstone&& rt) {
-            return _consumer->consume(std::move(rt));
-        }
-        stop_iteration consume_end_of_partition() {
-            return _consumer->consume_end_of_partition();
-        }
-        auto consume_end_of_stream() {
-            return _consumer->consume_end_of_stream();
-        }
-    };
-
-    struct position {
-        const dht::decorated_key* partition_key;
-        const clustering_key_prefix* clustering_key;
-    };
-
-    schema_ptr _schema;
-    std::unique_ptr<const dht::partition_range> _range;
-    std::unique_ptr<const query::partition_slice> _slice;
-    flat_mutation_reader _reader;
-    std::variant<lw_shared_ptr<compact_for_mutation_query_state>, lw_shared_ptr<compact_for_data_query_state>> _compaction_state;
-    lw_shared_ptr<std::optional<clustering_key_prefix>> _last_ckey;
-
-    std::variant<lw_shared_ptr<compact_for_mutation_query_state>, lw_shared_ptr<compact_for_data_query_state>> make_compaction_state(
-            const schema& s,
-            gc_clock::time_point query_time,
-            emit_only_live_rows only_live) const {
-        if (only_live == emit_only_live_rows::yes) {
-            return make_lw_shared<compact_for_query_state<emit_only_live_rows::yes>>(s, query_time, *_slice, 0, 0);
-        } else {
-            return make_lw_shared<compact_for_query_state<emit_only_live_rows::no>>(s, query_time, *_slice, 0, 0);
-        }
-    }
-
-    position current_position() const;
-
-    bool ring_position_matches(const dht::partition_range& range, const position& pos) const;
-
-    bool clustering_position_matches(const query::partition_slice& slice, const position& pos) const;
+template <emit_only_live_rows OnlyLive>
+class querier : public querier_base {
+    lw_shared_ptr<compact_for_query_state<OnlyLive>> _compaction_state;
+    std::optional<clustering_key_prefix> _last_ckey;
 
 public:
     querier(const mutation_source& ms,
             schema_ptr schema,
+            reader_permit permit,
             dht::partition_range range,
             query::partition_slice slice,
             const io_priority_class& pc,
-            tracing::trace_state_ptr trace_ptr,
-            emit_only_live_rows only_live)
-        : _schema(schema)
-        , _range(std::make_unique<dht::partition_range>(std::move(range)))
-        , _slice(std::make_unique<query::partition_slice>(std::move(slice)))
-        , _reader(ms.make_reader(schema, *_range, *_slice, pc, std::move(trace_ptr),
-                    streamed_mutation::forwarding::no, mutation_reader::forwarding::no))
-        , _compaction_state(make_compaction_state(*schema, gc_clock::time_point{}, only_live))
-        , _last_ckey(make_lw_shared<std::optional<clustering_key_prefix>>()) {
-    }
-
-    bool is_reversed() const {
-        return _slice->options.contains(query::partition_slice::option::reversed);
+            tracing::trace_state_ptr trace_ptr)
+        : querier_base(schema, permit, std::move(range), std::move(slice), ms, pc, std::move(trace_ptr))
+        , _compaction_state(make_lw_shared<compact_for_query_state<OnlyLive>>(*schema, gc_clock::time_point{}, *_slice, 0, 0)) {
     }
 
     bool are_limits_reached() const {
-        return std::visit([] (const auto& cs) { return cs->are_limits_reached(); }, _compaction_state);
+        return  _compaction_state->are_limits_reached();
     }
-
-    /// Does the querier's range matches `range`?
-    ///
-    /// A query can have more then one querier executing parallelly for
-    /// different sub-ranges on the same shard. This method helps identifying
-    /// the appropriate one for the `range'.
-    /// For the purposes of this identification it is enough to check that the
-    /// singulariness and end bound of the ranges matches. For non-singular
-    /// ranges the start bound may be adjusted from page-to-page as the query
-    /// progresses through it but since a query is guaranteed to be broken into
-    /// non-overlapping ranges just checking the end-bound is enough.
-    bool matches(const dht::partition_range& range) const;
-
-    /// Can the querier be used for the next page?
-    ///
-    /// The querier can only be used for the next page if the only_live, the
-    /// schema versions, the ring and the clustering positions match.
-    can_use can_be_used_for_page(emit_only_live_rows only_live, const schema& s,
-            const dht::partition_range& range, const query::partition_slice& slice) const;
 
     template <typename Consumer>
-    GCC6_CONCEPT(
-        requires CompactedFragmentsConsumer<Consumer>
-    )
+    requires CompactedFragmentsConsumer<Consumer>
     auto consume_page(Consumer&& consumer,
-            uint32_t row_limit,
+            uint64_t row_limit,
             uint32_t partition_limit,
             gc_clock::time_point query_time,
-            db::timeout_clock::time_point timeout) {
-        return std::visit([=, consumer = std::move(consumer)] (auto& compaction_state) mutable {
-            // FIXME: #3158
-            // consumer cannot be moved after consume_new_partition() is called
-            // on it because it stores references to some of it's own members.
-            // Move it to the heap before any consumption begins to avoid
-            // accidents.
-            return _reader.peek().then([=, consumer = std::make_unique<Consumer>(std::move(consumer))] (mutation_fragment* next_fragment) mutable {
-                const auto next_fragment_kind = next_fragment ? next_fragment->mutation_fragment_kind() : mutation_fragment::kind::partition_end;
-                compaction_state->start_new_page(row_limit, partition_limit, query_time, next_fragment_kind, *consumer);
-
-                const auto is_reversed = flat_mutation_reader::consume_reversed_partitions(
-                        _slice->options.contains(query::partition_slice::option::reversed));
-
-                using compaction_state_type = typename std::remove_reference<decltype(*compaction_state)>::type;
-                constexpr auto only_live = compaction_state_type::parameters::only_live;
-                auto reader_consumer = make_stable_flattened_mutations_consumer<compact_for_query<only_live, clustering_position_tracker<Consumer>>>(
-                        compaction_state,
-                        clustering_position_tracker(std::move(consumer), _last_ckey));
-
-                return _reader.consume(std::move(reader_consumer), is_reversed, timeout);
-            });
-        }, _compaction_state);
+            db::timeout_clock::time_point timeout,
+            query::max_result_size max_size) {
+        return ::query::consume_page(_reader, _compaction_state, *_slice, std::move(consumer), row_limit, partition_limit, query_time,
+                timeout, max_size).then([this] (auto&& results) {
+            _last_ckey = std::get<std::optional<clustering_key>>(std::move(results));
+            constexpr auto size = std::tuple_size<std::decay_t<decltype(results)>>::value;
+            static_assert(size <= 2);
+            if constexpr (size == 1) {
+                return make_ready_future<>();
+            } else {
+                auto result = std::get<1>(std::move(results));
+                return make_ready_future<std::decay_t<decltype(result)>>(std::move(result));
+            }
+        });
     }
 
-    size_t memory_usage() const {
-        return _reader.buffer_size();
+    virtual position_view current_position() const override {
+        const dht::decorated_key* dk = _compaction_state->current_partition();
+        const clustering_key_prefix* clustering_key = _last_ckey ? &*_last_ckey : nullptr;
+        return {dk, clustering_key};
+    }
+};
+
+using data_querier = querier<emit_only_live_rows::yes>;
+using mutation_querier = querier<emit_only_live_rows::no>;
+
+/// Local state of a multishard query.
+///
+/// This querier is not intended to be used directly to read pages. Instead it
+/// is merely a shard local state of a suspended multishard query and is
+/// intended to be used for storing the state of the query on each shard where
+/// it executes. It stores the local reader and the referenced parameters it was
+/// created with (similar to other queriers).
+/// For position validation purposes (at lookup) the reader's position is
+/// considered to be the same as that of the query.
+class shard_mutation_querier : public querier_base {
+    std::unique_ptr<const dht::partition_range_vector> _query_ranges;
+    dht::decorated_key _nominal_pkey;
+    std::optional<clustering_key_prefix> _nominal_ckey;
+
+private:
+    shard_mutation_querier(
+            std::unique_ptr<const dht::partition_range_vector> query_ranges,
+            std::unique_ptr<const dht::partition_range> reader_range,
+            std::unique_ptr<const query::partition_slice> reader_slice,
+            flat_mutation_reader reader,
+            reader_permit permit,
+            dht::decorated_key nominal_pkey,
+            std::optional<clustering_key_prefix> nominal_ckey)
+        : querier_base(permit, std::move(reader_range), std::move(reader_slice), std::move(reader), *query_ranges)
+        , _query_ranges(std::move(query_ranges))
+        , _nominal_pkey(std::move(nominal_pkey))
+        , _nominal_ckey(std::move(nominal_ckey)) {
     }
 
-    schema_ptr schema() const {
-        return _schema;
+
+public:
+    shard_mutation_querier(
+            const dht::partition_range_vector query_ranges,
+            std::unique_ptr<const dht::partition_range> reader_range,
+            std::unique_ptr<const query::partition_slice> reader_slice,
+            flat_mutation_reader reader,
+            reader_permit permit,
+            dht::decorated_key nominal_pkey,
+            std::optional<clustering_key_prefix> nominal_ckey)
+        : shard_mutation_querier(std::make_unique<const dht::partition_range_vector>(std::move(query_ranges)), std::move(reader_range),
+                std::move(reader_slice), std::move(reader), std::move(permit), std::move(nominal_pkey), std::move(nominal_ckey)) {
+    }
+
+    virtual position_view current_position() const override {
+        return {&_nominal_pkey, _nominal_ckey ? &*_nominal_ckey : nullptr};
+    }
+
+    std::unique_ptr<const dht::partition_range> reader_range() && {
+        return std::move(_range);
+    }
+
+    std::unique_ptr<const query::partition_slice> reader_slice() && {
+        return std::move(_slice);
+    }
+
+    flat_mutation_reader reader() && {
+        return std::move(_reader);
     }
 };
 
@@ -229,18 +328,18 @@ public:
 /// Inserted queriers will have a TTL. When this expires the querier is
 /// evicted. This is to avoid excess and unnecessary resource usage due to
 /// abandoned queriers.
-/// Provides a way to evict readers one-by-one via `evict_one()`. This can be
-/// used by the concurrency-limiting code to evict cached readers to free up
-/// resources for admitting new ones.
+/// Registers cached readers with the reader concurrency semaphore, as inactive
+/// readers, so the latter can evict them if needed.
 /// Keeps the total memory consumption of cached queriers
 /// below max_queriers_memory_usage by evicting older entries upon inserting
 /// new ones if the the memory consupmtion would go above the limit.
 class querier_cache {
 public:
     static const std::chrono::seconds default_entry_ttl;
-    static const size_t max_queriers_memory_usage;
 
     struct stats {
+        // The number of inserts into the cache.
+        uint64_t inserts = 0;
         // The number of cache lookups.
         uint64_t lookups = 0;
         // The subset of lookups that missed.
@@ -260,86 +359,78 @@ public:
         uint64_t population = 0;
     };
 
-private:
-    class entry : public weakly_referencable<entry> {
-        querier _querier;
-        lowres_clock::time_point _expires;
-    public:
-        // Since entry cannot be moved and unordered_map::emplace can pass only
-        // a single param to it's mapped-type we need to force a single-param
-        // constructor for entry. Oh C++...
-        struct param {
-            querier q;
-            std::chrono::seconds ttl;
-        };
+    class entry : public boost::intrusive::set_base_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>> {
+        // Self reference so that we can remove the entry given an `entry&`.
+        std::list<entry>::iterator _pos;
+        const utils::UUID _key;
+        const lowres_clock::time_point _expires;
+        std::unique_ptr<querier_base> _value;
+        reader_concurrency_semaphore::inactive_read_handle _handle;
 
-        explicit entry(param p)
-            : _querier(std::move(p.q))
-            , _expires(lowres_clock::now() + p.ttl) {
+    public:
+        template <typename Querier>
+        entry(utils::UUID key, Querier q, lowres_clock::time_point expires)
+            : _key(key)
+            , _expires(expires)
+            , _value(std::make_unique<Querier>(std::move(q))) {
+        }
+
+        std::list<entry>::iterator pos() const {
+            return _pos;
+        }
+
+        void set_pos(std::list<entry>::iterator pos) {
+            _pos = pos;
+        }
+
+        void set_inactive_handle(reader_concurrency_semaphore::inactive_read_handle handle) {
+            _handle = std::move(handle);
+        }
+
+        reader_concurrency_semaphore::inactive_read_handle get_inactive_handle() && {
+            return std::move(_handle);
+        }
+
+        const utils::UUID& key() const {
+            return _key;
         }
 
         bool is_expired(const lowres_clock::time_point& now) const {
             return _expires <= now;
         }
 
-        const querier& get() const & {
-            return _querier;
+        const querier_base& value() const {
+            return *_value;
         }
 
-        querier&& get() && {
-            return std::move(_querier);
-        }
-
-        size_t memory_usage() const {
-            return _querier.memory_usage();
+        querier_base& value() {
+            return *_value;
         }
     };
 
-    using entries = std::unordered_map<utils::UUID, entry>;
-
-    class meta_entry {
-        entries& _entries;
-        weak_ptr<entry> _entry_ptr;
-        entries::iterator _entry_it;
-
-    public:
-        meta_entry(entries& e, entries::iterator it)
-            : _entries(e)
-            , _entry_ptr(it->second.weak_from_this())
-            , _entry_it(it) {
-        }
-
-        ~meta_entry() {
-            if (_entry_ptr) {
-                _entries.erase(_entry_it);
-            }
-        }
-
-        bool is_expired(const lowres_clock::time_point& now) const {
-            return !_entry_ptr || _entry_ptr->is_expired(now);
-        }
-
-        explicit operator bool() const {
-            return bool(_entry_ptr);
-        }
-
-        const entry& get_entry() const {
-            return *_entry_ptr;
-        }
+    struct key_of_entry {
+        using type = utils::UUID;
+        const type& operator()(const entry& e) { return e.key(); }
     };
 
+    using entries = std::list<entry>;
+    using index = boost::intrusive::multiset<entry, boost::intrusive::key_of_value<key_of_entry>,
+          boost::intrusive::constant_time_size<false>>;
+
+private:
     entries _entries;
-    std::list<meta_entry> _meta_entries;
+    index _data_querier_index;
+    index _mutation_querier_index;
+    index _shard_mutation_querier_index;
     timer<lowres_clock> _expiry_timer;
     std::chrono::seconds _entry_ttl;
     stats _stats;
-
-    entries::iterator find_querier(utils::UUID key, const dht::partition_range& range, tracing::trace_state_ptr trace_state);
+    size_t _max_queriers_memory_usage;
 
     void scan_cache_entries();
 
 public:
-    querier_cache(std::chrono::seconds entry_ttl = default_entry_ttl);
+    explicit querier_cache(size_t max_cache_size = 1'000'000, std::chrono::seconds entry_ttl = default_entry_ttl);
 
     querier_cache(const querier_cache&) = delete;
     querier_cache& operator=(const querier_cache&) = delete;
@@ -348,11 +439,13 @@ public:
     querier_cache(querier_cache&&) = delete;
     querier_cache& operator=(querier_cache&&) = delete;
 
-    void insert(utils::UUID key, querier&& q, tracing::trace_state_ptr trace_state);
+    void insert(utils::UUID key, data_querier&& q, tracing::trace_state_ptr trace_state);
 
-    /// Lookup a querier in the cache.
-    ///
-    /// If the querier doesn't exist, use `create_fun' to create it.
+    void insert(utils::UUID key, mutation_querier&& q, tracing::trace_state_ptr trace_state);
+
+    void insert(utils::UUID key, shard_mutation_querier&& q, tracing::trace_state_ptr trace_state);
+
+    /// Lookup a data querier in the cache.
     ///
     /// Queriers are found based on `key` and `range`. There may be multiple
     /// queriers for the same `key` differentiated by their read range. Since
@@ -362,17 +455,32 @@ public:
     /// non-overlapping ranges. Thus both bounds of any range, or in case of
     /// singular ranges only the start bound are guaranteed to be unique.
     ///
-    /// The found querier is checked for a matching read-kind and schema
-    /// version. The start position is also checked against the current
-    /// position of the querier using the `range' and `slice'. If there is a
-    /// mismatch drop the querier and create a new one with `create_fun'.
-    querier lookup(utils::UUID key,
-            emit_only_live_rows only_live,
+    /// The found querier is checked for a matching position and schema version.
+    /// The start position of the querier is checked against the start position
+    /// of the page using the `range' and `slice'.
+    std::optional<data_querier> lookup_data_querier(utils::UUID key,
             const schema& s,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            tracing::trace_state_ptr trace_state,
-            const noncopyable_function<querier()>& create_fun);
+            tracing::trace_state_ptr trace_state);
+
+    /// Lookup a mutation querier in the cache.
+    ///
+    /// See \ref lookup_data_querier().
+    std::optional<mutation_querier> lookup_mutation_querier(utils::UUID key,
+            const schema& s,
+            const dht::partition_range& range,
+            const query::partition_slice& slice,
+            tracing::trace_state_ptr trace_state);
+
+    /// Lookup a shard mutation querier in the cache.
+    ///
+    /// See \ref lookup_data_querier().
+    std::optional<shard_mutation_querier> lookup_shard_mutation_querier(utils::UUID key,
+            const schema& s,
+            const dht::partition_range_vector& ranges,
+            const query::partition_slice& slice,
+            tracing::trace_state_ptr trace_state);
 
     void set_entry_ttl(std::chrono::seconds entry_ttl);
 
@@ -395,16 +503,26 @@ public:
 class querier_cache_context {
     querier_cache* _cache{};
     utils::UUID _key;
-    bool _is_first_page;
+    query::is_first_page _is_first_page;
 
 public:
     querier_cache_context() = default;
-    querier_cache_context(querier_cache& cache, utils::UUID key, bool is_first_page);
-    void insert(querier&& q, tracing::trace_state_ptr trace_state);
-    querier lookup(emit_only_live_rows only_live,
-            const schema& s,
+    querier_cache_context(querier_cache& cache, utils::UUID key, query::is_first_page is_first_page);
+    void insert(data_querier&& q, tracing::trace_state_ptr trace_state);
+    void insert(mutation_querier&& q, tracing::trace_state_ptr trace_state);
+    void insert(shard_mutation_querier&& q, tracing::trace_state_ptr trace_state);
+    std::optional<data_querier> lookup_data_querier(const schema& s,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            tracing::trace_state_ptr trace_state,
-            const noncopyable_function<querier()>& create_fun);
+            tracing::trace_state_ptr trace_state);
+    std::optional<mutation_querier> lookup_mutation_querier(const schema& s,
+            const dht::partition_range& range,
+            const query::partition_slice& slice,
+            tracing::trace_state_ptr trace_state);
+    std::optional<shard_mutation_querier> lookup_shard_mutation_querier(const schema& s,
+            const dht::partition_range_vector& ranges,
+            const query::partition_slice& slice,
+            tracing::trace_state_ptr trace_state);
 };
+
+} // namespace query

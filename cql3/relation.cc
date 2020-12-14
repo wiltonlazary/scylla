@@ -45,11 +45,11 @@
 namespace cql3 {
 
 const column_definition&
-relation::to_column_definition(schema_ptr schema, ::shared_ptr<column_identifier::raw> entity) {
-    auto id = entity->prepare_column_identifier(schema);
+relation::to_column_definition(const schema& schema, const column_identifier::raw& entity) {
+    auto id = entity.prepare_column_identifier(schema);
     auto def = get_column_definition(schema, *id);
-    if (!def) {
-        throw exceptions::unrecognized_entity_exception(id, shared_from_this());
+    if (!def || def->is_hidden_from_cql()) {
+        throw exceptions::unrecognized_entity_exception(*id, to_string());
     }
     return *def;
 }

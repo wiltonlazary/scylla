@@ -42,8 +42,8 @@
 
 #pragma once
 
-#include "schema.hh"
-#include "core/shared_ptr.hh"
+#include "schema_fwd.hh"
+#include <seastar/core/shared_ptr.hh>
 #include "cql3/selection/selector.hh"
 #include "cql3/cql3_type.hh"
 #include "cql3/functions/function.hh"
@@ -72,7 +72,7 @@ public:
     public:
         virtual ~raw() {}
 
-        virtual ::shared_ptr<selectable> prepare(schema_ptr s) = 0;
+        virtual ::shared_ptr<selectable> prepare(const schema& s) const = 0;
 
         /**
          * Returns true if any processing is performed on the selected column.
@@ -110,7 +110,7 @@ public:
         raw(functions::function_name function_name, std::vector<shared_ptr<selectable::raw>> args)
                 : _function_name(std::move(function_name)), _args(std::move(args)) {
         }
-        virtual shared_ptr<selectable> prepare(schema_ptr s) override;
+        virtual shared_ptr<selectable> prepare(const schema& s) const override;
         virtual bool processes_selection() const override;
         static ::shared_ptr<selectable::with_function::raw> make_count_rows_function();
     };
@@ -134,16 +134,16 @@ public:
         raw(shared_ptr<functions::function> f, std::vector<shared_ptr<selectable::raw>> args)
                 : _function(f), _args(std::move(args)) {
         }
-        virtual shared_ptr<selectable> prepare(schema_ptr s) override;
+        virtual shared_ptr<selectable> prepare(const schema& s) const override;
         virtual bool processes_selection() const override;
     };
 };
 
 class selectable::with_cast : public selectable {
     ::shared_ptr<selectable> _arg;
-    ::shared_ptr<cql3_type> _type;
+    cql3_type _type;
 public:
-    with_cast(::shared_ptr<selectable> arg, ::shared_ptr<cql3_type> type)
+    with_cast(::shared_ptr<selectable> arg, cql3_type type)
         : _arg(std::move(arg)), _type(std::move(type)) {
     }
 
@@ -152,12 +152,12 @@ public:
     virtual shared_ptr<selector::factory> new_selector_factory(database& db, schema_ptr s, std::vector<const column_definition*>& defs) override;
     class raw : public selectable::raw {
         ::shared_ptr<selectable::raw> _arg;
-        ::shared_ptr<cql3_type> _type;
+        cql3_type _type;
     public:
-        raw(shared_ptr<selectable::raw> arg, ::shared_ptr<cql3_type> type)
+        raw(shared_ptr<selectable::raw> arg, cql3_type type)
                 : _arg(std::move(arg)), _type(std::move(type)) {
         }
-        virtual shared_ptr<selectable> prepare(schema_ptr s) override;
+        virtual shared_ptr<selectable> prepare(const schema& s) const override;
         virtual bool processes_selection() const override;
     };
 };

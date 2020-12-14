@@ -42,4 +42,20 @@ class prepare_message {
     uint32_t dst_cpu_id;
 };
 
+enum class stream_reason : uint8_t {
+    unspecified,
+    bootstrap,
+    decommission,
+    removenode,
+    rebuild,
+    repair,
+    replace,
+};
+
+enum class stream_mutation_fragments_cmd : uint8_t {
+    error,
+    mutation_fragment_data,
+    end_of_stream,
+};
+
 }

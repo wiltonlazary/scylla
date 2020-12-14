@@ -26,18 +26,28 @@
 #include <vector>
 #include <list>
 #include <chrono>
+#include <optional>
 #include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_mutex.hh>
+#include "lister.hh"
 #include "gms/gossiper.hh"
+#include "locator/snitch_base.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "db/commitlog/commitlog.hh"
 #include "utils/loading_shared_values.hh"
+#include "utils/fragmented_temporary_buffer.hh"
+#include "db/hints/resource_manager.hh"
+#include "db/hints/host_filter.hh"
 
 namespace service {
 class storage_service;
+}
+
+namespace utils {
+class directories;
 }
 
 namespace db {
@@ -48,6 +58,25 @@ using hints_store_ptr = node_to_hint_store_factory_type::entry_ptr;
 using hint_entry_reader = commitlog_entry_reader;
 using timer_clock_type = seastar::lowres_clock;
 
+/// A helper class which tracks hints directory creation
+/// and allows to perform hints directory initialization lazily.
+class directory_initializer {
+private:
+    class impl;
+    ::std::shared_ptr<impl> _impl;
+
+    directory_initializer(::std::shared_ptr<impl> impl);
+
+public:
+    /// Creates an initializer that does nothing. Useful in tests.
+    static directory_initializer make_dummy();
+    static future<directory_initializer> make(utils::directories& dirs, sstring hints_directory);
+
+    ~directory_initializer();
+    future<> ensure_created_and_verified();
+    future<> ensure_rebalanced();
+};
+
 class manager : public service::endpoint_lifecycle_subscriber {
 private:
     struct stats {
@@ -56,11 +85,21 @@ private:
         uint64_t errors = 0;
         uint64_t dropped = 0;
         uint64_t sent = 0;
+        uint64_t discarded = 0;
+        uint64_t corrupted_files = 0;
     };
+
+    // map: shard -> segments
+    using hints_ep_segments_map = std::unordered_map<unsigned, std::list<fs::path>>;
+    // map: IP -> map: shard -> segments
+    using hints_segments_map = std::unordered_map<sstring, hints_ep_segments_map>;
 
     class drain_tag {};
     using drain = seastar::bool_class<drain_tag>;
 
+    friend class space_watchdog;
+
+public:
     class end_point_hints_manager {
     public:
         using key_type = gms::inet_address;
@@ -72,34 +111,32 @@ private:
 
             enum class state {
                 stopping,               // stop() was called
-                ep_state_is_not_normal, // destination Node state is not NORMAL - usually means that it has been decommissioned
+                ep_state_left_the_ring, // destination Node is not a part of the ring anymore - usually means that it has been decommissioned
                 draining,               // try to send everything out and ignore errors
             };
 
             using state_set = enum_set<super_enum<state,
                 state::stopping,
-                state::ep_state_is_not_normal,
+                state::ep_state_left_the_ring,
                 state::draining>>;
 
-            enum class send_state {
-                segment_replay_failed,  // current segment sending failed
-                restart_segment,        // segment sending failed and it has to be restarted from the beginning since we failed to store one or more RPs
-            };
-
-            using send_state_set = enum_set<super_enum<send_state,
-                send_state::segment_replay_failed,
-                send_state::restart_segment>>;
-
             struct send_one_file_ctx {
-                std::unordered_map<table_schema_version, column_mapping> schema_ver_to_column_mapping;
+                send_one_file_ctx(std::unordered_map<table_schema_version, column_mapping>& last_schema_ver_to_column_mapping)
+                    : schema_ver_to_column_mapping(last_schema_ver_to_column_mapping)
+                {}
+                std::unordered_map<table_schema_version, column_mapping>& schema_ver_to_column_mapping;
                 seastar::gate file_send_gate;
-                std::unordered_set<db::replay_position> rps_set; // number of elements in this set is never going to be greater than the maximum send queue length
-                send_state_set state;
+                std::optional<db::replay_position> first_failed_rp;
+                std::optional<db::replay_position> last_attempted_rp;
+                bool segment_replay_failed = false;
+
+                void on_hint_send_failure(db::replay_position rp) noexcept;
             };
 
         private:
             std::list<sstring> _segments_to_replay;
             replay_position _last_not_complete_rp;
+            std::unordered_map<table_schema_version, column_mapping> _last_schema_ver_to_column_mapping;
             state_set _state;
             future<> _stopped;
             clock::time_point _next_flush_tp;
@@ -107,8 +144,10 @@ private:
             key_type _ep_key;
             end_point_hints_manager& _ep_manager;
             manager& _shard_manager;
+            resource_manager& _resource_manager;
             service::storage_proxy& _proxy;
             database& _db;
+            seastar::scheduling_group _hints_cpu_sched_group;
             gms::gossiper& _gossiper;
             seastar::shared_mutex& _file_update_mutex;
 
@@ -169,12 +208,15 @@ private:
                 return _state.contains(state::stopping);
             }
 
+            bool replay_allowed() const noexcept {
+                return _ep_manager.replay_allowed();
+            }
+
             /// \brief Try to send one hint read from the file.
             ///  - Limit the maximum memory size of hints "in the air" and the maximum total number of hints "in the air".
             ///  - Discard the hints that are older than the grace seconds value of the corresponding table.
             ///
-            /// If sending fails we are going to clear the state::segment_replay_ok in the _state and \ref rp is going to be stored in the _rps_set.
-            /// If sending is successful then \ref rp is going to be removed from the _rps_set.
+            /// If sending fails we are going to set the state::segment_replay_failed in the _state and _first_failed_rp will be updated to min(_first_failed_rp, \ref rp).
             ///
             /// \param ctx_ptr shared pointer to the file sending context
             /// \param buf buffer representing the hint
@@ -182,7 +224,7 @@ private:
             /// \param secs_since_file_mod last modification time stamp (in seconds since Epoch) of the current hints file
             /// \param fname name of the hints file this hint was read from
             /// \return future that resolves when next hint may be sent
-            future<> send_one_hint(lw_shared_ptr<send_one_file_ctx> ctx_ptr, temporary_buffer<char> buf, db::replay_position rp, gc_clock::duration secs_since_file_mod, const sstring& fname);
+            future<> send_one_hint(lw_shared_ptr<send_one_file_ctx> ctx_ptr, fragmented_temporary_buffer buf, db::replay_position rp, gc_clock::duration secs_since_file_mod, const sstring& fname);
 
             /// \brief Send all hint from a single file and delete it after it has been successfully sent.
             /// Send all hints from the given file. If we failed to send the current segment we will pick up in the next
@@ -200,7 +242,7 @@ private:
             /// \param ctx_ptr pointer to the send context
             /// \param buf hints file entry
             /// \return The mutation object representing the original mutation stored in the hints file.
-            mutation get_mutation(lw_shared_ptr<send_one_file_ctx> ctx_ptr, temporary_buffer<char>& buf);
+            frozen_mutation_and_schema get_mutation(lw_shared_ptr<send_one_file_ctx> ctx_ptr, fragmented_temporary_buffer& buf);
 
             /// \brief Get a reference to the column_mapping object for a given frozen mutation.
             /// \param ctx_ptr pointer to the send context
@@ -217,13 +259,13 @@ private:
             /// \param m mutation to send
             /// \param natural_endpoints current replicas for the given mutation
             /// \return future that resolves when the operation is complete
-            future<> do_send_one_mutation(mutation m, const std::vector<gms::inet_address>& natural_endpoints) noexcept;
+            future<> do_send_one_mutation(frozen_mutation_and_schema m, const std::vector<gms::inet_address>& natural_endpoints) noexcept;
 
             /// \brief Send one mutation out.
             ///
             /// \param m mutation to send
             /// \return future that resolves when the mutation sending processing is complete.
-            future<> send_one_mutation(mutation m);
+            future<> send_one_mutation(frozen_mutation_and_schema m);
 
             /// \brief Get the last modification time stamp for a given file.
             /// \param fname File name
@@ -252,7 +294,8 @@ private:
         manager& _shard_manager;
         hints_store_ptr _hints_store_anchor;
         seastar::gate _store_gate;
-        seastar::shared_mutex _file_update_mutex;
+        lw_shared_ptr<seastar::shared_mutex> _file_update_mutex_ptr;
+        seastar::shared_mutex& _file_update_mutex;
 
         enum class state {
             can_hint,               // hinting is currently allowed (used by the space_watchdog)
@@ -266,7 +309,7 @@ private:
             state::stopped>>;
 
         state_set _state;
-        const boost::filesystem::path _hints_dir;
+        const fs::path _hints_dir;
         uint64_t _hints_in_progress = 0;
         sender _sender;
 
@@ -318,6 +361,10 @@ private:
             return _hints_in_progress;
         }
 
+        bool replay_allowed() const noexcept {
+            return _shard_manager.replay_allowed();
+        }
+
         bool can_hint() const noexcept {
             return _state.contains(state::can_hint);
         }
@@ -350,15 +397,30 @@ private:
             return _state.contains(state::stopped);
         }
 
-        seastar::shared_mutex& file_update_mutex() {
-            return _file_update_mutex;
+        /// \brief Safely runs a given functor under the file_update_mutex of \ref ep_man
+        ///
+        /// Runs a given functor under the file_update_mutex of the given end_point_hints_manager instance.
+        /// This function is safe even if \ref ep_man gets destroyed before the future this function returns resolves
+        /// (as long as the \ref func call itself is safe).
+        ///
+        /// \tparam Func Functor type.
+        /// \param ep_man end_point_hints_manager instance which file_update_mutex we want to lock.
+        /// \param func Functor to run under the lock.
+        /// \return Whatever \ref func returns.
+        template <typename Func>
+        friend inline auto with_file_update_mutex(end_point_hints_manager& ep_man, Func&& func) {
+            return with_lock(*ep_man._file_update_mutex_ptr, std::forward<Func>(func)).finally([lock_ptr = ep_man._file_update_mutex_ptr] {});
         }
 
-        const boost::filesystem::path& hints_dir() const noexcept {
+        const fs::path& hints_dir() const noexcept {
             return _hints_dir;
         }
 
     private:
+        seastar::shared_mutex& file_update_mutex() noexcept {
+            return _file_update_mutex;
+        }
+
         /// \brief Creates a new hints store object.
         ///
         /// - Creates a hints store directory if doesn't exist: <shard_hints_dir>/<ep_key>
@@ -377,96 +439,77 @@ private:
         struct stats& shard_stats() {
             return _shard_manager._stats;
         }
+
+        resource_manager& shard_resource_manager() {
+            return _shard_manager._resource_manager;
+        }
     };
+
+    enum class state {
+        started,                // hinting is currently allowed (start() call is complete)
+        replay_allowed,         // replaying (hints sending) is allowed
+        draining_all,           // hinting is not allowed - all ep managers are being stopped because this node is leaving the cluster
+        stopping                // hinting is not allowed - stopping is in progress (stop() method has been called)
+    };
+
+    using state_set = enum_set<super_enum<state,
+        state::started,
+        state::replay_allowed,
+        state::draining_all,
+        state::stopping>>;
 
 private:
     using ep_key_type = typename end_point_hints_manager::key_type;
     using ep_managers_map_type = std::unordered_map<ep_key_type, end_point_hints_manager>;
 
-    class space_watchdog {
-    private:
-        static const std::chrono::seconds _watchdog_period;
-
-    private:
-        std::unordered_set<ep_key_type> _eps_with_pending_hints;
-        size_t _total_size = 0;
-        manager& _shard_manager;
-        seastar::gate _gate;
-        seastar::timer<timer_clock_type> _timer;
-        int _files_count = 0;
-
-    public:
-        space_watchdog(manager& shard_manager);
-        future<> stop() noexcept;
-        void start();
-
-    private:
-        /// \brief Check that hints don't occupy too much disk space.
-        ///
-        /// Verifies that the whole \ref manager::_hints_dir occupies less than \ref manager::max_shard_disk_space_size.
-        ///
-        /// If it does, stop all end point managers that have more than one hints file - we don't want some DOWN Node to
-        /// prevent hints to other Nodes from being generated (e.g. due to some temporary overload and timeout).
-        ///
-        /// This is a simplistic implementation of a manager for a limited shared resource with a minimum guarantied share for all
-        /// participants.
-        ///
-        /// This implementation guaranties at least a single hint share for all end point managers.
-        void on_timer();
-
-        /// \brief Scan files in a single end point directory.
-        ///
-        /// Add sizes of files in the directory to _total_size. If number of files is greater than 1 add this end point ID
-        /// to _eps_with_pending_hints so that we may block it if _total_size value becomes greater than the maximum allowed
-        /// value.
-        ///
-        /// \param path directory to scan
-        /// \param ep_name end point ID (as a string)
-        /// \return future that resolves when scanning is complete
-        future<> scan_one_ep_dir(boost::filesystem::path path, ep_key_type ep_name);
-    };
-
 public:
     static const std::string FILENAME_PREFIX;
     static const std::chrono::seconds hints_flush_period;
     static const std::chrono::seconds hint_file_write_timeout;
-    static size_t max_shard_disk_space_size;
 
 private:
-    static constexpr uint64_t _max_size_of_hints_in_progress = 10 * 1024 * 1024; // 10MB
-    static constexpr size_t _hint_segment_size_in_mb = 32;
-    static constexpr size_t _max_hints_per_ep_size_mb = 128; // 4 files 32MB each
-    static constexpr size_t _max_hints_send_queue_length = 128;
-    const boost::filesystem::path _hints_dir;
+    static constexpr uint64_t max_size_of_hints_in_progress = 10 * 1024 * 1024; // 10MB
+    state_set _state;
+    const fs::path _hints_dir;
+    dev_t _hints_dir_device_id = 0;
 
     node_to_hint_store_factory_type _store_factory;
-    std::unordered_set<sstring> _hinted_dcs;
+    host_filter _host_filter;
     shared_ptr<service::storage_proxy> _proxy_anchor;
     shared_ptr<gms::gossiper> _gossiper_anchor;
     shared_ptr<service::storage_service> _strorage_service_anchor;
     locator::snitch_ptr& _local_snitch_ptr;
     int64_t _max_hint_window_us = 0;
     database& _local_db;
-    bool _stopping = false;
+
     seastar::gate _draining_eps_gate; // gate used to control the progress of ep_managers stopping not in the context of manager::stop() call
 
-    // Limit the maximum size of in-flight (being sent) hints by 10% of the shard memory.
-    // Also don't allow more than 128 in-flight hints to limit the collateral memory consumption as well.
-    const size_t _max_send_in_flight_memory;
-    const size_t _min_send_hint_budget;
-    seastar::semaphore _send_limiter;
+    resource_manager& _resource_manager;
 
-    space_watchdog _space_watchdog;
     ep_managers_map_type _ep_managers;
     stats _stats;
     seastar::metrics::metric_groups _metrics;
+    std::unordered_set<ep_key_type> _eps_with_pending_hints;
+    seastar::named_semaphore _drain_lock = {1, named_semaphore_exception_factory{"drain lock"}};
 
 public:
-    manager(sstring hints_directory, std::vector<sstring> hinted_dcs, int64_t max_hint_window_ms, distributed<database>& db);
+    manager(sstring hints_directory, host_filter filter, int64_t max_hint_window_ms, resource_manager&res_manager, distributed<database>& db);
     virtual ~manager();
+    manager(manager&&) = delete;
+    manager& operator=(manager&&) = delete;
+    void register_metrics(const sstring& group_name);
     future<> start(shared_ptr<service::storage_proxy> proxy_ptr, shared_ptr<gms::gossiper> gossiper_ptr, shared_ptr<service::storage_service> ss_ptr);
     future<> stop();
     bool store_hint(gms::inet_address ep, schema_ptr s, lw_shared_ptr<const frozen_mutation> fm, tracing::trace_state_ptr tr_state) noexcept;
+
+    /// \brief Changes the host_filter currently used, stopping and starting ep_managers relevant to the new host_filter.
+    /// \param filter the new host_filter
+    /// \return A future that resolves when the operation is complete.
+    future<> change_host_filter(host_filter filter);
+
+    const host_filter& get_host_filter() const noexcept {
+        return _host_filter;
+    }
 
     /// \brief Check if a hint may be generated to the give end point
     /// \param ep end point to check
@@ -494,6 +537,12 @@ public:
     /// \return TRUE if hints are allowed to be generated to \param ep.
     bool check_dc_for(ep_key_type ep) const noexcept;
 
+    /// \brief Checks if hints are disabled for all endpoints
+    /// \return TRUE if hints are disabled.
+    bool is_disabled_for_all() const noexcept {
+        return _host_filter.is_disabled_for_all();
+    }
+
     /// \return Size of mutations of hints in-flight (to the disk) at the moment.
     uint64_t size_of_hints_in_progress() const noexcept {
         return _stats.size_of_hints_in_progress;
@@ -510,10 +559,63 @@ public:
         return it->second.hints_in_progress();
     }
 
-    static future<> rebalance() {
-        // TODO
-        return make_ready_future<>();
+    void add_ep_with_pending_hints(ep_key_type key) {
+        _eps_with_pending_hints.insert(key);
     }
+
+    void clear_eps_with_pending_hints() {
+        _eps_with_pending_hints.clear();
+        _eps_with_pending_hints.reserve(_ep_managers.size());
+    }
+
+    bool has_ep_with_pending_hints(ep_key_type key) const {
+        return _eps_with_pending_hints.contains(key);
+    }
+
+    size_t ep_managers_size() const {
+        return _ep_managers.size();
+    }
+
+    const fs::path& hints_dir() const {
+        return _hints_dir;
+    }
+
+    dev_t hints_dir_device_id() const {
+        return _hints_dir_device_id;
+    }
+
+    seastar::named_semaphore& drain_lock() noexcept {
+        return _drain_lock;
+    }
+
+    void allow_hints();
+    void forbid_hints();
+    void forbid_hints_for_eps_with_pending_hints();
+
+    void allow_replaying() noexcept {
+        _state.set(state::replay_allowed);
+    }
+
+    /// \brief Creates an object which aids in hints directory initialization.
+    /// This object can saafely be copied and used from any shard.
+    /// \arg dirs The utils::directories object, used to create and lock hints directories
+    /// \arg hints_directory The directory with hints which should be initialized
+    directory_initializer make_directory_initializer(utils::directories& dirs, fs::path hints_directory);
+
+    /// \brief Rebalance hints segments among all present shards.
+    ///
+    /// The difference between the number of segments on every two shard will be not greater than 1 after the
+    /// rebalancing.
+    ///
+    /// Removes the sub-directories of \ref hints_directory that correspond to shards that are not relevant any more
+    /// (re-sharding to a lower shards number case).
+    ///
+    /// Complexity: O(N+K), where N is a total number of present hints' segments and
+    ///                           K = <number of shards during the previous boot> * <number of end points for which hints where ever created>
+    ///
+    /// \param hints_directory A hints directory to rebalance
+    /// \return A future that resolves when the operation is complete.
+    static future<> rebalance(sstring hints_directory);
 
     virtual void on_join_cluster(const gms::inet_address& endpoint) override {}
     virtual void on_leave_cluster(const gms::inet_address& endpoint) override {
@@ -521,15 +623,70 @@ public:
     };
     virtual void on_up(const gms::inet_address& endpoint) override {}
     virtual void on_down(const gms::inet_address& endpoint) override {}
-    virtual void on_move(const gms::inet_address& endpoint) override {}
 
 private:
+    future<> compute_hints_dir_device_id();
+
+    /// \brief Scan the given hints directory and build the map of all present hints segments.
+    ///
+    /// Complexity: O(N+K), where N is a total number of present hints' segments and
+    ///                           K = <number of shards during the previous boot> * <number of end points for which hints where ever created>
+    ///
+    /// \note Should be called from a seastar::thread context.
+    ///
+    /// \param hints_directory directory to scan
+    /// \return a map: ep -> map: shard -> segments (full paths)
+    static hints_segments_map get_current_hints_segments(const sstring& hints_directory);
+
+    /// \brief Rebalance hints segments for a given (destination) end point
+    ///
+    /// This method is going to consume files from the \ref segments_to_move and distribute them between the present
+    /// shards (taking into an account the \ref ep_segments state - there may be zero or more segments that belong to a
+    /// particular shard in it) until we either achieve the requested \ref segments_per_shard level on each shard
+    /// or until we are out of files to move.
+    ///
+    /// As a result (in addition to the actual state on the disk) both \ref ep_segments and \ref segments_to_move are going
+    /// to be modified.
+    ///
+    /// Complexity: O(N), where N is a total number of present hints' segments for the \ref ep end point (as a destination).
+    ///
+    /// \note Should be called from a seastar::thread context.
+    ///
+    /// \param ep destination end point ID (a string with its IP address)
+    /// \param segments_per_shard number of hints segments per-shard we want to achieve
+    /// \param hints_directory a root hints directory
+    /// \param ep_segments a map that was originally built by get_current_hints_segments() for this end point
+    /// \param segments_to_move a list of segments we are allowed to move
+    static void rebalance_segments_for(
+            const sstring& ep,
+            size_t segments_per_shard,
+            const sstring& hints_directory,
+            hints_ep_segments_map& ep_segments,
+            std::list<fs::path>& segments_to_move);
+
+    /// \brief Rebalance all present hints segments.
+    ///
+    /// The difference between the number of segments on every two shard will be not greater than 1 after the
+    /// rebalancing.
+    ///
+    /// Complexity: O(N), where N is a total number of present hints' segments.
+    ///
+    /// \note Should be called from a seastar::thread context.
+    ///
+    /// \param hints_directory a root hints directory
+    /// \param segments_map a map that was built by get_current_hints_segments()
+    static void rebalance_segments(const sstring& hints_directory, hints_segments_map& segments_map);
+
+    /// \brief Remove sub-directories of shards that are not relevant any more (re-sharding to a lower number of shards case).
+    ///
+    /// Complexity: O(S*E), where S is a number of shards during the previous boot and
+    ///                           E is a number of end points for which hints where ever created.
+    ///
+    /// \param hints_directory a root hints directory
+    static void remove_irrelevant_shards_directories(const sstring& hints_directory);
+
     node_to_hint_store_factory_type& store_factory() noexcept {
         return _store_factory;
-    }
-
-    const boost::filesystem::path& hints_dir() const {
-        return _hints_dir;
     }
 
     service::storage_proxy& local_storage_proxy() const noexcept {
@@ -558,7 +715,37 @@ private:
     /// \param endpoint node that left the cluster
     void drain_for(gms::inet_address endpoint);
 
-private:
+    void update_backlog(size_t backlog, size_t max_backlog);
+
+    bool stopping() const noexcept {
+        return _state.contains(state::stopping);
+    }
+
+    void set_stopping() noexcept {
+        _state.set(state::stopping);
+    }
+
+    bool started() const noexcept {
+        return _state.contains(state::started);
+    }
+
+    void set_started() noexcept {
+        _state.set(state::started);
+    }
+
+    bool replay_allowed() const noexcept {
+        return _state.contains(state::replay_allowed);
+    }
+
+    void set_draining_all() noexcept {
+        _state.set(state::draining_all);
+    }
+
+    bool draining_all() noexcept {
+        return _state.contains(state::draining_all);
+    }
+
+public:
     ep_managers_map_type::iterator find_ep_manager(ep_key_type ep_key) noexcept {
         return _ep_managers.find(ep_key);
     }

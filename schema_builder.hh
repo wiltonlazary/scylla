@@ -23,19 +23,21 @@
 
 #include "schema.hh"
 #include "database_fwd.hh"
+#include "cdc/log.hh"
+#include "dht/i_partitioner.hh"
 
 struct schema_builder {
 public:
     enum class compact_storage { no, yes };
 private:
     schema::raw_schema _raw;
-    std::experimental::optional<compact_storage> _compact_storage;
-    std::experimental::optional<table_schema_version> _version;
-    std::experimental::optional<raw_view_info> _view_info;
+    std::optional<compact_storage> _compact_storage;
+    std::optional<table_schema_version> _version;
+    std::optional<raw_view_info> _view_info;
     schema_builder(const schema::raw_schema&);
 public:
-    schema_builder(const sstring& ks_name, const sstring& cf_name,
-            std::experimental::optional<utils::UUID> = { },
+    schema_builder(std::string_view ks_name, std::string_view cf_name,
+            std::optional<utils::UUID> = { },
             data_type regular_column_name_type = utf8_type);
     schema_builder(const schema_ptr);
 
@@ -86,6 +88,8 @@ public:
     int32_t get_gc_grace_seconds() const {
         return _raw._gc_grace_seconds;
     }
+
+    schema_builder& set_paxos_grace_seconds(int32_t seconds);
 
     schema_builder& set_dc_local_read_repair_chance(double chance) {
         _raw._dc_local_read_repair_chance = chance;
@@ -192,15 +196,19 @@ public:
         _raw._extensions = std::move(exts);
         return *this;
     }
+    schema_builder& add_extension(const sstring& name, ::shared_ptr<schema_extension> ext) {
+        _raw._extensions[name] = std::move(ext);
+        return *this;
+    }
+    const schema::extensions_map& get_extensions() const {
+        return _raw._extensions;
+    }
     schema_builder& set_compaction_strategy(sstables::compaction_strategy_type type) {
         _raw._compaction_strategy = type;
         return *this;
     }
 
-    schema_builder& set_compaction_strategy_options(std::map<sstring, sstring> options) {
-        _raw._compaction_strategy_options = std::move(options);
-        return *this;
-    }
+    schema_builder& set_compaction_strategy_options(std::map<sstring, sstring>&& options);
 
     schema_builder& set_caching_options(caching_options c) {
         _raw._caching_options = std::move(c);
@@ -222,6 +230,12 @@ public:
         return *this;
     }
 
+    schema_builder& set_wait_for_sync_to_commitlog(bool sync) {
+        _raw._wait_for_sync = sync;
+        return *this;
+    }
+    schema_builder& with_partitioner(sstring name);
+    schema_builder& with_sharder(unsigned shard_count, unsigned sharding_ignore_msb_bits);
     class default_names {
     public:
         default_names(const schema_builder&);
@@ -237,14 +251,16 @@ public:
     };
 
     column_definition& find_column(const cql3::column_identifier&);
-    schema_builder& with_column(const column_definition& c);
-    schema_builder& with_column(bytes name, data_type type, column_kind kind = column_kind::regular_column);
-    schema_builder& with_column(bytes name, data_type type, column_kind kind, column_id component_index);
-    schema_builder& without_column(bytes name);
+    bool has_column(const cql3::column_identifier&);
+    schema_builder& with_column_ordered(const column_definition& c);
+    schema_builder& with_column(bytes name, data_type type, column_kind kind = column_kind::regular_column, column_view_virtual view_virtual = column_view_virtual::no);
+    schema_builder& with_computed_column(bytes name, data_type type, column_kind kind, column_computation_ptr computation);
+    schema_builder& remove_column(bytes name);
     schema_builder& without_column(sstring name, api::timestamp_type timestamp);
     schema_builder& without_column(sstring name, data_type, api::timestamp_type timestamp);
-    schema_builder& with_column_rename(bytes from, bytes to);
-    schema_builder& with_altered_column_type(bytes name, data_type new_type);
+    schema_builder& rename_column(bytes from, bytes to);
+    schema_builder& alter_column_type(bytes name, data_type new_type);
+    schema_builder& mark_column_computed(bytes name, column_computation_ptr computation);
 
     // Adds information about collection that existed in the past but the column
     // has since been removed. For adding colllections that are still alive
@@ -261,7 +277,10 @@ public:
 
     schema_builder& with_index(const index_metadata& im);
     schema_builder& without_index(const sstring& name);
+    schema_builder& without_indexes();
 
+    schema_builder& with_cdc_options(const cdc::options&);
+    
     default_names get_default_names() const {
         return default_names(_raw);
     }
@@ -273,4 +292,6 @@ public:
 private:
     friend class default_names;
     void prepare_dense_schema(schema::raw_schema& raw);
+
+    schema_builder& with_column(bytes name, data_type type, column_kind kind, column_id component_index, column_view_virtual view_virtual = column_view_virtual::no, column_computation_ptr computation = nullptr);
 };

@@ -28,8 +28,8 @@
 #include "transport/messages/result_message_base.hh"
 #include "transport/event.hh"
 
-#include "core/shared_ptr.hh"
-#include "core/sstring.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sstring.hh>
 
 namespace cql_transport {
 
@@ -38,12 +38,15 @@ namespace messages {
 class result_message::prepared : public result_message {
 private:
     cql3::statements::prepared_statement::checked_weak_ptr _prepared;
-    ::shared_ptr<cql3::prepared_metadata> _metadata;
+    cql3::prepared_metadata _metadata;
     ::shared_ptr<const cql3::metadata> _result_metadata;
 protected:
-    prepared(cql3::statements::prepared_statement::checked_weak_ptr prepared)
+    prepared(cql3::statements::prepared_statement::checked_weak_ptr prepared, bool support_lwt_opt)
         : _prepared(std::move(prepared))
-        , _metadata{::make_shared<cql3::prepared_metadata>(_prepared->bound_names, _prepared->partition_key_bind_indices)}
+        , _metadata(
+            _prepared->bound_names,
+            _prepared->partition_key_bind_indices,
+            support_lwt_opt ? _prepared->statement->is_conditional() : false)
         , _result_metadata{extract_result_metadata(_prepared->statement)}
     { }
 public:
@@ -51,7 +54,7 @@ public:
         return _prepared;
     }
 
-    ::shared_ptr<cql3::prepared_metadata> metadata() const {
+    const cql3::prepared_metadata& metadata() const {
         return _metadata;
     }
 
@@ -75,6 +78,7 @@ public:
     virtual void visit(const result_message::prepared::thrift&) = 0;
     virtual void visit(const result_message::schema_change&) = 0;
     virtual void visit(const result_message::rows&) = 0;
+    virtual void visit(const result_message::bounce_to_shard&) = 0;
 };
 
 class result_message::visitor_base : public visitor {
@@ -85,6 +89,7 @@ public:
     void visit(const result_message::prepared::thrift&) override {};
     void visit(const result_message::schema_change&) override {};
     void visit(const result_message::rows&) override {};
+    void visit(const result_message::bounce_to_shard&) override { assert(false); };
 };
 
 class result_message::void_message : public result_message {
@@ -95,6 +100,24 @@ public:
 };
 
 std::ostream& operator<<(std::ostream& os, const result_message::void_message& msg);
+
+// This result is handled internally and should never be returned
+// to a client. Any visitor should abort while handling it since
+// it is a sure sign of a error.
+class result_message::bounce_to_shard : public result_message {
+    unsigned _shard;
+public:
+    bounce_to_shard(unsigned shard) : _shard(shard) {}
+    virtual void accept(result_message::visitor& v) const override {
+        v.visit(*this);
+    }
+    virtual std::optional<unsigned> move_to_shard() const {
+        return _shard;
+    }
+
+};
+
+std::ostream& operator<<(std::ostream& os, const result_message::bounce_to_shard& msg);
 
 class result_message::set_keyspace : public result_message {
 private:
@@ -118,8 +141,8 @@ std::ostream& operator<<(std::ostream& os, const result_message::set_keyspace& m
 class result_message::prepared::cql : public result_message::prepared {
     bytes _id;
 public:
-    cql(const bytes& id, cql3::statements::prepared_statement::checked_weak_ptr p)
-        : result_message::prepared(std::move(p))
+    cql(const bytes& id, cql3::statements::prepared_statement::checked_weak_ptr p, bool support_lwt_opt)
+        : result_message::prepared(std::move(p), support_lwt_opt)
         , _id{id}
     { }
 
@@ -145,8 +168,8 @@ std::ostream& operator<<(std::ostream& os, const result_message::prepared::cql& 
 class result_message::prepared::thrift : public result_message::prepared {
     int32_t _id;
 public:
-    thrift(int32_t id, cql3::statements::prepared_statement::checked_weak_ptr prepared)
-        : result_message::prepared(std::move(prepared))
+    thrift(int32_t id, cql3::statements::prepared_statement::checked_weak_ptr prepared, bool support_lwt_opt)
+        : result_message::prepared(std::move(prepared), support_lwt_opt)
         , _id{id}
     { }
 
@@ -182,12 +205,12 @@ std::ostream& operator<<(std::ostream& os, const result_message::schema_change& 
 
 class result_message::rows : public result_message {
 private:
-    std::unique_ptr<cql3::result_set> _rs;
+    cql3::result _result;
 public:
-    rows(std::unique_ptr<cql3::result_set> rs) : _rs(std::move(rs)) {}
+    rows(cql3::result rs) : _result(std::move(rs)) {}
 
-    const cql3::result_set& rs() const {
-        return *_rs;
+    const cql3::result& rs() const {
+        return _result;
     }
 
     virtual void accept(result_message::visitor& v) const override {

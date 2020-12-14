@@ -22,29 +22,41 @@
 #include "sets.hh"
 #include "constants.hh"
 #include "cql3_type.hh"
+#include "types/map.hh"
+#include "types/set.hh"
 
 namespace cql3 {
 
-shared_ptr<column_specification>
-sets::value_spec_of(shared_ptr<column_specification> column) {
-    return make_shared<column_specification>(column->ks_name, column->cf_name,
-            ::make_shared<column_identifier>(sprint("value(%s)", *column->name), true),
-            dynamic_pointer_cast<const set_type_impl>(column->type)->get_elements_type());
+lw_shared_ptr<column_specification>
+sets::value_spec_of(const column_specification& column) {
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
+            ::make_shared<column_identifier>(format("value({})", *column.name), true),
+            dynamic_pointer_cast<const set_type_impl>(column.type)->get_elements_type());
 }
 
 shared_ptr<term>
-sets::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
-    validate_assignable_to(db, keyspace, receiver);
+sets::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
+    validate_assignable_to(db, keyspace, *receiver);
 
-    // We've parsed empty maps as a set literal to break the ambiguity so
-    // handle that case now
-    if (_elements.empty() && dynamic_pointer_cast<const map_type_impl>(receiver->type)) {
-        // use empty_type for comparator, set is empty anyway.
-        std::map<bytes, bytes, serialized_compare> m(empty_type->as_less_comparator());
-        return ::make_shared<maps::value>(std::move(m));
+    if (_elements.empty()) {
+
+        // In Cassandra, an empty (unfrozen) map/set/list is equivalent to the column being null. In
+        // other words a non-frozen collection only exists if it has elements.  Return nullptr right
+        // away to simplify predicate evaluation.  See also
+        // https://issues.apache.org/jira/browse/CASSANDRA-5141
+        if (receiver->type->is_multi_cell()) {
+            return cql3::constants::null_literal::NULL_VALUE;
+        }
+        // We've parsed empty maps as a set literal to break the ambiguity so
+        // handle that case now. This branch works for frozen sets/maps only.
+        if (dynamic_pointer_cast<const map_type_impl>(receiver->type)) {
+            // use empty_type for comparator, set is empty anyway.
+            std::map<bytes, bytes, serialized_compare> m(empty_type->as_less_comparator());
+            return ::make_shared<maps::value>(std::move(m));
+        }
     }
 
-    auto value_spec = value_spec_of(receiver);
+    auto value_spec = value_spec_of(*receiver);
     std::vector<shared_ptr<term>> values;
     values.reserve(_elements.size());
     bool all_terminal = true;
@@ -53,7 +65,7 @@ sets::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_
         auto t = rt->prepare(db, keyspace, value_spec);
 
         if (t->contains_bind_marker()) {
-            throw exceptions::invalid_request_exception(sprint("Invalid set literal for %s: bind variables are not supported inside collection literals", *receiver->name));
+            throw exceptions::invalid_request_exception(format("Invalid set literal for {}: bind variables are not supported inside collection literals", *receiver->name));
         }
 
         if (dynamic_pointer_cast<non_terminal>(t)) {
@@ -73,30 +85,30 @@ sets::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_
 }
 
 void
-sets::literal::validate_assignable_to(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
-    if (!dynamic_pointer_cast<const set_type_impl>(receiver->type)) {
+sets::literal::validate_assignable_to(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!dynamic_pointer_cast<const set_type_impl>(receiver.type)) {
         // We've parsed empty maps as a set literal to break the ambiguity so
         // handle that case now
-        if (dynamic_pointer_cast<const map_type_impl>(receiver->type) && _elements.empty()) {
+        if (dynamic_pointer_cast<const map_type_impl>(receiver.type) && _elements.empty()) {
             return;
         }
 
-        throw exceptions::invalid_request_exception(sprint("Invalid set literal for %s of type %s", *receiver->name, *receiver->type->as_cql3_type()));
+        throw exceptions::invalid_request_exception(format("Invalid set literal for {} of type {}", receiver.name, receiver.type->as_cql3_type()));
     }
 
     auto&& value_spec = value_spec_of(receiver);
     for (shared_ptr<term::raw> rt : _elements) {
-        if (!is_assignable(rt->test_assignment(db, keyspace, value_spec))) {
-            throw exceptions::invalid_request_exception(sprint("Invalid set literal for %s: value %s is not of type %s", *receiver->name, *rt, *value_spec->type->as_cql3_type()));
+        if (!is_assignable(rt->test_assignment(db, keyspace, *value_spec))) {
+            throw exceptions::invalid_request_exception(format("Invalid set literal for {}: value {} is not of type {}", *receiver.name, *rt, value_spec->type->as_cql3_type()));
         }
     }
 }
 
 assignment_testable::test_result
-sets::literal::test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
-    if (!dynamic_pointer_cast<const set_type_impl>(receiver->type)) {
+sets::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!dynamic_pointer_cast<const set_type_impl>(receiver.type)) {
         // We've parsed empty maps as a set literal to break the ambiguity so handle that case now
-        if (dynamic_pointer_cast<const map_type_impl>(receiver->type) && _elements.empty()) {
+        if (dynamic_pointer_cast<const map_type_impl>(receiver.type) && _elements.empty()) {
             return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         }
 
@@ -111,7 +123,7 @@ sets::literal::test_assignment(database& db, const sstring& keyspace, shared_ptr
     auto&& value_spec = value_spec_of(receiver);
     // FIXME: make assignment_testable::test_all() accept ranges
     std::vector<shared_ptr<assignment_testable>> to_test(_elements.begin(), _elements.end());
-    return assignment_testable::test_all(db, keyspace, value_spec, to_test);
+    return assignment_testable::test_all(db, keyspace, *value_spec, to_test);
 }
 
 sstring
@@ -120,15 +132,15 @@ sets::literal::to_string() const {
 }
 
 sets::value
-sets::value::from_serialized(bytes_view v, set_type type, cql_serialization_format sf) {
+sets::value::from_serialized(const fragmented_temporary_buffer::view& val, const set_type_impl& type, cql_serialization_format sf) {
     try {
         // Collections have this small hack that validate cannot be called on a serialized object,
         // but compose does the validation (so we're fine).
         // FIXME: deserializeForNativeProtocol?!
-        auto s = value_cast<set_type_impl::native_type>(type->deserialize(v, sf));
-        std::set<bytes, serialized_compare> elements(type->get_elements_type()->as_less_comparator());
+        auto s = value_cast<set_type_impl::native_type>(type.deserialize(val, sf));
+        std::set<bytes, serialized_compare> elements(type.get_elements_type()->as_less_comparator());
         for (auto&& element : s) {
-            elements.insert(elements.end(), type->get_elements_type()->decompose(element));
+            elements.insert(elements.end(), type.get_elements_type()->decompose(element));
         }
         return value(std::move(elements));
     } catch (marshal_exception& e) {
@@ -148,11 +160,11 @@ sets::value::get_with_protocol_version(cql_serialization_format sf) {
 }
 
 bool
-sets::value::equals(set_type st, const value& v) {
+sets::value::equals(const set_type_impl& st, const value& v) {
     if (_elements.size() != v._elements.size()) {
         return false;
     }
-    auto&& elements_type = st->get_elements_type();
+    auto&& elements_type = st.get_elements_type();
     return std::equal(_elements.begin(), _elements.end(),
             v._elements.begin(),
             [elements_type] (bytes_view v1, bytes_view v2) {
@@ -182,7 +194,7 @@ sets::delayed_value::contains_bind_marker() const {
 }
 
 void
-sets::delayed_value::collect_marker_specification(shared_ptr<variable_specifications> bound_names) {
+sets::delayed_value::collect_marker_specification(variable_specifications& bound_names) const {
 }
 
 shared_ptr<terminal>
@@ -198,10 +210,10 @@ sets::delayed_value::bind(const query_options& options) {
             return constants::UNSET_VALUE;
         }
         // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-        if (b->size() > std::numeric_limits<uint16_t>::max()) {
-            throw exceptions::invalid_request_exception(sprint("Set value is too long. Set values are limited to %d bytes but %d bytes value provided",
+        if (b->size_bytes() > std::numeric_limits<uint16_t>::max()) {
+            throw exceptions::invalid_request_exception(format("Set value is too long. Set values are limited to {:d} bytes but {:d} bytes value provided",
                     std::numeric_limits<uint16_t>::max(),
-                    b->size()));
+                    b->size_bytes()));
         }
 
         buffers.insert(buffers.end(), std::move(to_bytes(*b)));
@@ -209,6 +221,11 @@ sets::delayed_value::bind(const query_options& options) {
     return ::make_shared<value>(std::move(buffers));
 }
 
+
+sets::marker::marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
+    : abstract_marker{bind_index, std::move(receiver)} {
+        assert(dynamic_cast<const set_type_impl*>(_receiver->type.get()));
+    }
 
 ::shared_ptr<terminal>
 sets::marker::bind(const query_options& options) {
@@ -218,8 +235,14 @@ sets::marker::bind(const query_options& options) {
     } else if (value.is_unset_value()) {
         return constants::UNSET_VALUE;
     } else {
-        auto as_set_type = static_pointer_cast<const set_type_impl>(_receiver->type);
-        return make_shared(value::from_serialized(*value, as_set_type, options.get_cql_serialization_format()));
+        auto& type = static_cast<const set_type_impl&>(*_receiver->type);
+        try {
+            type.validate(*value, options.get_cql_serialization_format());
+        } catch (marshal_exception& e) {
+            throw exceptions::invalid_request_exception(
+                    format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
+        }
+        return make_shared<cql3::sets::value>(value::from_serialized(*value, type, options.get_cql_serialization_format()));
     }
 }
 
@@ -235,12 +258,10 @@ sets::setter::execute(mutation& m, const clustering_key_prefix& row_key, const u
         return;
     }
     if (column.type->is_multi_cell()) {
-        // delete + add
-        collection_type_impl::mutation mut;
+        // Delete all cells first, then add new ones
+        collection_mutation_description mut;
         mut.tomb = params.make_tombstone_just_before();
-        auto ctype = static_pointer_cast<const set_type_impl>(column.type);
-        auto col_mut = ctype->serialize_mutation_form(std::move(mut));
-        m.set_cell(row_key, column, std::move(col_mut));
+        m.set_cell(row_key, column, mut.serialize(*column.type));
     }
     adder::do_add(m, row_key, params, value, column);
 }
@@ -259,27 +280,27 @@ void
 sets::adder::do_add(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params,
         shared_ptr<term> value, const column_definition& column) {
     auto set_value = dynamic_pointer_cast<sets::value>(std::move(value));
-    auto set_type = dynamic_pointer_cast<const set_type_impl>(column.type);
+    auto set_type = dynamic_cast<const set_type_impl*>(column.type.get());
+    assert(set_type);
     if (column.type->is_multi_cell()) {
-        // FIXME: mutation_view? not compatible with params.make_cell().
-        collection_type_impl::mutation mut;
-
         if (!set_value || set_value->_elements.empty()) {
             return;
         }
 
-        for (auto&& e : set_value->_elements) {
-            mut.cells.emplace_back(e, params.make_cell({}));
-        }
-        auto smut = set_type->serialize_mutation_form(mut);
+        // FIXME: collection_mutation_view_description? not compatible with params.make_cell().
+        collection_mutation_description mut;
 
-        m.set_cell(row_key, column, std::move(smut));
+        for (auto&& e : set_value->_elements) {
+            mut.cells.emplace_back(e, params.make_cell(*set_type->value_comparator(), bytes_view(), atomic_cell::collection_member::yes));
+        }
+
+        m.set_cell(row_key, column, mut.serialize(*set_type));
     } else if (set_value != nullptr) {
         // for frozen sets, we're overwriting the whole cell
-        auto v = set_type->serialize_partially_deserialized_form(
+        auto v = set_type_impl::serialize_partially_deserialized_form(
                 {set_value->_elements.begin(), set_value->_elements.end()},
                 cql_serialization_format::internal());
-        m.set_cell(row_key, column, params.make_cell(std::move(v)));
+        m.set_cell(row_key, column, params.make_cell(*column.type, fragmented_temporary_buffer::view(v)));
     } else {
         m.set_cell(row_key, column, params.make_dead_cell());
     }
@@ -294,7 +315,7 @@ sets::discarder::execute(mutation& m, const clustering_key_prefix& row_key, cons
         return;
     }
 
-    collection_type_impl::mutation mut;
+    collection_mutation_description mut;
     auto kill = [&] (bytes idx) {
         mut.cells.push_back({std::move(idx), params.make_dead_cell()});
     };
@@ -304,10 +325,7 @@ sets::discarder::execute(mutation& m, const clustering_key_prefix& row_key, cons
     for (auto&& e : svalue->_elements) {
         kill(e);
     }
-    auto ctype = static_pointer_cast<const collection_type_impl>(column.type);
-    m.set_cell(row_key, column,
-            atomic_cell_or_collection::from_collection_mutation(
-                    ctype->serialize_mutation_form(mut)));
+    m.set_cell(row_key, column, mut.serialize(*column.type));
 }
 
 void sets::element_discarder::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params)
@@ -317,10 +335,9 @@ void sets::element_discarder::execute(mutation& m, const clustering_key_prefix& 
     if (!elt) {
         throw exceptions::invalid_request_exception("Invalid null set element");
     }
-    collection_type_impl::mutation mut;
+    collection_mutation_description mut;
     mut.cells.emplace_back(*elt->get(params._options), params.make_dead_cell());
-    auto ctype = static_pointer_cast<const collection_type_impl>(column.type);
-    m.set_cell(row_key, column, ctype->serialize_mutation_form(mut));
+    m.set_cell(row_key, column, mut.serialize(*column.type));
 }
 
 }

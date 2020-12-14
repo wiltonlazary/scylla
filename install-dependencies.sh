@@ -17,30 +17,220 @@
 # under the License.
 #
 
-. /etc/os-release
+# os-release may be missing in container environment by default.
+if [ -f "/etc/os-release" ]; then
+    . /etc/os-release
+elif [ -f "/etc/arch-release" ]; then
+    export ID=arch
+else
+    echo "/etc/os-release missing."
+    exit 1
+fi
+
+debian_base_packages=(
+    clang
+    liblua5.3-dev
+    python3-pyparsing
+    python3-colorama
+    libsnappy-dev
+    libjsoncpp-dev
+    rapidjson-dev
+    scylla-libthrift010-dev
+    scylla-antlr35-c++-dev
+    thrift-compiler
+    git
+    pigz
+    libunistring-dev
+    libzstd-dev
+)
+
+fedora_packages=(
+    clang
+    lua-devel
+    yaml-cpp-devel
+    thrift-devel
+    antlr3-tool
+    antlr3-C++-devel
+    jsoncpp-devel
+    rapidjson-devel
+    snappy-devel
+    systemd-devel
+    git
+    python
+    sudo
+    java-1.8.0-openjdk-headless
+    java-1.8.0-openjdk-devel
+    ant
+    ant-junit
+    maven
+    patchelf
+    python3
+    python3-pip
+    python3-magic
+    python3-colorama
+    python3-boto3
+    python3-pytest
+    python3-redis
+    dnf-utils
+    pigz
+    net-tools
+    tar
+    gzip
+    gawk
+    util-linux
+    ethtool
+    hwloc
+    glibc-langpack-en
+    lld
+    xxhash-devel
+    makeself
+    libzstd-static libzstd-devel
+    rpm-build
+    devscripts
+    debhelper
+    fakeroot
+    file
+    dpkg-dev
+)
+
+fedora_python3_packages=(
+    python3-pyyaml
+    python3-urwid
+    python3-pyparsing
+    python3-requests
+    python3-pyudev
+    python3-setuptools
+    python3-psutil
+    python3-distro
+)
+
+centos_packages=(
+    yaml-cpp-devel
+    thrift-devel
+    scylla-antlr35-tool
+    scylla-antlr35-C++-devel
+    jsoncpp-devel snappy-devel
+    rapidjson-devel
+    scylla-boost163-static
+    scylla-python34-pyparsing20
+    systemd-devel
+    pigz
+)
+
+# 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
+#    some old containers may contain glibc older,
+#    so enforce update on that one.
+# 2) if problems with signatures, ensure having fresh
+#    archlinux-keyring: pacman -Sy archlinux-keyring && pacman -Syyu
+# 3) aur installations require having sudo and being
+#    a sudoer. makepkg does not work otherwise.
+#
+# aur: antlr3, antlr3-cpp-headers-git
+arch_packages=(
+    base-devel
+    filesystem
+    git
+    glibc
+    jsoncpp
+    lua
+    python-pyparsing
+    python3
+    rapidjson
+    snappy
+    thrift
+)
+
+print_usage() {
+    echo "Usage: install-dependencies.sh [OPTION]..."
+    echo ""
+    echo "  --print-python3-runtime-packages Print required python3 packages for Scylla"
+    exit 1
+}
+
+PRINT_PYTHON3=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "--print-python3-runtime-packages")
+            PRINT_PYTHON3=true
+            shift 1
+            ;;
+         *)
+            print_usage
+            ;;
+    esac
+done
+
+if $PRINT_PYTHON3; then
+    if [ "$ID" != "fedora" ]; then
+        echo "Unsupported Distribution: $ID"
+        exit 1
+    fi
+    echo "${fedora_python3_packages[@]}"
+    exit 0
+fi
 
 bash seastar/install-dependencies.sh
+bash tools/jmx/install-dependencies.sh
+bash tools/java/install-dependencies.sh
 
-if [ "$ID" = "ubuntu" ]; then
-    echo "Adding /etc/apt/sources.list.d/scylla.list"
-
-    if wget "http://downloads.scylladb.com/deb/3rdparty/${VERSION_CODENAME}/scylla-3rdparty.list" -q -O /dev/null; then
-        echo "deb  [trusted=yes arch=amd64] http://downloads.scylladb.com/deb/3rdparty/${VERSION_CODENAME} ${VERSION_CODENAME} scylladb/multiverse" > /etc/apt/sources.list.d/scylla-3rdparty.list
+if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
+    apt-get -y install "${debian_base_packages[@]}"
+    if [ "$VERSION_ID" = "8" ]; then
+        apt-get -y install libsystemd-dev scylla-antlr35 libyaml-cpp-dev
+    elif [ "$VERSION_ID" = "14.04" ]; then
+        apt-get -y install scylla-antlr35 libyaml-cpp-dev
+    elif [ "$VERSION_ID" = "9" ]; then
+        apt-get -y install libsystemd-dev antlr3 scylla-libyaml-cpp05-dev
     else
-        echo "Packages are not available for your Ubuntu release yet, using the Xenial (16.04) list instead"
-
-        echo "deb  [trusted=yes arch=amd64] http://downloads.scylladb.com/deb/3rdparty/xenial xenial scylladb/multiverse" > /etc/apt/sources.list.d/scylla-3rdparty.list
+        apt-get -y install libsystemd-dev antlr3 libyaml-cpp-dev
+    fi
+    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-thrift --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
+elif [ "$ID" = "fedora" ]; then
+    if rpm -q --quiet yum-utils; then
+        echo
+        echo "This script will install dnf-utils package, witch will conflict with currently installed package: yum-utils"
+        echo "Please remove the package and try to run this script again."
+        exit 1
+    fi
+    yum install -y "${fedora_packages[@]}" "${fedora_python3_packages[@]}"
+    pip3 install cassandra-driver
+elif [ "$ID" = "centos" ]; then
+    yum install -y "${centos_packages[@]}"
+    echo -e "Configure example:\n\tpython3.4 ./configure.py --enable-dpdk --mode=release --static-boost --compiler=/opt/scylladb/bin/g++-7.3 --python python3.4 --ldflag=-Wl,-rpath=/opt/scylladb/lib64 --cflags=-I/opt/scylladb/include --with-antlr3=/opt/scylladb/bin/antlr3"
+elif [ "$ID" == "arch" ]; then
+    # main
+    if [ "$EUID" -eq "0" ]; then
+        pacman -Sy --needed --noconfirm "${arch_packages[@]}"
+    else
+        echo "scylla: You now ran $0 as non-root. Run it again as root to execute the pacman part of the installation." 1>&2
     fi
 
-    apt -y update
-
-    apt -y install libsystemd-dev python3-pyparsing libsnappy-dev libjsoncpp-dev libyaml-cpp-dev libthrift-dev antlr3-c++-dev antlr3 thrift-compiler
-elif [ "$ID" = "debian" ]; then
-    apt -y install libyaml-cpp-dev libjsoncpp-dev libsnappy-dev
-    echo antlr3 and thrift still missing - waiting for ppa
-elif [ "$ID" = "fedora" ]; then
-    yum install -y yaml-cpp-devel thrift-devel antlr3-tool antlr3-C++-devel jsoncpp-devel snappy-devel
-elif [ "$ID" = "centos" ]; then
-    yum install -y yaml-cpp-devel thrift-devel scylla-antlr35-tool scylla-antlr35-C++-devel jsoncpp-devel snappy-devel scylla-boost163-static scylla-python34-pyparsing20 systemd-devel
-    echo -e "Configure example:\n\tpython3.4 ./configure.py --enable-dpdk --mode=release --static-boost --compiler=/opt/scylladb/bin/g++-7.3 --python python3.4 --ldflag=-Wl,-rpath=/opt/scylladb/lib64 --cflags=-I/opt/scylladb/include --with-antlr3=/opt/scylladb/bin/antlr3"
+    # aur
+    if [ ! -x /usr/bin/antlr3 ]; then
+        echo "Installing aur/antlr3..."
+        if (( EUID == 0 )); then
+            echo "You now ran $0 as root. This can only update dependencies with pacman. Please run again it as non-root to complete the AUR part of the installation." 1>&2
+            exit 1
+        fi
+        TEMP=$(mktemp -d)
+        pushd "$TEMP" > /dev/null || exit 1
+        git clone --depth 1 https://aur.archlinux.org/antlr3.git
+        cd antlr3 || exit 1
+        makepkg -si
+        popd > /dev/null || exit 1
+    fi
+    if [ ! -f /usr/include/antlr3.hpp ]; then
+        echo "Installing aur/antlr3-cpp-headers-git..."
+        if (( EUID == 0 )); then
+            echo "You now ran $0 as root. This can only update dependencies with pacman. Please run again it as non-root to complete the AUR part of the installation." 1>&2
+            exit 1
+        fi
+        TEMP=$(mktemp -d)
+        pushd "$TEMP" > /dev/null || exit 1
+        git clone --depth 1 https://aur.archlinux.org/antlr3-cpp-headers-git.git
+        cd antlr3-cpp-headers-git || exit 1
+        makepkg -si
+        popd > /dev/null || exit 1
+    fi
+    echo -e "Configure example:\n\t./configure.py\n\tninja release"
 fi

@@ -56,12 +56,7 @@ production_snitch_base::production_snitch_base(const sstring& prop_file_name)
     if (!prop_file_name.empty()) {
         _prop_file_name = prop_file_name;
     } else {
-        using namespace boost::filesystem;
-
-        path def_prop_file(db::config::get_conf_dir());
-        def_prop_file /= path(snitch_properties_filename);
-
-        _prop_file_name = def_prop_file.string();
+        _prop_file_name = db::config::get_conf_sub(snitch_properties_filename).string();
     }
 }
 
@@ -100,12 +95,10 @@ void production_snitch_base::reset_io_state() {
 
 sstring production_snitch_base::get_endpoint_info(inet_address endpoint, gms::application_state key,
                                                   const sstring& default_val) {
-    gms::gossiper& local_gossiper = gms::get_local_gossiper();
-    auto* ep_state = local_gossiper.get_application_state_ptr(endpoint, key);
-    if (ep_state) {
-        return ep_state->value;
+    auto val = snitch_base::get_endpoint_info(endpoint, key);
+    if (val) {
+        return *val;
     }
-
     // ...if not found - look in the SystemTable...
     if (!_saved_endpoints) {
         _saved_endpoints = db::system_keyspace::load_dc_rack_info();
@@ -181,11 +174,11 @@ void production_snitch_base::parse_property_file() {
         auto key = split_line[0]; trim(key);
         auto val = split_line[1]; trim(val);
 
-        if (val.empty() || !allowed_property_keys.count(key)) {
+        if (val.empty() || !allowed_property_keys.contains(key)) {
             throw_bad_format(line);
         }
 
-        if (_prop_values.count(key)) {
+        if (_prop_values.contains(key)) {
             throw_double_declaration(key);
         }
 
@@ -222,7 +215,7 @@ void reconnectable_snitch_helper::reconnect(gms::inet_address public_address, co
 }
 
 void reconnectable_snitch_helper::reconnect(gms::inet_address public_address, gms::inet_address local_address) {
-    auto& ms = netw::get_local_messaging_service();
+    netw::messaging_service& ms = gms::get_local_gossiper().get_local_messaging();
     auto& sn_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
 
     if (sn_ptr->get_datacenter(public_address) == _local_dc &&
@@ -236,13 +229,9 @@ void reconnectable_snitch_helper::reconnect(gms::inet_address public_address, gm
         // ...then update messaging_service cache and reset the currently
         // open connections to this endpoint on all shards...
         //
-        netw::get_messaging_service().invoke_on_all([public_address, local_address] (auto& local_ms) {
+        ms.container().invoke_on_all([public_address, local_address] (auto& local_ms) {
             local_ms.cache_preferred_ip(public_address, local_address);
-
-            netw::msg_addr id = {
-                .addr = public_address
-            };
-            local_ms.remove_rpc_client(id);
+            local_ms.remove_rpc_client(netw::msg_addr(public_address));
         }).get();
 
         logger().debug("Initiated reconnect to an Internal IP {} for the {}", local_address, public_address);

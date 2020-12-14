@@ -22,10 +22,14 @@
 #include "column_family.hh"
 #include "api/api-doc/column_family.json.hh"
 #include <vector>
-#include "http/exception.hh"
+#include <seastar/http/exception.hh>
 #include "sstables/sstables.hh"
 #include "utils/estimated_histogram.hh"
 #include <algorithm>
+#include "db/system_keyspace_view_types.hh"
+#include "db/data_listeners.hh"
+
+extern logging::logger apilog;
 
 namespace api {
 using namespace httpd;
@@ -34,7 +38,7 @@ using namespace std;
 using namespace json;
 namespace cf = httpd::column_family_json;
 
-const utils::UUID& get_uuid(const sstring& name, const database& db) {
+std::tuple<sstring, sstring> parse_fully_qualified_cf_name(sstring name) {
     auto pos = name.find("%3A");
     size_t end;
     if (pos == sstring::npos) {
@@ -46,12 +50,20 @@ const utils::UUID& get_uuid(const sstring& name, const database& db) {
     } else {
         end = pos + 3;
     }
+    return std::make_tuple(name.substr(0, pos), name.substr(end));
+}
+
+const utils::UUID& get_uuid(const sstring& ks, const sstring& cf, const database& db) {
     try {
-        return db.find_uuid(name.substr(0, pos), name.substr(end));
+        return db.find_uuid(ks, cf);
     } catch (std::out_of_range& e) {
-        throw bad_param_exception("Column family '" + name.substr(0, pos) + ":"
-                + name.substr(end) + "' not found");
+        throw bad_param_exception(format("Column family '{}:{}' not found", ks, cf));
     }
+}
+
+const utils::UUID& get_uuid(const sstring& name, const database& db) {
+    auto [ks, cf] = parse_fully_qualified_cf_name(name);
+    return get_uuid(ks, cf, db);
 }
 
 future<> foreach_column_family(http_context& ctx, const sstring& name, function<void(column_family&)> f) {
@@ -63,28 +75,28 @@ future<> foreach_column_family(http_context& ctx, const sstring& name, function<
 }
 
 future<json::json_return_type>  get_cf_stats(http_context& ctx, const sstring& name,
-        int64_t column_family::stats::*f) {
+        int64_t column_family_stats::*f) {
     return map_reduce_cf(ctx, name, int64_t(0), [f](const column_family& cf) {
         return cf.get_stats().*f;
     }, std::plus<int64_t>());
 }
 
 future<json::json_return_type>  get_cf_stats(http_context& ctx,
-        int64_t column_family::stats::*f) {
+        int64_t column_family_stats::*f) {
     return map_reduce_cf(ctx, int64_t(0), [f](const column_family& cf) {
         return cf.get_stats().*f;
     }, std::plus<int64_t>());
 }
 
 static future<json::json_return_type>  get_cf_stats_count(http_context& ctx, const sstring& name,
-        utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+        utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     return map_reduce_cf(ctx, name, int64_t(0), [f](const column_family& cf) {
         return (cf.get_stats().*f).hist.count;
     }, std::plus<int64_t>());
 }
 
 static future<json::json_return_type>  get_cf_stats_sum(http_context& ctx, const sstring& name,
-        utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+        utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     auto uuid = get_uuid(name, ctx.db.local());
     return ctx.db.map_reduce0([uuid, f](database& db) {
         // Histograms information is sample of the actual load
@@ -100,14 +112,14 @@ static future<json::json_return_type>  get_cf_stats_sum(http_context& ctx, const
 
 
 static future<json::json_return_type>  get_cf_stats_count(http_context& ctx,
-        utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+        utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     return map_reduce_cf(ctx, int64_t(0), [f](const column_family& cf) {
         return (cf.get_stats().*f).hist.count;
     }, std::plus<int64_t>());
 }
 
 static future<json::json_return_type>  get_cf_histogram(http_context& ctx, const sstring& name,
-        utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+        utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     utils::UUID uuid = get_uuid(name, ctx.db.local());
     return ctx.db.map_reduce0([f, uuid](const database& p) {
         return (p.find_column_family(uuid).get_stats().*f).hist;},
@@ -118,7 +130,7 @@ static future<json::json_return_type>  get_cf_histogram(http_context& ctx, const
     });
 }
 
-static future<json::json_return_type> get_cf_histogram(http_context& ctx, utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+static future<json::json_return_type> get_cf_histogram(http_context& ctx, utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     std::function<utils::ihistogram(const database&)> fun = [f] (const database& db)  {
         utils::ihistogram res;
         for (auto i : db.get_column_families()) {
@@ -134,7 +146,7 @@ static future<json::json_return_type> get_cf_histogram(http_context& ctx, utils:
 }
 
 static future<json::json_return_type>  get_cf_rate_and_histogram(http_context& ctx, const sstring& name,
-        utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+        utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     utils::UUID uuid = get_uuid(name, ctx.db.local());
     return ctx.db.map_reduce0([f, uuid](const database& p) {
         return (p.find_column_family(uuid).get_stats().*f).rate();},
@@ -145,7 +157,7 @@ static future<json::json_return_type>  get_cf_rate_and_histogram(http_context& c
     });
 }
 
-static future<json::json_return_type> get_cf_rate_and_histogram(http_context& ctx, utils::timed_rate_moving_average_and_histogram column_family::stats::*f) {
+static future<json::json_return_type> get_cf_rate_and_histogram(http_context& ctx, utils::timed_rate_moving_average_and_histogram column_family_stats::*f) {
     std::function<utils::rate_moving_average_and_histogram(const database&)> fun = [f] (const database& db)  {
         utils::rate_moving_average_and_histogram res;
         for (auto i : db.get_column_families()) {
@@ -166,27 +178,27 @@ static future<json::json_return_type> get_cf_unleveled_sstables(http_context& ct
     }, std::plus<int64_t>());
 }
 
-static int64_t min_row_size(column_family& cf) {
+static int64_t min_partition_size(column_family& cf) {
     int64_t res = INT64_MAX;
     for (auto i: *cf.get_sstables() ) {
-        res = std::min(res, i->get_stats_metadata().estimated_row_size.min());
+        res = std::min(res, i->get_stats_metadata().estimated_partition_size.min());
     }
     return (res == INT64_MAX) ? 0 : res;
 }
 
-static int64_t max_row_size(column_family& cf) {
+static int64_t max_partition_size(column_family& cf) {
     int64_t res = 0;
     for (auto i: *cf.get_sstables() ) {
-        res = std::max(i->get_stats_metadata().estimated_row_size.max(), res);
+        res = std::max(i->get_stats_metadata().estimated_partition_size.max(), res);
     }
     return res;
 }
 
-static integral_ratio_holder mean_row_size(column_family& cf) {
+static integral_ratio_holder mean_partition_size(column_family& cf) {
     integral_ratio_holder res;
     for (auto i: *cf.get_sstables() ) {
-        auto c = i->get_stats_metadata().estimated_row_size.count();
-        res.sub += i->get_stats_metadata().estimated_row_size.mean() * c;
+        auto c = i->get_stats_metadata().estimated_partition_size.count();
+        res.sub += i->get_stats_metadata().estimated_partition_size.mean() * c;
         res.total += c;
     }
     return res;
@@ -237,17 +249,22 @@ static future<json::json_return_type> sum_sstable(http_context& ctx, bool total)
     });
 }
 
+future<json::json_return_type> map_reduce_cf_time_histogram(http_context& ctx, const sstring& name, std::function<utils::time_estimated_histogram(const column_family&)> f) {
+    return map_reduce_cf_raw(ctx, name, utils::time_estimated_histogram(), f, utils::time_estimated_histogram_merge).then([](const utils::time_estimated_histogram& res) {
+        return make_ready_future<json::json_return_type>(time_to_json_histogram(res));
+    });
+}
+
 template <typename T>
 class sum_ratio {
     uint64_t _n = 0;
     T _total = 0;
 public:
-    future<> operator()(T value) {
+    void operator()(T value) {
         if (value > 0) {
             _total += value;
             _n++;
         }
-        return make_ready_future<>();
     }
     // Returns average value of all registered ratios.
     T get() && {
@@ -396,29 +413,31 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_memtable_switch_count.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats(ctx,req->param["name"] ,&column_family::stats::memtable_switch_count);
+        return get_cf_stats(ctx,req->param["name"] ,&column_family_stats::memtable_switch_count);
     });
 
     cf::get_all_memtable_switch_count.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &column_family::stats::memtable_switch_count);
+        return get_cf_stats(ctx, &column_family_stats::memtable_switch_count);
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_estimated_row_size_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
         return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
             utils::estimated_histogram res(0);
             for (auto i: *cf.get_sstables() ) {
-                res.merge(i->get_stats_metadata().estimated_row_size);
+                res.merge(i->get_stats_metadata().estimated_partition_size);
             }
             return res;
         },
         utils::estimated_histogram_merge, utils_json::estimated_histogram());
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_estimated_row_count.set(r, [&ctx] (std::unique_ptr<request> req) {
         return map_reduce_cf(ctx, req->param["name"], int64_t(0), [](column_family& cf) {
             uint64_t res = 0;
             for (auto i: *cf.get_sstables() ) {
-                res += i->get_stats_metadata().estimated_row_size.count();
+                res += i->get_stats_metadata().estimated_partition_size.count();
             }
             return res;
         },
@@ -443,67 +462,67 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_pending_flushes.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats(ctx,req->param["name"] ,&column_family::stats::pending_flushes);
+        return get_cf_stats(ctx,req->param["name"] ,&column_family_stats::pending_flushes);
     });
 
     cf::get_all_pending_flushes.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &column_family::stats::pending_flushes);
+        return get_cf_stats(ctx, &column_family_stats::pending_flushes);
     });
 
     cf::get_read.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats_count(ctx,req->param["name"] ,&column_family::stats::reads);
+        return get_cf_stats_count(ctx,req->param["name"] ,&column_family_stats::reads);
     });
 
     cf::get_all_read.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats_count(ctx, &column_family::stats::reads);
+        return get_cf_stats_count(ctx, &column_family_stats::reads);
     });
 
     cf::get_write.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats_count(ctx, req->param["name"] ,&column_family::stats::writes);
+        return get_cf_stats_count(ctx, req->param["name"] ,&column_family_stats::writes);
     });
 
     cf::get_all_write.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats_count(ctx, &column_family::stats::writes);
+        return get_cf_stats_count(ctx, &column_family_stats::writes);
     });
 
     cf::get_read_latency_histogram_depricated.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_histogram(ctx, req->param["name"], &column_family::stats::reads);
+        return get_cf_histogram(ctx, req->param["name"], &column_family_stats::reads);
     });
 
     cf::get_read_latency_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_rate_and_histogram(ctx, req->param["name"], &column_family::stats::reads);
+        return get_cf_rate_and_histogram(ctx, req->param["name"], &column_family_stats::reads);
     });
 
     cf::get_read_latency.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats_sum(ctx,req->param["name"] ,&column_family::stats::reads);
+        return get_cf_stats_sum(ctx,req->param["name"] ,&column_family_stats::reads);
     });
 
     cf::get_write_latency.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats_sum(ctx, req->param["name"] ,&column_family::stats::writes);
+        return get_cf_stats_sum(ctx, req->param["name"] ,&column_family_stats::writes);
     });
 
     cf::get_all_read_latency_histogram_depricated.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_histogram(ctx, &column_family::stats::writes);
+        return get_cf_histogram(ctx, &column_family_stats::writes);
     });
 
     cf::get_all_read_latency_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_rate_and_histogram(ctx, &column_family::stats::writes);
+        return get_cf_rate_and_histogram(ctx, &column_family_stats::writes);
     });
 
     cf::get_write_latency_histogram_depricated.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_histogram(ctx, req->param["name"], &column_family::stats::writes);
+        return get_cf_histogram(ctx, req->param["name"], &column_family_stats::writes);
     });
 
     cf::get_write_latency_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_rate_and_histogram(ctx, req->param["name"], &column_family::stats::writes);
+        return get_cf_rate_and_histogram(ctx, req->param["name"], &column_family_stats::writes);
     });
 
     cf::get_all_write_latency_histogram_depricated.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_histogram(ctx, &column_family::stats::writes);
+        return get_cf_histogram(ctx, &column_family_stats::writes);
     });
 
     cf::get_all_write_latency_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_rate_and_histogram(ctx, &column_family::stats::writes);
+        return get_cf_rate_and_histogram(ctx, &column_family_stats::writes);
     });
 
     cf::get_pending_compactions.set(r, [&ctx] (std::unique_ptr<request> req) {
@@ -519,11 +538,11 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_live_ss_table_count.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, req->param["name"], &column_family::stats::live_sstable_count);
+        return get_cf_stats(ctx, req->param["name"], &column_family_stats::live_sstable_count);
     });
 
     cf::get_all_live_ss_table_count.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &column_family::stats::live_sstable_count);
+        return get_cf_stats(ctx, &column_family_stats::live_sstable_count);
     });
 
     cf::get_unleveled_sstables.set(r, [&ctx] (std::unique_ptr<request> req) {
@@ -546,30 +565,36 @@ void set_column_family(http_context& ctx, routes& r) {
         return sum_sstable(ctx, true);
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_min_row_size.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], INT64_MAX, min_row_size, min_int64);
+        return map_reduce_cf(ctx, req->param["name"], INT64_MAX, min_partition_size, min_int64);
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_all_min_row_size.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, INT64_MAX, min_row_size, min_int64);
+        return map_reduce_cf(ctx, INT64_MAX, min_partition_size, min_int64);
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_max_row_size.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], int64_t(0), max_row_size, max_int64);
+        return map_reduce_cf(ctx, req->param["name"], int64_t(0), max_partition_size, max_int64);
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_all_max_row_size.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, int64_t(0), max_row_size, max_int64);
+        return map_reduce_cf(ctx, int64_t(0), max_partition_size, max_int64);
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_mean_row_size.set(r, [&ctx] (std::unique_ptr<request> req) {
         // Cassandra 3.x mean values are truncated as integrals.
-        return map_reduce_cf(ctx, req->param["name"], integral_ratio_holder(), mean_row_size, std::plus<integral_ratio_holder>());
+        return map_reduce_cf(ctx, req->param["name"], integral_ratio_holder(), mean_partition_size, std::plus<integral_ratio_holder>());
     });
 
+    // FIXME: this refers to partitions, not rows.
     cf::get_all_mean_row_size.set(r, [&ctx] (std::unique_ptr<request> req) {
         // Cassandra 3.x mean values are truncated as integrals.
-        return map_reduce_cf(ctx, integral_ratio_holder(), mean_row_size, std::plus<integral_ratio_holder>());
+        return map_reduce_cf(ctx, integral_ratio_holder(), mean_partition_size, std::plus<integral_ratio_holder>());
     });
 
     cf::get_bloom_filter_false_positives.set(r, [&ctx] (std::unique_ptr<request> req) {
@@ -776,25 +801,22 @@ void set_column_family(http_context& ctx, routes& r) {
 
     });
 
-    cf::get_cas_prepare.set(r, [] (std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        //auto id = get_uuid(req->param["name"], ctx.db.local());
-        return make_ready_future<json::json_return_type>(0);
+    cf::get_cas_prepare.set(r, [&ctx] (std::unique_ptr<request> req) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
+            return cf.get_stats().estimated_cas_prepare;
+        });
     });
 
-    cf::get_cas_propose.set(r, [] (std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        //auto id = get_uuid(req->param["name"], ctx.db.local());
-        return make_ready_future<json::json_return_type>(0);
+    cf::get_cas_propose.set(r, [&ctx] (std::unique_ptr<request> req) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
+            return cf.get_stats().estimated_cas_accept;
+        });
     });
 
-    cf::get_cas_commit.set(r, [] (std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        //auto id = get_uuid(req->param["name"], ctx.db.local());
-        return make_ready_future<json::json_return_type>(0);
+    cf::get_cas_commit.set(r, [&ctx] (std::unique_ptr<request> req) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
+            return cf.get_stats().estimated_cas_learn;
+        });
     });
 
     cf::get_sstables_per_read_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
@@ -805,11 +827,11 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_tombstone_scanned_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_histogram(ctx, req->param["name"], &column_family::stats::tombstone_scanned);
+        return get_cf_histogram(ctx, req->param["name"], &column_family_stats::tombstone_scanned);
     });
 
     cf::get_live_scanned_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return get_cf_histogram(ctx, req->param["name"], &column_family::stats::live_scanned);
+        return get_cf_histogram(ctx, req->param["name"], &column_family_stats::live_scanned);
     });
 
     cf::get_col_update_time_delta_histogram.set(r, [] (std::unique_ptr<request> req) {
@@ -820,19 +842,51 @@ void set_column_family(http_context& ctx, routes& r) {
         return make_ready_future<json::json_return_type>(res);
     });
 
-    cf::is_auto_compaction_disabled.set(r, [] (const_req req) {
-        // FIXME
-        // currently auto compaction is disable
-        // it should be changed when it would have an API
-        return true;
+    cf::get_auto_compaction.set(r, [&ctx] (const_req req) {
+        const utils::UUID& uuid = get_uuid(req.param["name"], ctx.db.local());
+        column_family& cf = ctx.db.local().find_column_family(uuid);
+        return !cf.is_auto_compaction_disabled_by_user();
     });
 
-    cf::get_built_indexes.set(r, [](const_req) {
-        // FIXME
-        // Currently there are no index support
-        return std::vector<sstring>();
+    cf::enable_auto_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
+        return foreach_column_family(ctx, req->param["name"], [](column_family &cf) {
+            cf.enable_auto_compaction();
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
     });
 
+    cf::disable_auto_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
+        return foreach_column_family(ctx, req->param["name"], [](column_family &cf) {
+            cf.disable_auto_compaction();
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    cf::get_built_indexes.set(r, [&ctx](std::unique_ptr<request> req) {
+        auto ks_cf = parse_fully_qualified_cf_name(req->param["name"]);
+        auto&& ks = std::get<0>(ks_cf);
+        auto&& cf_name = std::get<1>(ks_cf);
+        return db::system_keyspace::load_view_build_progress().then([ks, cf_name, &ctx](const std::vector<db::system_keyspace::view_build_progress>& vb) mutable {
+            std::set<sstring> vp;
+            for (auto b : vb) {
+                if (b.view.first == ks) {
+                    vp.insert(b.view.second);
+                }
+            }
+            std::vector<sstring> res;
+            auto uuid = get_uuid(ks, cf_name, ctx.db.local());
+            column_family& cf = ctx.db.local().find_column_family(uuid);
+            res.reserve(cf.get_index_manager().list_indexes().size());
+            for (auto&& i : cf.get_index_manager().list_indexes()) {
+                if (!vp.contains(secondary_index::index_table_name(i.metadata().name()))) {
+                    res.emplace_back(i.metadata().name());
+                }
+            }
+            return make_ready_future<json::json_return_type>(res);
+        });
+    });
 
     cf::get_compression_metadata_off_heap_memory_used.set(r, [](const_req) {
         // FIXME
@@ -860,17 +914,15 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_read_latency_estimated_histogram.set(r, [&ctx](std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_read;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::get_write_latency_estimated_histogram.set(r, [&ctx](std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_write;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::set_compaction_strategy_class.set(r, [&ctx](std::unique_ptr<request> req) {
@@ -903,6 +955,74 @@ void set_column_family(http_context& ctx, routes& r) {
             return cf.sstable_count_per_level();
         }, concat_sstable_count_per_level).then([](const std::vector<uint64_t>& res) {
             return make_ready_future<json::json_return_type>(res);
+        });
+    });
+
+    cf::get_sstables_for_key.set(r, [&ctx](std::unique_ptr<request> req) {
+        auto key = req->get_query_param("key");
+        auto uuid = get_uuid(req->param["name"], ctx.db.local());
+
+        return ctx.db.map_reduce0([key, uuid] (database& db) {
+            return db.find_column_family(uuid).get_sstables_by_partition_key(key);
+        }, std::unordered_set<sstring>(),
+            [](std::unordered_set<sstring> a, std::unordered_set<sstring>&& b) mutable {
+            a.insert(b.begin(),b.end());
+            return a;
+        }).then([](const std::unordered_set<sstring>& res) {
+            return make_ready_future<json::json_return_type>(container_to_vec(res));
+        });
+    });
+
+    cf::toppartitions.set(r, [&ctx] (std::unique_ptr<request> req) {
+        auto name_param = req->param["name"];
+        auto [ks, cf] = parse_fully_qualified_cf_name(name_param);
+
+        api::req_param<std::chrono::milliseconds, unsigned> duration{*req, "duration", 1000ms};
+        api::req_param<unsigned> capacity(*req, "capacity", 256);
+        api::req_param<unsigned> list_size(*req, "list_size", 10);
+
+        apilog.info("toppartitions query: name={} duration={} list_size={} capacity={}",
+            name_param, duration.param, list_size.param, capacity.param);
+
+        return seastar::do_with(db::toppartitions_query(ctx.db, ks, cf, duration.value, list_size, capacity), [&ctx](auto& q) {
+            return q.scatter().then([&q] {
+                return sleep(q.duration()).then([&q] {
+                    return q.gather(q.capacity()).then([&q] (auto topk_results) {
+                        apilog.debug("toppartitions query: processing results");
+                        cf::toppartitions_query_results results;
+
+                        results.read_cardinality = topk_results.read.size();
+                        results.write_cardinality = topk_results.write.size();
+
+                        for (auto& d: topk_results.read.top(q.list_size())) {
+                            cf::toppartitions_record r;
+                            r.partition = sstring(d.item);
+                            r.count = d.count;
+                            r.error = d.error;
+                            results.read.push(r);
+                        }
+                        for (auto& d: topk_results.write.top(q.list_size())) {
+                            cf::toppartitions_record r;
+                            r.partition = sstring(d.item);
+                            r.count = d.count;
+                            r.error = d.error;
+                            results.write.push(r);
+                        }
+                        return make_ready_future<json::json_return_type>(results);
+                    });
+                });
+            });
+        });
+    });
+
+    cf::force_major_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
+        if (req->get_query_param("split_output") != "") {
+            fail(unimplemented::cause::API);
+        }
+        return foreach_column_family(ctx, req->param["name"], [](column_family &cf) {
+            return cf.compact_all_sstables();
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
         });
     });
 }

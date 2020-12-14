@@ -44,43 +44,43 @@
 #include "function_name.hh"
 #include "types.hh"
 #include <vector>
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 namespace functions {
 
 class function {
 public:
-    using opt_bytes = std::experimental::optional<bytes>;
+    using opt_bytes = std::optional<bytes>;
     virtual ~function() {}
     virtual const function_name& name() const = 0;
     virtual const std::vector<data_type>& arg_types() const = 0;
-    virtual data_type return_type() const = 0;
+    virtual const data_type& return_type() const = 0;
 
     /**
      * Checks whether the function is a pure function (as in doesn't depend on, nor produce side effects) or not.
      *
      * @return <code>true</code> if the function is a pure function, <code>false</code> otherwise.
      */
-    virtual bool is_pure() = 0;
+    virtual bool is_pure() const = 0;
 
     /**
      * Checks whether the function is a native/hard coded one or not.
      *
      * @return <code>true</code> if the function is a native/hard coded one, <code>false</code> otherwise.
      */
-    virtual bool is_native() = 0;
+    virtual bool is_native() const = 0;
+
+    virtual bool requires_thread() const = 0;
 
     /**
      * Checks whether the function is an aggregate function or not.
      *
      * @return <code>true</code> if the function is an aggregate function, <code>false</code> otherwise.
      */
-    virtual bool is_aggregate() = 0;
+    virtual bool is_aggregate() const = 0;
 
     virtual void print(std::ostream& os) const = 0;
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) = 0;
-    virtual bool has_reference_to(function& f) = 0;
 
     /**
      * Returns the name of the function to use within a ResultSet.
@@ -88,7 +88,7 @@ public:
      * @param column_names the names of the columns used to call the function
      * @return the name of the function to use within a ResultSet
      */
-    virtual sstring column_name(const std::vector<sstring>& column_names) = 0;
+    virtual sstring column_name(const std::vector<sstring>& column_names) const = 0;
 
     friend class function_call;
     friend std::ostream& operator<<(std::ostream& os, const function& f);

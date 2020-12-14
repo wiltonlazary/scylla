@@ -23,6 +23,25 @@
 #pragma once
 
 
+#include <variant>
+#include "flat_mutation_reader.hh"
+#include "timestamp.hh"
+#include "gc_clock.hh"
+#include "mutation_fragment.hh"
+#include "schema_fwd.hh"
+#include "row.hh"
+#include "clustering_ranges_walker.hh"
+#include "utils/data_input.hh"
+#include "utils/overloaded_functor.hh"
+#include "liveness_info.hh"
+#include "mutation_fragment_filter.hh"
+#include "types.hh"
+#include "keys.hh"
+#include "clustering_bounds_comparator.hh"
+#include "range_tombstone.hh"
+#include "types/user.hh"
+#include "concrete_types.hh"
+
 namespace sstables {
 
 static inline bytes_view pop_back(std::vector<bytes_view>& vec) {
@@ -34,9 +53,36 @@ static inline bytes_view pop_back(std::vector<bytes_view>& vec) {
 class mp_row_consumer_reader : public flat_mutation_reader::impl {
     friend class mp_row_consumer_k_l;
     friend class mp_row_consumer_m;
+protected:
+    shared_sstable _sst;
+
+    // Whether index lower bound is in current partition
+    bool _index_in_current_partition = false;
+
+    // True iff the consumer finished generating fragments for a partition and hasn't
+    // entered the new partition yet.
+    // Implies that partition_end was emitted for the last partition.
+    // Will cause the reader to skip to the next partition if !_before_partition.
+    bool _partition_finished = true;
+
+    // When set, the consumer is positioned right before a partition or at end of the data file.
+    // _index_in_current_partition applies to the partition which is about to be read.
+    bool _before_partition = true;
+
+    std::optional<dht::decorated_key> _current_partition_key;
 public:
-    mp_row_consumer_reader(schema_ptr s) : impl(std::move(s)) {}
-    virtual void on_end_of_stream() = 0;
+    mp_row_consumer_reader(schema_ptr s, reader_permit permit, shared_sstable sst)
+        : impl(std::move(s), std::move(permit))
+        , _sst(std::move(sst))
+    { }
+
+    // Called when all fragments relevant to the query range or fast forwarding window
+    // within the current partition have been pushed.
+    // If no skipping is required, this method may not be called before transitioning
+    // to the next partition.
+    virtual void on_out_of_clustering_range() = 0;
+
+    void on_next_partition(dht::decorated_key key, tombstone tomb);
 };
 
 struct new_mutation {
@@ -44,14 +90,29 @@ struct new_mutation {
     tombstone tomb;
 };
 
+inline atomic_cell make_atomic_cell(const abstract_type& type,
+                                    api::timestamp_type timestamp,
+                                    bytes_view value,
+                                    gc_clock::duration ttl,
+                                    gc_clock::time_point expiration,
+                                    atomic_cell::collection_member cm) {
+    if (ttl != gc_clock::duration::zero()) {
+        return atomic_cell::make_live(type, timestamp, value, expiration, ttl, cm);
+    } else {
+        return atomic_cell::make_live(type, timestamp, value, cm);
+    }
+}
+
+atomic_cell make_counter_cell(api::timestamp_type timestamp, bytes_view value);
+
 class mp_row_consumer_k_l : public row_consumer {
 private:
     mp_row_consumer_reader* _reader;
     schema_ptr _schema;
     const query::partition_slice& _slice;
     bool _out_of_range = false;
-    stdx::optional<query::clustering_key_filter_ranges> _ck_ranges;
-    stdx::optional<clustering_ranges_walker> _ck_ranges_walker;
+    std::optional<query::clustering_key_filter_ranges> _ck_ranges;
+    std::optional<clustering_ranges_walker> _ck_ranges_walker;
 
     // When set, the fragment pending in _in_progress should not be emitted.
     bool _skip_in_progress = false;
@@ -76,7 +137,6 @@ private:
     mutation_fragment_opt _in_progress;
     mutation_fragment_opt _ready;
 
-    stdx::optional<new_mutation> _mutation;
     bool _is_mutation_end = true;
     position_in_partition _fwd_end = position_in_partition::after_all_clustered_rows(); // Restricts the stream on top of _ck_ranges_walker.
     streamed_mutation::forwarding _fwd;
@@ -113,7 +173,7 @@ public:
         // column_name as seen by the row consumer. This means that if our
         // exploded clustering keys has more rows than expected, we are dealing
         // with a collection.
-        bool is_collection(const schema& s) {
+        bool is_collection(const schema& s) const {
             auto expected_normal = s.clustering_key_size() + 1;
             // Note that we can have less than the expected. That is the case for
             // incomplete prefixes, for instance.
@@ -122,7 +182,7 @@ public:
             } else if (clustering.size() == (expected_normal + 1)) {
                 return true;
             }
-            throw malformed_sstable_exception(sprint("Found %d clustering elements in column name. Was not expecting that!", clustering.size()));
+            throw malformed_sstable_exception(format("Found {:d} clustering elements in column name. Was not expecting that!", clustering.size()));
         }
 
         static bool check_static(const schema& schema, bytes_view col) {
@@ -179,7 +239,7 @@ private:
     class collection_mutation {
         const column_definition *_cdef;
     public:
-        collection_type_impl::mutation cm;
+        collection_mutation_description cm;
 
         // We need to get a copy of the prefix here, because the outer object may be short lived.
         collection_mutation(const column_definition *cdef)
@@ -187,7 +247,7 @@ private:
 
         collection_mutation() : _cdef(nullptr) {}
 
-        bool is_new_collection(const column_definition *c) {
+        bool is_new_collection(const column_definition *c) const {
             if (!_cdef || ((_cdef->id != c->id) || (_cdef->kind != c->kind))) {
                 return true;
             }
@@ -198,24 +258,24 @@ private:
             if (!_cdef) {
                 return;
             }
-            auto ctype = static_pointer_cast<const collection_type_impl>(_cdef->type);
-            auto ac = atomic_cell_or_collection::from_collection_mutation(ctype->serialize_mutation_form(cm));
+            auto ac = atomic_cell_or_collection::from_collection_mutation(cm.serialize(*_cdef->type));
             if (_cdef->is_static()) {
-                mf.as_mutable_static_row().set_cell(*_cdef, std::move(ac));
+                mf.mutate_as_static_row(s, [&] (static_row& sr) mutable {
+                    sr.set_cell(*_cdef, std::move(ac));
+                });
             } else {
-                mf.as_mutable_clustering_row().set_cell(*_cdef, std::move(ac));
+                mf.mutate_as_clustering_row(s, [&] (clustering_row& cr) {
+                    cr.set_cell(*_cdef, std::move(ac));
+                });
             }
         }
     };
-    std::experimental::optional<collection_mutation> _pending_collection = {};
+    std::optional<collection_mutation> _pending_collection = {};
 
     collection_mutation& pending_collection(const column_definition *cdef) {
+        assert(cdef->is_multi_cell() && "frozen set should behave like a cell\n");
         if (!_pending_collection || _pending_collection->is_new_collection(cdef)) {
             flush_pending_collection(*_schema);
-
-            if (!cdef->is_multi_cell()) {
-                throw malformed_sstable_exception("frozen set should behave like a cell\n");
-            }
             _pending_collection = collection_mutation(cdef);
         }
         return *_pending_collection;
@@ -226,7 +286,9 @@ private:
         while (!_reader->is_buffer_full()) {
             auto mfo = _range_tombstones.get_next(_fwd_end);
             if (!mfo) {
-                _reader->on_end_of_stream();
+                if (!_reader->_partition_finished) {
+                    _reader->on_out_of_clustering_range();
+                }
                 break;
             }
             _reader->push_mutation_fragment(std::move(*mfo));
@@ -280,7 +342,7 @@ private:
             _out_of_range |= _ck_ranges_walker->out_of_range();
         }
 
-        sstlog.trace("mp_row_consumer_k_l {}: advance_to({}) => out_of_range={}, skip_in_progress={}", this, pos, _out_of_range, _skip_in_progress);
+        sstlog.trace("mp_row_consumer_k_l {}: advance_to({}) => out_of_range={}, skip_in_progress={}", fmt::ptr(this), pos, _out_of_range, _skip_in_progress);
     }
 
     // Assumes that this and other advance_to() overloads are called with monotonic positions.
@@ -297,7 +359,7 @@ private:
             _out_of_range |= _ck_ranges_walker->out_of_range();
         }
 
-        sstlog.trace("mp_row_consumer_k_l {}: advance_to({}) => out_of_range={}, skip_in_progress={}", this, rt, _out_of_range, _skip_in_progress);
+        sstlog.trace("mp_row_consumer_k_l {}: advance_to({}) => out_of_range={}, skip_in_progress={}", fmt::ptr(this), rt, _out_of_range, _skip_in_progress);
     }
 
     void advance_to(const mutation_fragment& mf) {
@@ -309,13 +371,14 @@ private:
     }
 
     void set_up_ck_ranges(const partition_key& pk) {
-        sstlog.trace("mp_row_consumer_k_l {}: set_up_ck_ranges({})", this, pk);
+        sstlog.trace("mp_row_consumer_k_l {}: set_up_ck_ranges({})", fmt::ptr(this), pk);
         _ck_ranges = query::clustering_key_filter_ranges::get_ranges(*_schema, _slice, pk);
-        _ck_ranges_walker = clustering_ranges_walker(*_schema, _ck_ranges->ranges(), _schema->has_static_columns());
+        _ck_ranges_walker.emplace(*_schema, _ck_ranges->ranges(), _schema->has_static_columns());
         _last_lower_bound_counter = 0;
         _fwd_end = _fwd ? position_in_partition::before_all_clustered_rows() : position_in_partition::after_all_clustered_rows();
         _out_of_range = false;
         _range_tombstones.reset();
+        _ready = {};
         _first_row_encountered = false;
     }
 public:
@@ -323,35 +386,39 @@ public:
 
     mp_row_consumer_k_l(mp_row_consumer_reader* reader,
                         const schema_ptr schema,
+                        reader_permit permit,
                         const query::partition_slice& slice,
                         const io_priority_class& pc,
-                        reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-        : row_consumer(std::move(resource_tracker), pc)
+        : row_consumer(std::move(permit), std::move(trace_state), pc)
         , _reader(reader)
         , _schema(schema)
         , _slice(slice)
         , _fwd(fwd)
-        , _range_tombstones(*_schema)
+        , _range_tombstones(*_schema, this->permit())
         , _treat_non_compound_rt_as_compound(!sst->has_correct_non_compound_range_tombstones())
     { }
 
     mp_row_consumer_k_l(mp_row_consumer_reader* reader,
                         const schema_ptr schema,
+                        reader_permit permit,
                         const io_priority_class& pc,
-                        reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-        : mp_row_consumer_k_l(reader, schema, schema->full_slice(), pc, std::move(resource_tracker), fwd, sst) { }
+        : mp_row_consumer_k_l(reader, schema, std::move(permit), schema->full_slice(), pc, std::move(trace_state), fwd, sst) { }
 
     virtual proceed consume_row_start(sstables::key_view key, sstables::deletion_time deltime) override {
         if (!_is_mutation_end) {
             return proceed::yes;
         }
-        _mutation = new_mutation{partition_key::from_exploded(key.explode(*_schema)), tombstone(deltime)};
-        setup_for_partition(_mutation->key);
-        return proceed::no;
+        auto pk = partition_key::from_exploded(key.explode(*_schema));
+        setup_for_partition(pk);
+        auto dk = dht::decorate_key(*_schema, pk);
+        _reader->on_next_partition(std::move(dk), tombstone(deltime));
+        return proceed::yes;
     }
 
     void setup_for_partition(const partition_key& pk) {
@@ -361,7 +428,10 @@ public:
     }
 
     proceed flush() {
-        sstlog.trace("mp_row_consumer_k_l {}: flush(in_progress={}, ready={}, skip={})", this, _in_progress, _ready, _skip_in_progress);
+        sstlog.trace("mp_row_consumer_k_l {}: flush(in_progress={}, ready={}, skip={})", fmt::ptr(this),
+            _in_progress ? std::optional<mutation_fragment::printer>(std::in_place, *_schema, *_in_progress) : std::optional<mutation_fragment::printer>(),
+            _ready ? std::optional<mutation_fragment::printer>(std::in_place, *_schema, *_ready) : std::optional<mutation_fragment::printer>(),
+            _skip_in_progress);
         flush_pending_collection(*_schema);
         // If _ready is already set we have a bug: get_mutation_fragment()
         // was not called, and below we will lose one clustering row!
@@ -378,13 +448,16 @@ public:
     }
 
     proceed flush_if_needed(range_tombstone&& rt) {
-        sstlog.trace("mp_row_consumer_k_l {}: flush_if_needed(in_progress={}, ready={}, skip={})", this, _in_progress, _ready, _skip_in_progress);
+        sstlog.trace("mp_row_consumer_k_l {}: flush_if_needed(in_progress={}, ready={}, skip={})", fmt::ptr(this),
+            _in_progress ? std::optional<mutation_fragment::printer>(std::in_place, *_schema, *_in_progress) : std::optional<mutation_fragment::printer>(),
+            _ready ? std::optional<mutation_fragment::printer>(std::in_place, *_schema, *_ready) : std::optional<mutation_fragment::printer>(),
+            _skip_in_progress);
         proceed ret = proceed::yes;
         if (_in_progress) {
             ret = flush();
         }
         advance_to(rt);
-        _in_progress = mutation_fragment(std::move(rt));
+        _in_progress = mutation_fragment(*_schema, permit(), std::move(rt));
         if (_out_of_range) {
             ret = push_ready_fragments_out_of_range();
         }
@@ -395,7 +468,7 @@ public:
     }
 
     proceed flush_if_needed(bool is_static, position_in_partition&& pos) {
-        sstlog.trace("mp_row_consumer_k_l {}: flush_if_needed({})", this, pos);
+        sstlog.trace("mp_row_consumer_k_l {}: flush_if_needed({})", fmt::ptr(this), pos);
 
         // Part of workaround for #1203
         _first_row_encountered = !is_static;
@@ -408,9 +481,9 @@ public:
         if (!_in_progress) {
             advance_to(pos);
             if (is_static) {
-                _in_progress = mutation_fragment(static_row());
+                _in_progress = mutation_fragment(*_schema, permit(), static_row());
             } else {
-                _in_progress = mutation_fragment(clustering_row(std::move(pos.key())));
+                _in_progress = mutation_fragment(*_schema, permit(), clustering_row(std::move(pos.key())));
             }
             if (_out_of_range) {
                 ret = push_ready_fragments_out_of_range();
@@ -438,42 +511,11 @@ public:
         return flush_if_needed(false, position_in_partition(position_in_partition::clustering_row_tag_t(), std::move(ck)));
     }
 
-    atomic_cell make_counter_cell(int64_t timestamp, bytes_view value) {
-        static constexpr size_t shard_size = 32;
-
-        data_input in(value);
-
-        auto header_size = in.read<int16_t>();
-        for (auto i = 0; i < header_size; i++) {
-            auto idx = in.read<int16_t>();
-            if (idx >= 0) {
-                throw marshal_exception("encountered a local shard in a counter cell");
-            }
-        }
-        auto shard_count = value.size() / shard_size;
-        if (shard_count != size_t(header_size)) {
-            throw marshal_exception("encountered remote shards in a counter cell");
-        }
-
-        std::vector<counter_shard> shards;
-        shards.reserve(shard_count);
-        counter_cell_builder ccb(shard_count);
-        for (auto i = 0u; i < shard_count; i++) {
-            auto id_hi = in.read<int64_t>();
-            auto id_lo = in.read<int64_t>();
-            auto clock = in.read<int64_t>();
-            auto value = in.read<int64_t>();
-            ccb.add_maybe_unsorted_shard(counter_shard(counter_id(utils::UUID(id_hi, id_lo)), value, clock));
-        }
-        ccb.sort_and_remove_duplicates();
-        return ccb.build(timestamp);
-    }
-
     template<typename CreateCell>
     //requires requires(CreateCell create_cell, column col) {
     //    { create_cell(col) } -> void;
     //}
-    proceed do_consume_cell(bytes_view col_name, int64_t timestamp, int32_t ttl, int32_t expiration, CreateCell&& create_cell) {
+    proceed do_consume_cell(bytes_view col_name, int64_t timestamp, int64_t ttl, int64_t expiration, CreateCell&& create_cell) {
         struct column col(*_schema, col_name, timestamp);
 
         auto ret = flush_if_needed(col.is_static, col.clustering);
@@ -483,7 +525,9 @@ public:
 
         if (col.cell.size() == 0) {
             row_marker rm(timestamp, gc_clock::duration(ttl), gc_clock::time_point(gc_clock::duration(expiration)));
-            _in_progress->as_mutable_clustering_row().apply(std::move(rm));
+            _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) {
+                cr.apply(std::move(rm));
+            });
             return ret;
         }
 
@@ -500,40 +544,69 @@ public:
             auto ac = make_counter_cell(timestamp, value);
 
             if (col.is_static) {
-                _in_progress->as_mutable_static_row().set_cell(*(col.cdef), std::move(ac));
+                _in_progress->mutate_as_static_row(*_schema, [&] (static_row& sr) mutable {
+                    sr.set_cell(*(col.cdef), std::move(ac));
+                });
             } else {
-                _in_progress->as_mutable_clustering_row().set_cell(*(col.cdef), atomic_cell_or_collection(std::move(ac)));
+                _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) mutable {
+                    cr.set_cell(*(col.cdef), atomic_cell_or_collection(std::move(ac)));
+                });
             }
         });
     }
 
-    atomic_cell make_atomic_cell(uint64_t timestamp, bytes_view value, uint32_t ttl, uint32_t expiration) {
-        if (ttl) {
-            return atomic_cell::make_live(timestamp, value,
-                                          gc_clock::time_point(gc_clock::duration(expiration)), gc_clock::duration(ttl));
-        } else {
-            return atomic_cell::make_live(timestamp, value);
-        }
-    }
-
-    virtual proceed consume_cell(bytes_view col_name, bytes_view value, int64_t timestamp, int32_t ttl, int32_t expiration) override {
+    virtual proceed consume_cell(bytes_view col_name, bytes_view value, int64_t timestamp, int64_t ttl, int64_t expiration) override {
         return do_consume_cell(col_name, timestamp, ttl, expiration, [&] (auto&& col) {
-            auto ac = make_atomic_cell(timestamp, value, ttl, expiration);
-
             bool is_multi_cell = col.collection_extra_data.size();
             if (is_multi_cell != col.cdef->is_multi_cell()) {
                 return;
             }
             if (is_multi_cell) {
+                auto& value_type = visit(*col.cdef->type, make_visitor(
+                    [] (const collection_type_impl& ctype) -> const abstract_type& { return *ctype.value_comparator(); },
+                    [&] (const user_type_impl& utype) -> const abstract_type& {
+                        if (col.collection_extra_data.size() != sizeof(int16_t)) {
+                            throw malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
+                                        sizeof(int16_t), col.collection_extra_data.size()));
+                        }
+
+                        auto field_idx = deserialize_field_index(col.collection_extra_data);
+                        if (field_idx >= utype.size()) {
+                            throw malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
+                                        utype.size(), field_idx));
+                        }
+
+                        return *utype.type(field_idx);
+                    },
+                    [] (const abstract_type& o) -> const abstract_type& {
+                        throw malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
+                    }
+                ));
+                auto ac = make_atomic_cell(value_type,
+                                           api::timestamp_type(timestamp),
+                                           value,
+                                           gc_clock::duration(ttl),
+                                           gc_clock::time_point(gc_clock::duration(expiration)),
+                                           atomic_cell::collection_member::yes);
                 update_pending_collection(col.cdef, to_bytes(col.collection_extra_data), std::move(ac));
                 return;
             }
 
+            auto ac = make_atomic_cell(*col.cdef->type,
+                                       api::timestamp_type(timestamp),
+                                       value,
+                                       gc_clock::duration(ttl),
+                                       gc_clock::time_point(gc_clock::duration(expiration)),
+                                       atomic_cell::collection_member::no);
             if (col.is_static) {
-                _in_progress->as_mutable_static_row().set_cell(*(col.cdef), std::move(ac));
+                _in_progress->mutate_as_static_row(*_schema, [&] (static_row& sr) mutable {
+                    sr.set_cell(*(col.cdef), std::move(ac));
+                });
                 return;
             }
-            _in_progress->as_mutable_clustering_row().set_cell(*(col.cdef), atomic_cell_or_collection(std::move(ac)));
+            _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) mutable {
+                cr.set_cell(*(col.cdef), atomic_cell_or_collection(std::move(ac)));
+            });
         });
     }
 
@@ -545,22 +618,24 @@ public:
         return consume_deleted_cell(col, timestamp, gc_clock::time_point(secs));
     }
 
-    proceed consume_deleted_cell(column &col, int64_t timestamp, gc_clock::time_point ttl) {
+    proceed consume_deleted_cell(column &col, int64_t timestamp, gc_clock::time_point local_deletion_time) {
         auto ret = flush_if_needed(col.is_static, col.clustering);
         if (_skip_in_progress) {
             return ret;
         }
 
         if (col.cell.size() == 0) {
-            row_marker rm(tombstone(timestamp, ttl));
-            _in_progress->as_mutable_clustering_row().apply(rm);
+            row_marker rm(tombstone(timestamp, local_deletion_time));
+            _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) mutable {
+                cr.apply(rm);
+            });
             return ret;
         }
         if (!col.is_present) {
             return ret;
         }
 
-        auto ac = atomic_cell::make_dead(timestamp, ttl);
+        auto ac = atomic_cell::make_dead(timestamp, local_deletion_time);
 
         bool is_multi_cell = col.collection_extra_data.size();
         if (is_multi_cell != col.cdef->is_multi_cell()) {
@@ -570,9 +645,13 @@ public:
         if (is_multi_cell) {
             update_pending_collection(col.cdef, to_bytes(col.collection_extra_data), std::move(ac));
         } else if (col.is_static) {
-            _in_progress->as_mutable_static_row().set_cell(*col.cdef, atomic_cell_or_collection(std::move(ac)));
+            _in_progress->mutate_as_static_row(*_schema, [&] (static_row& sr) {
+                sr.set_cell(*col.cdef, atomic_cell_or_collection(std::move(ac)));
+            });
         } else {
-            _in_progress->as_mutable_clustering_row().set_cell(*col.cdef, atomic_cell_or_collection(std::move(ac)));
+            _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) mutable {
+                cr.set_cell(*col.cdef, atomic_cell_or_collection(std::move(ac)));
+            });
         }
         return ret;
     }
@@ -590,7 +669,9 @@ public:
         auto ck = clustering_key_prefix::from_exploded_view(key);
         auto ret = flush_if_needed(std::move(ck));
         if (!_skip_in_progress) {
-            _in_progress->as_mutable_clustering_row().apply(shadowable_tombstone(tombstone(deltime)));
+            _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) mutable {
+                cr.apply(shadowable_tombstone(tombstone(deltime)));
+            });
         }
         return ret;
     }
@@ -606,9 +687,8 @@ public:
                 return bound_kind::incl_start;
             case composite::eoc::end:
                 return bound_kind::excl_start;
-            default:
-                throw malformed_sstable_exception(sprint("Unexpected start composite marker %d\n", uint16_t(uint8_t(found))));
         }
+        throw malformed_sstable_exception(format("Unexpected start composite marker {:d}", uint16_t(uint8_t(found))));
     }
 
     static bound_kind end_marker_to_bound_kind(bytes_view component) {
@@ -622,9 +702,8 @@ public:
                 return bound_kind::excl_end;
             case composite::eoc::end:
                 return bound_kind::incl_end;
-            default:
-                throw malformed_sstable_exception(sprint("Unexpected start composite marker %d\n", uint16_t(uint8_t(found))));
         }
+        throw malformed_sstable_exception(format("Unexpected end composite marker {:d}", uint16_t(uint8_t(found))));
     }
 
     virtual proceed consume_range_tombstone(
@@ -646,7 +725,9 @@ public:
             if (range_tombstone::is_single_clustering_row_tombstone(*_schema, start_ck, start_kind, end, end_kind)) {
                 auto ret = flush_if_needed(std::move(start_ck));
                 if (!_skip_in_progress) {
-                    _in_progress->as_mutable_clustering_row().apply(tombstone(deltime));
+                    _in_progress->mutate_as_clustering_row(*_schema, [&] (clustering_row& cr) mutable {
+                        cr.apply(tombstone(deltime));
+                    });
                 }
                 return ret;
             } else {
@@ -680,8 +761,8 @@ public:
     }
 
     // Returns true if the consumer is positioned at partition boundary,
-    // meaning that after next read either get_mutation() will
-    // return engaged mutation or end of stream was reached.
+    // meaning that after next read partition_start will be emitted
+    // or end of stream was reached.
     bool is_mutation_end() const {
         return _is_mutation_end;
     }
@@ -690,29 +771,21 @@ public:
         return _out_of_range;
     }
 
-    stdx::optional<new_mutation> get_mutation() {
-        return std::exchange(_mutation, { });
-    }
-
-    // Pushes ready fragments into the streamed_mutation's buffer.
-    // Tries to push as much as possible, but respects buffer limits.
-    // Sets streamed_mutation::_end_of_range when there are no more fragments for the query range.
-    // Returns information whether the parser should continue to parse more
-    // input and produce more fragments or we have collected enough and should yield.
-    proceed push_ready_fragments() {
+    // See the RowConsumer concept
+    void push_ready_fragments() {
         if (_ready) {
-            return push_ready_fragments_with_ready_set();
+            if (push_ready_fragments_with_ready_set() == proceed::no) {
+                return;
+            }
         }
 
         if (_out_of_range) {
-            return push_ready_fragments_out_of_range();
+            push_ready_fragments_out_of_range();
         }
-
-        return proceed::yes;
     }
 
     virtual void reset(indexable_element el) override {
-        sstlog.trace("mp_row_consumer_k_l {}: reset({})", this, static_cast<int>(el));
+        sstlog.trace("mp_row_consumer_k_l {}: reset({})", fmt::ptr(this), static_cast<int>(el));
         _ready = {};
         if (el == indexable_element::partition) {
             _pending_collection = {};
@@ -725,6 +798,19 @@ public:
         }
     }
 
+    virtual position_in_partition_view position() override {
+        if (_in_progress) {
+            return _in_progress->position();
+        }
+        if (_ready) {
+            return _ready->position();
+        }
+        if (_is_mutation_end) {
+            return position_in_partition_view(position_in_partition_view::end_of_partition_tag_t{});
+        }
+        return position_in_partition_view(position_in_partition_view::partition_start_tag_t{});
+    }
+
     // Changes current fragment range.
     //
     // When there are no more fragments for current range,
@@ -733,8 +819,8 @@ public:
     // The new range must not overlap with the previous range and
     // must be after it.
     //
-    stdx::optional<position_in_partition_view> fast_forward_to(position_range r, db::timeout_clock::time_point timeout) {
-        sstlog.trace("mp_row_consumer_k_l {}: fast_forward_to({})", this, r);
+    std::optional<position_in_partition_view> fast_forward_to(position_range r, db::timeout_clock::time_point timeout) {
+        sstlog.trace("mp_row_consumer_k_l {}: fast_forward_to({})", fmt::ptr(this), r);
         _out_of_range = _is_mutation_end;
         _fwd_end = std::move(r).end();
 
@@ -744,7 +830,7 @@ public:
         if (_ck_ranges_walker->out_of_range()) {
             _out_of_range = true;
             _ready = {};
-            sstlog.trace("mp_row_consumer_k_l {}: no more ranges", this);
+            sstlog.trace("mp_row_consumer_k_l {}: no more ranges", fmt::ptr(this));
             return { };
         }
 
@@ -757,24 +843,24 @@ public:
         if (_in_progress) {
             advance_to(*_in_progress);
             if (!_skip_in_progress) {
-                sstlog.trace("mp_row_consumer_k_l {}: _in_progress in range", this);
+                sstlog.trace("mp_row_consumer_k_l {}: _in_progress in range", fmt::ptr(this));
                 return { };
             }
         }
 
         if (_out_of_range) {
-            sstlog.trace("mp_row_consumer_k_l {}: _out_of_range=true", this);
+            sstlog.trace("mp_row_consumer_k_l {}: _out_of_range=true", fmt::ptr(this));
             return { };
         }
 
         position_in_partition::less_compare less(*_schema);
         if (!less(start, _fwd_end)) {
             _out_of_range = true;
-            sstlog.trace("mp_row_consumer_k_l {}: no overlap with restrictions", this);
+            sstlog.trace("mp_row_consumer_k_l {}: no overlap with restrictions", fmt::ptr(this));
             return { };
         }
 
-        sstlog.trace("mp_row_consumer_k_l {}: advance_context({})", this, start);
+        sstlog.trace("mp_row_consumer_k_l {}: advance_context({})", fmt::ptr(this), start);
         _last_lower_bound_counter = _ck_ranges_walker->lower_bound_change_counter();
         return start;
     }
@@ -786,12 +872,12 @@ public:
 
     // Tries to fast forward the consuming context to the next position.
     // Must be called outside consuming context.
-    stdx::optional<position_in_partition_view> maybe_skip() {
+    std::optional<position_in_partition_view> maybe_skip() {
         if (!needs_skip()) {
             return { };
         }
         _last_lower_bound_counter = _ck_ranges_walker->lower_bound_change_counter();
-        sstlog.trace("mp_row_consumer_k_l {}: advance_context({})", this, _ck_ranges_walker->lower_bound());
+        sstlog.trace("mp_row_consumer_k_l {}: advance_context({})", fmt::ptr(this), _ck_ranges_walker->lower_bound());
         return _ck_ranges_walker->lower_bound();
     }
 };
@@ -800,61 +886,205 @@ class mp_row_consumer_m : public consumer_m {
     mp_row_consumer_reader* _reader;
     schema_ptr _schema;
     const query::partition_slice& _slice;
-    bool _out_of_range = false;
-    stdx::optional<query::clustering_key_filter_ranges> _ck_ranges;
-    stdx::optional<clustering_ranges_walker> _ck_ranges_walker;
+    std::optional<mutation_fragment_filter> _mf_filter;
 
-    stdx::optional<new_mutation> _mutation;
     bool _is_mutation_end = true;
-    position_in_partition _fwd_end = position_in_partition::after_all_clustered_rows(); // Restricts the stream on top of _ck_ranges_walker.
     streamed_mutation::forwarding _fwd;
+    // For static-compact tables C* stores the only row in the static row but in our representation they're regular rows.
+    const bool _treat_static_row_as_regular;
 
-    void set_up_ck_ranges(const partition_key& pk) {
-        _ck_ranges = query::clustering_key_filter_ranges::get_ranges(*_schema, _slice, pk);
-        _ck_ranges_walker = clustering_ranges_walker(*_schema, _ck_ranges->ranges(), _schema->has_static_columns());
-        _fwd_end = _fwd ? position_in_partition::before_all_clustered_rows() : position_in_partition::after_all_clustered_rows();
-        _out_of_range = false;
+    std::optional<clustering_row> _in_progress_row;
+    std::optional<range_tombstone> _stored_tombstone;
+    static_row _in_progress_static_row;
+    bool _inside_static_row = false;
+
+    struct cell {
+        column_id id;
+        atomic_cell_or_collection val;
+    };
+    std::vector<cell> _cells;
+    collection_mutation_description _cm;
+
+    struct range_tombstone_start {
+        clustering_key_prefix ck;
+        bound_kind kind;
+        tombstone tomb;
+
+        position_in_partition_view position() const {
+            return position_in_partition_view(position_in_partition_view::range_tag_t{}, bound_view(ck, kind));
+        }
+    };
+
+    inline friend std::ostream& operator<<(std::ostream& o, const sstables::mp_row_consumer_m::range_tombstone_start& rt_start) {
+        o << "{ clustering: " << rt_start.ck
+          << ", kind: " << rt_start.kind
+          << ", tombstone: " << rt_start.tomb << " }";
+        return o;
+    }
+
+    std::optional<range_tombstone_start> _opened_range_tombstone;
+
+    void consume_range_tombstone_start(clustering_key_prefix ck, bound_kind k, tombstone t) {
+        sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_start(ck={}, k={}, t={})", fmt::ptr(this), ck, k, t);
+        if (_opened_range_tombstone) {
+            throw sstables::malformed_sstable_exception(
+                    format("Range tombstones have to be disjoint: current opened range tombstone {}, new tombstone {}",
+                           *_opened_range_tombstone, t));
+        }
+        _opened_range_tombstone = {std::move(ck), k, std::move(t)};
+    }
+
+    proceed consume_range_tombstone_end(clustering_key_prefix ck, bound_kind k, tombstone t) {
+        sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_end(ck={}, k={}, t={})", fmt::ptr(this), ck, k, t);
+        if (!_opened_range_tombstone) {
+            throw sstables::malformed_sstable_exception(
+                    format("Closing range tombstone that wasn't opened: clustering {}, kind {}, tombstone {}",
+                           ck, k, t));
+        }
+        if (_opened_range_tombstone->tomb != t) {
+            throw sstables::malformed_sstable_exception(
+                    format("Range tombstone with ck {} and two different tombstones at ends: {}, {}",
+                           ck, _opened_range_tombstone->tomb, t));
+        }
+
+
+        auto rt = range_tombstone {std::move(_opened_range_tombstone->ck),
+                            _opened_range_tombstone->kind,
+                            std::move(ck),
+                            k,
+                            std::move(t)};
+        _opened_range_tombstone.reset();
+        return maybe_push_range_tombstone(std::move(rt));
+    }
+
+    const column_definition& get_column_definition(std::optional<column_id> column_id) const {
+        auto column_type = _inside_static_row ? column_kind::static_column : column_kind::regular_column;
+        return _schema->column_at(column_type, *column_id);
+    }
+
+    inline proceed maybe_push_range_tombstone(range_tombstone&& rt) {
+        const auto action = _mf_filter->apply(rt);
+        switch (action) {
+        case mutation_fragment_filter::result::emit:
+            _reader->push_mutation_fragment(mutation_fragment(*_schema, permit(), std::move(rt)));
+            break;
+        case mutation_fragment_filter::result::ignore:
+            if (_mf_filter->out_of_range()) {
+                _reader->on_out_of_clustering_range();
+                return proceed::no;
+            }
+            if (_mf_filter->is_current_range_changed()) {
+                return proceed::no;
+            }
+            break;
+        case mutation_fragment_filter::result::store_and_finish:
+            _stored_tombstone = std::move(rt);
+            _reader->on_out_of_clustering_range();
+            return proceed::no;
+        }
+
+        return proceed(!_reader->is_buffer_full());
+    }
+
+    inline void reset_for_new_partition() {
+        _is_mutation_end = true;
+        _in_progress_row.reset();
+        _stored_tombstone.reset();
+        _mf_filter.reset();
+        _opened_range_tombstone.reset();
+    }
+
+    void check_schema_mismatch(const column_translation::column_info& column_info, const column_definition& column_def) const {
+        if (column_info.schema_mismatch) {
+            throw malformed_sstable_exception(
+                    format("{} definition in serialization header does not match schema. Expected {} but got {}",
+                        column_def.name_as_text(),
+                        column_def.type->name(),
+                        column_info.type->name()));
+        }
+    }
+
+    void check_column_missing_in_current_schema(const column_translation::column_info& column_info,
+                                                api::timestamp_type timestamp) const {
+        if (!column_info.id) {
+            sstring name = sstring(to_sstring_view(*column_info.name));
+            auto it = _schema->dropped_columns().find(name);
+            if (it == _schema->dropped_columns().end() || timestamp > it->second.timestamp) {
+                throw malformed_sstable_exception(format("Column {} missing in current schema", name));
+            }
+        }
     }
 
 public:
+
+    /*
+     * In m format, RTs are represented as separate start and end bounds,
+     * so setting/resetting RT start is needed so that we could skip using index.
+     * For this, the following methods need to be defined:
+     *
+     * void set_range_tombstone_start(clustering_key_prefix, bound_kind, tombstone);
+     * void reset_range_tombstone_start();
+     */
+    constexpr static bool is_setting_range_tombstone_start_supported = true;
+
     mp_row_consumer_m(mp_row_consumer_reader* reader,
                         const schema_ptr schema,
+                        reader_permit permit,
                         const query::partition_slice& slice,
                         const io_priority_class& pc,
-                            reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-        : consumer_m(resource_tracker, pc)
+        : consumer_m(std::move(permit), std::move(trace_state), pc)
         , _reader(reader)
         , _schema(schema)
         , _slice(slice)
         , _fwd(fwd)
-    { }
+        , _treat_static_row_as_regular(_schema->is_static_compact_table()
+            && (!sst->has_scylla_component() || sst->features().is_enabled(sstable_feature::CorrectStaticCompact))) // See #4139
+    {
+        _cells.reserve(std::max(_schema->static_columns_count(), _schema->regular_columns_count()));
+    }
 
     mp_row_consumer_m(mp_row_consumer_reader* reader,
                         const schema_ptr schema,
+                        reader_permit permit,
                         const io_priority_class& pc,
-                            reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-    : mp_row_consumer_m(reader, schema, schema->full_slice(), pc, std::move(resource_tracker), fwd, sst)
+    : mp_row_consumer_m(reader, schema, std::move(permit), schema->full_slice(), pc, std::move(trace_state), fwd, sst)
     { }
 
     virtual ~mp_row_consumer_m() {}
 
-    proceed push_ready_fragments() {
-        if (_out_of_range) {
-            _reader->on_end_of_stream();
-            return proceed::no;
-        }
+    // See the RowConsumer concept
+    void push_ready_fragments() {
+        auto maybe_push = [this] (auto&& mfopt) {
+            if (mfopt) {
+                assert(_mf_filter);
+                switch (_mf_filter->apply(*mfopt)) {
+                case mutation_fragment_filter::result::emit:
+                    _reader->push_mutation_fragment(mutation_fragment(*_schema, permit(), *std::exchange(mfopt, {})));
+                    break;
+                case mutation_fragment_filter::result::ignore:
+                    mfopt.reset();
+                    break;
+                case mutation_fragment_filter::result::store_and_finish:
+                    _reader->on_out_of_clustering_range();
+                    break;
+                }
+            }
+        };
 
-        return proceed::yes;
+        maybe_push(_stored_tombstone);
     }
 
-    // Tries to fast forward the consuming context to the next position.
-    // Must be called outside consuming context.
-    stdx::optional<position_in_partition_view> maybe_skip() {
-        return _ck_ranges_walker->lower_bound();
+    std::optional<position_in_partition_view> maybe_skip() {
+        if (!_mf_filter) {
+            return {};
+        }
+        return _mf_filter->maybe_skip();
     }
 
     bool is_mutation_end() const {
@@ -862,69 +1092,389 @@ public:
     }
 
     void setup_for_partition(const partition_key& pk) {
+        sstlog.trace("mp_row_consumer_m {}: setup_for_partition({})", fmt::ptr(this), pk);
         _is_mutation_end = false;
-        set_up_ck_ranges(pk);
+        _mf_filter.emplace(*_schema, _slice, pk, _fwd);
     }
 
-    stdx::optional<new_mutation> get_mutation() {
-        return std::exchange(_mutation, { });
+    std::optional<position_in_partition_view> fast_forward_to(position_range r, db::timeout_clock::time_point) {
+        if (!_mf_filter) {
+            _reader->on_out_of_clustering_range();
+            return {};
+        }
+        auto skip = _mf_filter->fast_forward_to(std::move(r));
+        if (skip) {
+            position_in_partition::less_compare less(*_schema);
+            // No need to skip using index if stored fragments are after the start of the range
+            if (_in_progress_row && !less(_in_progress_row->position(), *skip)) {
+                return {};
+            }
+            if (_stored_tombstone && !less(_stored_tombstone->position(), *skip)) {
+                return {};
+            }
+        }
+        if (_mf_filter->out_of_range()) {
+            _reader->on_out_of_clustering_range();
+        }
+        return skip;
     }
 
-    // Changes current fragment range.
-    //
-    // When there are no more fragments for current range,
-    // is_out_of_range() will return true.
-    //
-    // The new range must not overlap with the previous range and
-    // must be after it.
-    //
-    stdx::optional<position_in_partition_view> fast_forward_to(position_range r, db::timeout_clock::time_point timeout) {
-        _out_of_range = _is_mutation_end;
-        _fwd_end = std::move(r).end();
+    /*
+     * Sets the range tombstone start. Overwrites the currently set RT start if any.
+     * Used for skipping through wide partitions using index when the data block
+     * skipped to starts in the middle of an opened range tombstone.
+     */
+    void set_range_tombstone_start(clustering_key_prefix ck, bound_kind k, tombstone t) {
+        _opened_range_tombstone = {std::move(ck), k, std::move(t)};
+    }
 
-        _ck_ranges_walker->trim_front(std::move(r).start());
-        if (_ck_ranges_walker->out_of_range()) {
-            _out_of_range = true;
-            return { };
-        }
-
-        if (_out_of_range) {
-            return { };
-        }
-
-        auto start = _ck_ranges_walker->lower_bound();
-
-        position_in_partition::less_compare less(*_schema);
-        if (!less(start, _fwd_end)) {
-            _out_of_range = true;
-            return { };
-        }
-
-        return start;
+    /*
+     * Resets the previously set range tombstone start if any.
+     */
+    void reset_range_tombstone_start() {
+        _opened_range_tombstone.reset();
     }
 
     virtual proceed consume_partition_start(sstables::key_view key, sstables::deletion_time deltime) override {
+        sstlog.trace("mp_row_consumer_m {}: consume_partition_start(deltime=({}, {})), _is_mutation_end={}", fmt::ptr(this),
+            deltime.local_deletion_time, deltime.marked_for_delete_at, _is_mutation_end);
         if (!_is_mutation_end) {
             return proceed::yes;
         }
-        _mutation = new_mutation{partition_key::from_exploded(key.explode(*_schema)), tombstone(deltime)};
-        setup_for_partition(_mutation->key);
-        return proceed::no;
+        auto pk = partition_key::from_exploded(key.explode(*_schema));
+        setup_for_partition(pk);
+        auto dk = dht::decorate_key(*_schema, pk);
+        _reader->on_next_partition(std::move(dk), tombstone(deltime));
+        return proceed::yes;
+    }
+
+    virtual consumer_m::row_processing_result consume_row_start(const std::vector<temporary_buffer<char>>& ecp) override {
+        auto key = clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+            [] (const temporary_buffer<char>& b) { return to_bytes_view(b); }));
+
+        sstlog.trace("mp_row_consumer_m {}: consume_row_start({})", fmt::ptr(this), key);
+
+        // enagaged _in_progress_row means we have already split around this key.
+        if (_opened_range_tombstone && !_in_progress_row) {
+            // We have an opened range tombstone which means that the current row is spanned by that RT.
+            auto ck = key;
+            bool was_non_full_key = clustering_key::make_full(*_schema, ck);
+            auto end_kind = was_non_full_key ? bound_kind::excl_end : bound_kind::incl_end;
+            assert(!_stored_tombstone);
+            auto rt = range_tombstone(std::move(_opened_range_tombstone->ck),
+                _opened_range_tombstone->kind,
+                ck,
+                end_kind,
+                _opened_range_tombstone->tomb);
+            sstlog.trace("mp_row_consumer_m {}: push({})", fmt::ptr(this), rt);
+            _opened_range_tombstone->ck = std::move(ck);
+            _opened_range_tombstone->kind = was_non_full_key ? bound_kind::incl_start : bound_kind::excl_start;
+
+            if (maybe_push_range_tombstone(std::move(rt)) == proceed::no) {
+                _in_progress_row.emplace(std::move(key));
+                return consumer_m::row_processing_result::retry_later;
+            }
+        }
+
+        _in_progress_row.emplace(std::move(key));
+
+        switch (_mf_filter->apply(_in_progress_row->position())) {
+        case mutation_fragment_filter::result::emit:
+            sstlog.trace("mp_row_consumer_m {}: emit", fmt::ptr(this));
+            return consumer_m::row_processing_result::do_proceed;
+        case mutation_fragment_filter::result::ignore:
+            sstlog.trace("mp_row_consumer_m {}: ignore", fmt::ptr(this));
+            if (_mf_filter->out_of_range()) {
+                _reader->on_out_of_clustering_range();
+                // We actually want skip_later, which doesn't exist, but retry_later
+                // is ok because signalling out-of-range on the reader will cause it
+                // to either stop reading or skip to the next partition using index,
+                // not by ignoring fragments.
+                return consumer_m::row_processing_result::retry_later;
+            }
+            if (_mf_filter->is_current_range_changed()) {
+                return consumer_m::row_processing_result::retry_later;
+            } else {
+                _in_progress_row.reset();
+                return consumer_m::row_processing_result::skip_row;
+            }
+        case mutation_fragment_filter::result::store_and_finish:
+            sstlog.trace("mp_row_consumer_m {}: store_and_finish", fmt::ptr(this));
+            _reader->on_out_of_clustering_range();
+            return consumer_m::row_processing_result::retry_later;
+        }
+        abort();
+    }
+
+    virtual proceed consume_row_marker_and_tombstone(
+            const liveness_info& info, tombstone tomb, tombstone shadowable_tomb) override {
+        sstlog.trace("mp_row_consumer_m {}: consume_row_marker_and_tombstone({}, {}, {}), key={}",
+            fmt::ptr(this), info.to_row_marker(), tomb, shadowable_tomb, _in_progress_row->position());
+        _in_progress_row->apply(info.to_row_marker());
+        _in_progress_row->apply(tomb);
+        if (shadowable_tomb) {
+            _in_progress_row->apply(shadowable_tombstone{shadowable_tomb});
+        }
+        return proceed::yes;
+    }
+
+    virtual consumer_m::row_processing_result consume_static_row_start() override {
+        sstlog.trace("mp_row_consumer_m {}: consume_static_row_start()", fmt::ptr(this));
+        if (_treat_static_row_as_regular) {
+            return consume_row_start({});
+        }
+        _inside_static_row = true;
+        _in_progress_static_row = static_row();
+        return consumer_m::row_processing_result::do_proceed;
+    }
+
+    virtual proceed consume_column(const column_translation::column_info& column_info,
+                                   bytes_view cell_path,
+                                   bytes_view value,
+                                   api::timestamp_type timestamp,
+                                   gc_clock::duration ttl,
+                                   gc_clock::time_point local_deletion_time,
+                                   bool is_deleted) override {
+        const std::optional<column_id>& column_id = column_info.id;
+        sstlog.trace("mp_row_consumer_m {}: consume_column(id={}, path={}, value={}, ts={}, ttl={}, del_time={}, deleted={})", fmt::ptr(this),
+            column_id, fmt_hex(cell_path), fmt_hex(value), timestamp, ttl.count(), local_deletion_time.time_since_epoch().count(), is_deleted);
+        check_column_missing_in_current_schema(column_info, timestamp);
+        if (!column_id) {
+            return proceed::yes;
+        }
+        const column_definition& column_def = get_column_definition(column_id);
+        if (timestamp <= column_def.dropped_at()) {
+            return proceed::yes;
+        }
+        check_schema_mismatch(column_info, column_def);
+        if (column_def.is_multi_cell()) {
+            auto& value_type = visit(*column_def.type, make_visitor(
+                [] (const collection_type_impl& ctype) -> const abstract_type& { return *ctype.value_comparator(); },
+                [&] (const user_type_impl& utype) -> const abstract_type& {
+                    if (cell_path.size() != sizeof(int16_t)) {
+                        throw malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
+                                    sizeof(int16_t), cell_path.size()));
+                    }
+
+                    auto field_idx = deserialize_field_index(cell_path);
+                    if (field_idx >= utype.size()) {
+                        throw malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
+                                    utype.size(), field_idx));
+                    }
+
+                    return *utype.type(field_idx);
+                },
+                [] (const abstract_type& o) -> const abstract_type& {
+                    throw malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
+                }
+            ));
+            auto ac = is_deleted ? atomic_cell::make_dead(timestamp, local_deletion_time)
+                                 : make_atomic_cell(value_type,
+                                                    timestamp,
+                                                    value,
+                                                    ttl,
+                                                    local_deletion_time,
+                                                    atomic_cell::collection_member::yes);
+            _cm.cells.emplace_back(to_bytes(cell_path), std::move(ac));
+        } else {
+            auto ac = is_deleted ? atomic_cell::make_dead(timestamp, local_deletion_time)
+                                 : make_atomic_cell(*column_def.type, timestamp, value, ttl, local_deletion_time,
+                                       atomic_cell::collection_member::no);
+            _cells.push_back({*column_id, atomic_cell_or_collection(std::move(ac))});
+        }
+        return proceed::yes;
+    }
+
+    virtual proceed consume_complex_column_start(const sstables::column_translation::column_info& column_info,
+                                                 tombstone tomb) override {
+        sstlog.trace("mp_row_consumer_m {}: consume_complex_column_start({}, {})", fmt::ptr(this), column_info.id, tomb);
+        _cm.tomb = tomb;
+        _cm.cells.clear();
+        return proceed::yes;
+    }
+
+    virtual proceed consume_complex_column_end(const sstables::column_translation::column_info& column_info) override {
+        const std::optional<column_id>& column_id = column_info.id;
+        sstlog.trace("mp_row_consumer_m {}: consume_complex_column_end({})", fmt::ptr(this), column_id);
+        if (_cm.tomb) {
+            check_column_missing_in_current_schema(column_info, _cm.tomb.timestamp);
+        }
+        if (column_id) {
+            const column_definition& column_def = get_column_definition(column_id);
+            if (!_cm.cells.empty() || (_cm.tomb && _cm.tomb.timestamp > column_def.dropped_at())) {
+                check_schema_mismatch(column_info, column_def);
+                _cells.push_back({column_def.id, _cm.serialize(*column_def.type)});
+            }
+        }
+        _cm.tomb = {};
+        _cm.cells.clear();
+        return proceed::yes;
+    }
+
+    virtual proceed consume_counter_column(const column_translation::column_info& column_info,
+                                           bytes_view value,
+                                           api::timestamp_type timestamp) override {
+        const std::optional<column_id>& column_id = column_info.id;
+        sstlog.trace("mp_row_consumer_m {}: consume_counter_column({}, {}, {})", fmt::ptr(this), column_id, fmt_hex(value), timestamp);
+        check_column_missing_in_current_schema(column_info, timestamp);
+        if (!column_id) {
+            return proceed::yes;
+        }
+        const column_definition& column_def = get_column_definition(column_id);
+        if (timestamp <= column_def.dropped_at()) {
+            return proceed::yes;
+        }
+        check_schema_mismatch(column_info, column_def);
+        auto ac = make_counter_cell(timestamp, value);
+        _cells.push_back({*column_id, atomic_cell_or_collection(std::move(ac))});
+        return proceed::yes;
+    }
+
+    virtual proceed consume_range_tombstone(const std::vector<temporary_buffer<char>>& ecp,
+                                            bound_kind kind,
+                                            tombstone tomb) override {
+        auto ck = clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+            [] (const temporary_buffer<char>& b) { return to_bytes_view(b); }));
+        if (kind == bound_kind::incl_start || kind == bound_kind::excl_start) {
+            consume_range_tombstone_start(std::move(ck), kind, std::move(tomb));
+            return proceed(!_reader->is_buffer_full());
+        } else { // *_end kind
+            return consume_range_tombstone_end(std::move(ck), kind, std::move(tomb));
+        }
+    }
+
+    virtual proceed consume_range_tombstone(const std::vector<temporary_buffer<char>>& ecp,
+                                            sstables::bound_kind_m kind,
+                                            tombstone end_tombstone,
+                                            tombstone start_tombstone) override {
+        auto result = proceed::yes;
+        auto ck = clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+            [] (const temporary_buffer<char>& b) { return to_bytes_view(b); }));
+        switch (kind) {
+        case bound_kind_m::incl_end_excl_start:
+            result = consume_range_tombstone_end(ck, bound_kind::incl_end, std::move(end_tombstone));
+            consume_range_tombstone_start(std::move(ck), bound_kind::excl_start, std::move(start_tombstone));
+            break;
+        case bound_kind_m::excl_end_incl_start:
+            result = consume_range_tombstone_end(ck, bound_kind::excl_end, std::move(end_tombstone));
+            consume_range_tombstone_start(std::move(ck), bound_kind::incl_start, std::move(start_tombstone));
+            break;
+        default:
+            assert(false && "Invalid boundary type");
+        }
+
+        return result;
+    }
+
+    virtual proceed consume_row_end() override {
+        auto fill_cells = [this] (column_kind kind, row& cells) {
+            auto max_id = boost::max_element(_cells, [](auto &&a, auto &&b) {
+                return a.id < b.id;
+            });
+            cells.reserve(max_id->id);
+            for (auto &&c : _cells) {
+                cells.apply(_schema->column_at(kind, c.id), std::move(c.val));
+            }
+            _cells.clear();
+        };
+
+        if (_inside_static_row) {
+            fill_cells(column_kind::static_column, _in_progress_static_row.cells());
+            sstlog.trace("mp_row_consumer_m {}: consume_row_end(_in_progress_static_row={})", fmt::ptr(this), static_row::printer(*_schema, _in_progress_static_row));
+            _inside_static_row = false;
+            if (!_in_progress_static_row.empty()) {
+                auto action = _mf_filter->apply(_in_progress_static_row);
+                switch (action) {
+                case mutation_fragment_filter::result::emit:
+                    _reader->push_mutation_fragment(mutation_fragment(*_schema, permit(), std::move(_in_progress_static_row)));
+                    break;
+                case mutation_fragment_filter::result::ignore:
+                    break;
+                case mutation_fragment_filter::result::store_and_finish:
+                    // static row is always either emited or ignored.
+                    throw runtime_exception("We should never need to store static row");
+                }
+            }
+        } else {
+            if (!_cells.empty()) {
+                fill_cells(column_kind::regular_column, _in_progress_row->cells());
+            }
+            _reader->push_mutation_fragment(mutation_fragment(*_schema, permit(), *std::exchange(_in_progress_row, {})));
+        }
+
+        return proceed(!_reader->is_buffer_full());
+    }
+
+    virtual void on_end_of_stream() override {
+        sstlog.trace("mp_row_consumer_m {}: on_end_of_stream()", fmt::ptr(this));
+        if (_opened_range_tombstone) {
+            if (!_mf_filter || _mf_filter->out_of_range()) {
+                throw sstables::malformed_sstable_exception("Unclosed range tombstone.");
+            }
+            auto range_end = _mf_filter->uppermost_bound();
+            position_in_partition::less_compare less(*_schema);
+            auto start_pos = position_in_partition_view(position_in_partition_view::range_tag_t{},
+                                                        bound_view(_opened_range_tombstone->ck, _opened_range_tombstone->kind));
+            if (less(start_pos, range_end)) {
+                auto end_bound = range_end.is_clustering_row()
+                    ? position_in_partition_view::after_key(range_end.key()).as_end_bound_view()
+                    : range_end.as_end_bound_view();
+                auto rt = range_tombstone {std::move(_opened_range_tombstone->ck),
+                                           _opened_range_tombstone->kind,
+                                           end_bound.prefix(),
+                                           end_bound.kind(),
+                                           _opened_range_tombstone->tomb};
+                sstlog.trace("mp_row_consumer_m {}: on_end_of_stream(), emitting last tombstone: {}", fmt::ptr(this), rt);
+                _opened_range_tombstone.reset();
+                _reader->push_mutation_fragment(mutation_fragment(*_schema, permit(), std::move(rt)));
+            }
+        }
+        if (!_reader->_partition_finished) {
+            consume_partition_end();
+        }
+        _reader->_end_of_stream = true;
     }
 
     virtual proceed consume_partition_end() override {
-        _is_mutation_end = true;
-        _out_of_range = true;
-        return proceed::no;
+        sstlog.trace("mp_row_consumer_m {}: consume_partition_end()", fmt::ptr(this));
+        reset_for_new_partition();
+
+        if (_fwd == streamed_mutation::forwarding::yes) {
+            _reader->_end_of_stream = true;
+            return proceed::no;
+        }
+
+        _reader->_index_in_current_partition = false;
+        _reader->_partition_finished = true;
+        _reader->_before_partition = true;
+        _reader->push_mutation_fragment(mutation_fragment(*_schema, permit(), partition_end()));
+        return proceed::yes;
     }
 
     virtual void reset(sstables::indexable_element el) override {
+        sstlog.trace("mp_row_consumer_m {}: reset({})", fmt::ptr(this), static_cast<int>(el));
         if (el == indexable_element::partition) {
-            _is_mutation_end = true;
-            _out_of_range = true;
+            reset_for_new_partition();
         } else {
+            _in_progress_row.reset();
             _is_mutation_end = false;
         }
+    }
+
+    virtual position_in_partition_view position() override {
+        if (_inside_static_row) {
+            return position_in_partition_view(position_in_partition_view::static_row_tag_t{});
+        }
+        if (_stored_tombstone) {
+            return _stored_tombstone->position();
+        }
+        if (_in_progress_row) {
+            return _in_progress_row->position();
+        }
+        if (_is_mutation_end) {
+            return position_in_partition_view(position_in_partition_view::end_of_partition_tag_t{});
+        }
+        return position_in_partition_view(position_in_partition_view::partition_start_tag_t{});
     }
 };
 

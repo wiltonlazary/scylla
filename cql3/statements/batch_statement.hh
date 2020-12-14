@@ -62,16 +62,42 @@ namespace statements {
  * A <code>BATCH</code> statement parsed from a CQL query.
  *
  */
-class batch_statement : public cql_statement_no_metadata {
+class batch_statement : public cql_statement_opt_metadata {
     static logging::logger _logger;
 public:
     using type = raw::batch_statement::type;
+
+    struct single_statement {
+        shared_ptr<modification_statement> statement;
+        bool needs_authorization = true;
+
+    public:
+        single_statement(shared_ptr<modification_statement> s)
+            : statement(std::move(s))
+        {}
+        single_statement(shared_ptr<modification_statement> s, bool na)
+            : statement(std::move(s))
+            , needs_authorization(na)
+        {}
+    };
 private:
     int _bound_terms;
     type _type;
-    std::vector<shared_ptr<modification_statement>> _statements;
+    std::vector<single_statement> _statements;
     std::unique_ptr<attributes> _attrs;
+    // True if *any* statement of the batch has IF .. clause. In
+    // this case entire batch is considered a CAS batch.
     bool _has_conditions;
+    // If the BATCH has conditions, it must return columns which
+    // are involved in condition expressions in its result set.
+    // Unlike Cassandra, Scylla always returns all columns,
+    // regardless of whether the batch succeeds or not - this
+    // allows clients to prepare a CAS statement like any other
+    // statement, and trust the returned statement metadata.
+    // Cassandra returns a result set only if CAS succeeds. If
+    // any statement in the batch has IF EXISTS, we must return
+    // all columns of the table, including the primary key.
+    column_set _columns_of_cas_result_set;
     cql_stats& _stats;
 public:
     /**
@@ -83,71 +109,72 @@ public:
      * @param attrs additional attributes for statement (CL, timestamp, timeToLive)
      */
     batch_statement(int bound_terms, type type_,
-                    std::vector<shared_ptr<modification_statement>> statements,
+                    std::vector<single_statement> statements,
                     std::unique_ptr<attributes> attrs,
                     cql_stats& stats);
 
     batch_statement(type type_,
-                    std::vector<shared_ptr<modification_statement>> statements,
+                    std::vector<single_statement> statements,
                     std::unique_ptr<attributes> attrs,
                     cql_stats& stats);
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
 
     virtual bool depends_on_keyspace(const sstring& ks_name) const override;
 
     virtual bool depends_on_column_family(const sstring& cf_name) const override;
 
-    virtual uint32_t get_bound_terms() override;
+    virtual uint32_t get_bound_terms() const override;
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
     // Validates a prepared batch statement without validating its nested statements.
     void validate();
 
+    bool has_conditions() const { return _has_conditions; }
+
+    void build_cas_result_set_metadata();
+
     // The batch itself will be validated in either Parsed#prepare() - for regular CQL3 batches,
     //   or in QueryProcessor.processBatch() - for native protocol batches.
-    virtual void validate(service::storage_proxy& proxy, const service::client_state& state) override;
+    virtual void validate(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    const std::vector<shared_ptr<modification_statement>>& get_statements();
+    const std::vector<single_statement>& get_statements();
 private:
-    future<std::vector<mutation>> get_mutations(service::storage_proxy& storage, const query_options& options, bool local, api::timestamp_type now, tracing::trace_state_ptr trace_state);
+    future<std::vector<mutation>> get_mutations(service::storage_proxy& storage, const query_options& options, db::timeout_clock::time_point timeout,
+            bool local, api::timestamp_type now, service::query_state& query_state) const;
 
 public:
     /**
      * Checks batch size to ensure threshold is met. If not, a warning is logged.
      * @param cfs ColumnFamilies that will store the batch's mutations.
      */
-    static void verify_batch_size(const std::vector<mutation>& mutations);
+    static void verify_batch_size(service::storage_proxy& proxy, const std::vector<mutation>& mutations);
 
     virtual future<shared_ptr<cql_transport::messages::result_message>> execute(
-            service::storage_proxy& storage, service::query_state& state, const query_options& options) override;
+            service::storage_proxy& storage, service::query_state& state, const query_options& options) const override;
 private:
     friend class batch_statement_executor;
     future<shared_ptr<cql_transport::messages::result_message>> do_execute(
             service::storage_proxy& storage,
             service::query_state& query_state, const query_options& options,
-            bool local, api::timestamp_type now);
+            bool local, api::timestamp_type now) const;
 
     future<> execute_without_conditions(
             service::storage_proxy& storage,
             std::vector<mutation> mutations,
             db::consistency_level cl,
-            tracing::trace_state_ptr tr_state);
+            db::timeout_clock::time_point timeout,
+            tracing::trace_state_ptr tr_state,
+            service_permit permit) const;
 
     future<shared_ptr<cql_transport::messages::result_message>> execute_with_conditions(
             service::storage_proxy& storage,
             const query_options& options,
-            service::query_state& state);
+            service::query_state& state) const;
 public:
-    virtual future<shared_ptr<cql_transport::messages::result_message>> execute_internal(
-            service::storage_proxy& proxy,
-            service::query_state& query_state, const query_options& options) override;
-
     // FIXME: no cql_statement::to_string() yet
 #if 0
     sstring to_string() const {
-        return sprint("BatchStatement(type=%s, statements=%s)", _type, join(", ", _statements));
+        return format("BatchStatement(type={}, statements={})", _type, join(", ", _statements));
     }
 #endif
 };

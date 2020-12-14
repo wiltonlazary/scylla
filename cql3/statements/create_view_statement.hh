@@ -30,11 +30,11 @@
 #include "service/migration_manager.hh"
 #include "schema.hh"
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 
 #include <utility>
 #include <vector>
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 
@@ -66,10 +66,10 @@ public:
     }
 
     // Functions we need to override to subclass schema_altering_statement
-    virtual future<> check_access(const service::client_state& state) override;
-    virtual void validate(service::storage_proxy&, const service::client_state& state) override;
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) override;
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
+    virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) const override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
     // FIXME: continue here. See create_table_statement.hh and CreateViewStatement.java
 };

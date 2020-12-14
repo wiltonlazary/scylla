@@ -52,7 +52,7 @@
 #include "service/migration_manager.hh"
 #include "schema.hh"
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 
 #include <unordered_map>
 #include <utility>
@@ -77,20 +77,20 @@ public:
             std::vector<::shared_ptr<index_target::raw>> raw_targets,
             ::shared_ptr<index_prop_defs> properties, bool if_not_exists);
 
-    future<> check_access(const service::client_state& state) override;
-    void validate(service::storage_proxy&, const service::client_state& state) override;
-    future<::shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy&, bool is_local_only) override;
+    future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
+    void validate(service::storage_proxy&, const service::client_state& state) const override;
+    future<::shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy&, bool is_local_only) const override;
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 private:
-    void validate_for_frozen_collection(::shared_ptr<index_target> target) const;
-    void validate_not_full_index(::shared_ptr<index_target> target) const;
+    void validate_for_local_index(const schema& schema) const;
+    void validate_for_frozen_collection(const index_target& target) const;
+    void validate_not_full_index(const index_target& target) const;
     void validate_is_values_index_if_target_column_not_collection(const column_definition* cd,
-                                                                  ::shared_ptr<index_target> target) const;
-    void validate_target_column_is_map_if_index_involves_keys(bool is_map, ::shared_ptr<index_target> target) const;
+                                                                  const index_target& target) const;
+    void validate_target_column_is_map_if_index_involves_keys(bool is_map, const index_target& target) const;
     void validate_targets_for_multi_column_index(std::vector<::shared_ptr<index_target>> targets) const;
-    static index_metadata make_index_metadata(schema_ptr schema,
-                                              const std::vector<::shared_ptr<index_target>>& targets,
+    static index_metadata make_index_metadata(const std::vector<::shared_ptr<index_target>>& targets,
                                               const sstring& name,
                                               index_metadata_kind kind,
                                               const index_options_map& options);

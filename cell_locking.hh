@@ -23,29 +23,15 @@
 
 #include <boost/intrusive/unordered_set.hpp>
 
-#if __has_include(<boost/container/small_vector.hpp>)
-
-#include <boost/container/small_vector.hpp>
-
-template <typename T, size_t N>
-using small_vector = boost::container::small_vector<T, N>;
-
-#else
-
-#include <vector>
-template <typename T, size_t N>
-using small_vector = std::vector<T>;
-
-#endif
-
-#include "fnv1a_hasher.hh"
+#include "utils/small_vector.hh"
 #include "mutation_fragment.hh"
 #include "mutation_partition.hh"
+#include "xx_hasher.hh"
 
 #include "db/timeout_clock.hh"
 
 class cells_range {
-    using ids_vector_type = small_vector<column_id, 5>;
+    using ids_vector_type = utils::small_vector<column_id, 5>;
 
     position_in_partition_view _position;
     ids_vector_type _ids;
@@ -77,12 +63,12 @@ class partition_cells_range {
 public:
     class iterator {
         const mutation_partition& _mp;
-        stdx::optional<mutation_partition::rows_type::const_iterator> _position;
+        std::optional<mutation_partition::rows_type::const_iterator> _position;
         cells_range _current;
     public:
         explicit iterator(const mutation_partition& mp)
             : _mp(mp)
-            , _current(position_in_partition_view(position_in_partition_view::static_row_tag_t()), mp.static_row())
+            , _current(position_in_partition_view(position_in_partition_view::static_row_tag_t()), mp.static_row().get())
         { }
 
         iterator(const mutation_partition& mp, mutation_partition::rows_type::const_iterator it)
@@ -208,10 +194,10 @@ private:
             explicit hasher(const schema& s) : _schema(&s) { }
 
             size_t operator()(const cell_address& ca) const {
-                fnv1a_hasher hasher;
+                xx_hasher hasher;
                 ca.position.feed_hash(hasher, *_schema);
                 ::feed_hash(hasher, ca.id);
-                return hasher.finalize();
+                return static_cast<size_t>(hasher.finalize_uint64());
             }
             size_t operator()(const cell_entry& ce) const {
                 return operator()(ce._address);

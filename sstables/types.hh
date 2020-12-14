@@ -22,13 +22,12 @@
 #pragma once
 
 #include "disk_types.hh"
-#include "core/enum.hh"
+#include <seastar/core/enum.hh>
 #include "bytes.hh"
 #include "gc_clock.hh"
 #include "tombstone.hh"
 #include "utils/streaming_histogram.hh"
 #include "utils/estimated_histogram.hh"
-#include "column_name_helper.hh"
 #include "sstables/key.hh"
 #include "db/commitlog/replay_position.hh"
 #include "version.hh"
@@ -36,6 +35,8 @@
 #include <unordered_map>
 #include <type_traits>
 #include "version.hh"
+#include "encoding_stats.hh"
+#include "utils/UUID.hh"
 
 // While the sstable code works with char, bytes_view works with int8_t
 // (signed char). Rather than change all the code, let's do a cast.
@@ -45,6 +46,12 @@ static inline bytes_view to_bytes_view(const temporary_buffer<char>& b) {
 }
 
 namespace sstables {
+
+template<typename T>
+concept Writer =
+    requires(T& wr, const char* data, size_t size) {
+        { wr.write(data, size) } -> std::same_as<void>;
+    };
 
 struct commitlog_interval {
     db::replay_position start;
@@ -73,6 +80,7 @@ struct deletion_time {
     explicit operator tombstone() {
         return !live() ? tombstone(marked_for_delete_at, gc_clock::time_point(gc_clock::duration(local_deletion_time))) : tombstone();
     }
+    friend std::ostream& operator<<(std::ostream&, const deletion_time&);
 };
 
 struct option {
@@ -110,47 +118,14 @@ enum class indexable_element {
     cell
 };
 
-class promoted_index_block {
-public:
-    promoted_index_block(temporary_buffer<char>&& start, temporary_buffer<char>&& end,
-            uint64_t offset, uint64_t width)
-        : _start(std::move(start)), _end(std::move(end))
-        , _offset(offset), _width(width)
-    {}
-    promoted_index_block(const promoted_index_block& rhs)
-        : _start(rhs._start.get(), rhs._start.size()), _end(rhs._end.get(), rhs._end.size())
-        , _offset(rhs._offset), _width(rhs._width)
-    {}
-    promoted_index_block(promoted_index_block&&) noexcept = default;
-
-    promoted_index_block& operator=(const promoted_index_block& rhs) {
-        if (this != &rhs) {
-            _start = temporary_buffer<char>(rhs._start.get(), rhs._start.size());
-            _end = temporary_buffer<char>(rhs._end.get(), rhs._end.size());
-            _offset = rhs._offset;
-            _width = rhs._width;
-        }
-        return *this;
-    }
-    promoted_index_block& operator=(promoted_index_block&&) noexcept = default;
-
-    composite_view start(const schema& s) const { return composite_view(to_bytes_view(_start), s.is_compound());}
-    composite_view end(const schema& s) const { return composite_view(to_bytes_view(_end), s.is_compound());}
-    uint64_t offset() const { return _offset; }
-    uint64_t width() const { return _width; }
-
-private:
-    temporary_buffer<char> _start;
-    temporary_buffer<char> _end;
-    uint64_t _offset;
-    uint64_t _width;
-};
-
-using promoted_index_blocks = seastar::circular_buffer<promoted_index_block>;
+inline std::ostream& operator<<(std::ostream& o, indexable_element e) {
+    o << static_cast<std::underlying_type_t<indexable_element>>(e);
+    return o;
+}
 
 class summary_entry {
 public:
-    dht::token_view token;
+    dht::token token;
     bytes_view key;
     uint64_t position;
 
@@ -269,9 +244,10 @@ struct metadata {
 template <typename T>
 uint64_t serialized_size(sstable_version_types v, const T& object);
 
-template <class T>
+template <class T, typename W>
+requires Writer<W>
 typename std::enable_if_t<!std::is_integral<T>::value && !std::is_enum<T>::value, void>
-write(sstable_version_types v, file_writer& out, const T& t);
+write(sstable_version_types v, W& out, const T& t);
 
 // serialized_size() implementation for metadata class
 template <typename Component>
@@ -294,15 +270,31 @@ struct validation_metadata : public metadata_base<validation_metadata> {
 };
 
 struct compaction_metadata : public metadata_base<compaction_metadata> {
-    disk_array<uint32_t, uint32_t> ancestors;
+    disk_array<uint32_t, uint32_t> ancestors; // DEPRECATED, not available in sstable format mc.
     disk_array<uint32_t, uint8_t> cardinality;
 
     template <typename Describer>
-    auto describe_type(sstable_version_types v, Describer f) { return f(ancestors, cardinality); }
+    auto describe_type(sstable_version_types v, Describer f) {
+        switch (v) {
+        case sstable_version_types::mc:
+        case sstable_version_types::md:
+            return f(
+                cardinality
+            );
+        case sstable_version_types::ka:
+        case sstable_version_types::la:
+            return f(
+                ancestors,
+                cardinality
+            );
+        }
+        // Should never reach here - compiler will complain if switch above does not cover all sstable versions
+        abort();
+    }
 };
 
 struct stats_metadata : public metadata_base<stats_metadata> {
-    utils::estimated_histogram estimated_row_size;
+    utils::estimated_histogram estimated_partition_size;
     utils::estimated_histogram estimated_cells_count;
     db::replay_position position;
     int64_t min_timestamp;
@@ -327,8 +319,9 @@ struct stats_metadata : public metadata_base<stats_metadata> {
     auto describe_type(sstable_version_types v, Describer f) {
         switch (v) {
         case sstable_version_types::mc:
+        case sstable_version_types::md:
             return f(
-                estimated_row_size,
+                estimated_partition_size,
                 estimated_cells_count,
                 position,
                 min_timestamp,
@@ -352,7 +345,7 @@ struct stats_metadata : public metadata_base<stats_metadata> {
         case sstable_version_types::ka:
         case sstable_version_types::la:
             return f(
-                estimated_row_size,
+                estimated_partition_size,
                 estimated_cells_count,
                 position,
                 min_timestamp,
@@ -372,14 +365,14 @@ struct stats_metadata : public metadata_base<stats_metadata> {
     }
 };
 
-using bytes_array_vint_size = disk_array_vint_size<uint32_t, bytes::value_type>;
+using bytes_array_vint_size = disk_string_vint_size;
 
 struct serialization_header : public metadata_base<serialization_header> {
-    vint<uint64_t> min_timestamp;
-    vint<uint32_t> min_local_deletion_time;
-    vint<uint32_t> min_ttl;
+    vint<uint64_t> min_timestamp_base;
+    vint<uint64_t> min_local_deletion_time_base;
+    vint<uint64_t> min_ttl_base;
     bytes_array_vint_size pk_type_name;
-    disk_array_vint_size<uint32_t, bytes_array_vint_size> clustering_key_types_names;
+    disk_array_vint_size<bytes_array_vint_size> clustering_key_types_names;
     struct column_desc {
         bytes_array_vint_size name;
         bytes_array_vint_size type_name;
@@ -391,16 +384,17 @@ struct serialization_header : public metadata_base<serialization_header> {
             );
         }
     };
-    disk_array_vint_size<uint32_t, column_desc> static_columns;
-    disk_array_vint_size<uint32_t, column_desc> regular_columns;
+    disk_array_vint_size<column_desc> static_columns;
+    disk_array_vint_size<column_desc> regular_columns;
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) {
         switch (v) {
         case sstable_version_types::mc:
+        case sstable_version_types::md:
             return f(
-                min_timestamp,
-                min_local_deletion_time,
-                min_ttl,
+                min_timestamp_base,
+                min_local_deletion_time_base,
+                min_ttl_base,
                 pk_type_name,
                 clustering_key_types_names,
                 static_columns,
@@ -413,6 +407,20 @@ struct serialization_header : public metadata_base<serialization_header> {
         }
         // Should never reach here - compiler will complain if switch above does not cover all sstable versions
         abort();
+    }
+
+    // mc serialization header minimum values are delta-encoded based on the default timestamp epoch times
+    // Note: following conversions rely on min_*_base.value being unsigned to prevent signed integer overflow
+    api::timestamp_type get_min_timestamp() const {
+        return static_cast<api::timestamp_type>(min_timestamp_base.value + encoding_stats::timestamp_epoch);
+    }
+
+    int64_t get_min_ttl() const {
+        return static_cast<int64_t>(min_ttl_base.value + encoding_stats::ttl_epoch);
+    }
+
+    int64_t get_min_local_deletion_time() const {
+        return static_cast<int64_t>(min_local_deletion_time_base.value + encoding_stats::deletion_time_epoch);
     }
 };
 
@@ -447,7 +455,11 @@ struct sharding_metadata {
 enum sstable_feature : uint8_t {
     NonCompoundPIEntries = 0,       // See #2993
     NonCompoundRangeTombstones = 1, // See #2986
-    End = 2
+    ShadowableTombstones = 2, // See #3885
+    CorrectStaticCompact = 3, // See #4139
+    CorrectEmptyCounters = 4, // See #4363
+    CorrectUDTsInCollections = 5, // See #6130
+    End = 6,
 };
 
 // Scylla-specific features enabled for a particular sstable.
@@ -464,6 +476,10 @@ struct sstable_enabled_features {
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) { return f(enabled_features); }
+
+    static sstable_enabled_features all() {
+        return sstable_enabled_features{(1 << sstable_feature::End) - 1};
+    }
 };
 
 // Numbers are found on disk, so they do matter. Also, setting their sizes of
@@ -481,20 +497,60 @@ enum class scylla_metadata_type : uint32_t {
     Sharding = 1,
     Features = 2,
     ExtensionAttributes = 3,
+    RunIdentifier = 4,
+    LargeDataStats = 5,
+};
+
+struct run_identifier {
+    // UUID is used for uniqueness across nodes, such that an imported sstable
+    // will not have its run identifier conflicted with the one of a local sstable.
+    utils::UUID id;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(id); }
+};
+
+// Types of large data statistics.
+//
+// Note: For extensibility, never reuse an identifier,
+// only add new ones, since these are stored on stable storage.
+enum class large_data_type : uint32_t {
+    partition_size = 1,     // partition size, in bytes
+    row_size = 2,           // row size, in bytes
+    cell_size = 3,          // cell size, in bytes
+    rows_in_partition = 4,  // number of rows in a partition
+};
+
+struct large_data_stats_entry {
+    uint64_t max_value;
+    uint64_t threshold;
+    uint32_t above_threshold;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(max_value, threshold, above_threshold); }
 };
 
 struct scylla_metadata {
     using extension_attributes = disk_hash<uint32_t, disk_string<uint32_t>, disk_string<uint32_t>>;
+    using large_data_stats = disk_hash<uint32_t, large_data_type, large_data_stats_entry>;
 
     disk_set_of_tagged_union<scylla_metadata_type,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Features, sstable_enabled_features>,
-            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtensionAttributes, extension_attributes>
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtensionAttributes, extension_attributes>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::RunIdentifier, run_identifier>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::LargeDataStats, large_data_stats>
             > data;
 
-    bool has_feature(sstable_feature f) const {
+    sstable_enabled_features get_features() const {
         auto features = data.get<scylla_metadata_type::Features, sstable_enabled_features>();
-        return features && features->is_enabled(f);
+        if (!features) {
+            return sstable_enabled_features{};
+        }
+        return *features;
+    }
+    bool has_feature(sstable_feature f) const {
+        return get_features().is_enabled(f);
     }
     const extension_attributes* get_extension_attributes() const {
         return data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
@@ -506,6 +562,10 @@ struct scylla_metadata {
             ext = data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
         }
         return *ext;
+    }
+    std::optional<utils::UUID> get_optional_run_identifier() const {
+        auto* m = data.get<scylla_metadata_type::RunIdentifier, run_identifier>();
+        return m ? std::make_optional(m->id) : std::nullopt;
     }
 
     template <typename Describer>
@@ -534,8 +594,35 @@ struct hash<sstables::metadata_type> : enum_hash<sstables::metadata_type> {};
 
 namespace sstables {
 
+// Special value to represent expired (i.e., 'dead') liveness info
+constexpr static int64_t expired_liveness_ttl = std::numeric_limits<int32_t>::max();
+
+inline bool is_expired_liveness_ttl(int64_t ttl) {
+    return ttl == expired_liveness_ttl;
+}
+
+inline bool is_expired_liveness_ttl(gc_clock::duration ttl) {
+    return is_expired_liveness_ttl(ttl.count());
+}
+
+// Corresponding to Cassandra's NO_DELETION_TIME
+constexpr static int64_t no_deletion_time = std::numeric_limits<int32_t>::max();
+
+// Corresponding to Cassandra's MAX_DELETION_TIME
+constexpr static int64_t max_deletion_time = std::numeric_limits<int32_t>::max() - 1;
+
+inline int32_t adjusted_local_deletion_time(gc_clock::time_point local_deletion_time, bool& capped) {
+    int64_t ldt = local_deletion_time.time_since_epoch().count();
+    if (ldt <= max_deletion_time) {
+        capped = false;
+        return static_cast<int32_t>(ldt);
+    }
+    capped = true;
+    return static_cast<int32_t>(max_deletion_time);
+}
+
 struct statistics {
-    disk_hash<uint32_t, metadata_type, uint32_t> hash;
+    disk_array<uint32_t, std::pair<metadata_type, uint32_t>> offsets; // ordered by metadata_type
     std::unordered_map<metadata_type, std::unique_ptr<metadata>> contents;
 };
 
@@ -558,12 +645,14 @@ inline column_mask operator|(column_mask m1, column_mask m2) {
 }
 
 class unfiltered_flags_m final {
-    static const uint8_t END_OF_PARTITION = 0x01u;
-    static const uint8_t IS_MARKER = 0x02u;
-    static const uint8_t HAS_TIMESTAMP = 0x04u;
-    static const uint8_t HAS_TTL = 0x08u;
-    static const uint8_t HAS_DELETION = 0x10u;
-    static const uint8_t HAS_EXTENDED_FLAGS = 0x80u;
+    static constexpr uint8_t END_OF_PARTITION = 0x01u;
+    static constexpr uint8_t IS_MARKER = 0x02u;
+    static constexpr uint8_t HAS_TIMESTAMP = 0x04u;
+    static constexpr uint8_t HAS_TTL = 0x08u;
+    static constexpr uint8_t HAS_DELETION = 0x10u;
+    static constexpr uint8_t HAS_ALL_COLUMNS = 0x20u;
+    static constexpr uint8_t HAS_COMPLEX_DELETION = 0x40u;
+    static constexpr uint8_t HAS_EXTENDED_FLAGS = 0x80u;
     uint8_t _flags;
     bool check_flag(const uint8_t flag) const {
         return (_flags & flag) != 0u;
@@ -588,10 +677,22 @@ public:
     bool has_deletion() const {
         return check_flag(HAS_DELETION);
     }
+    bool has_all_columns() const {
+        return check_flag(HAS_ALL_COLUMNS);
+    }
+    bool has_complex_deletion() const {
+        return check_flag(HAS_COMPLEX_DELETION);
+    }
 };
 
 class unfiltered_extended_flags_m final {
     static const uint8_t IS_STATIC = 0x01u;
+    // This flag is used by Cassandra but not supported by Scylla because
+    // Scylla's representation of shadowable tombstones is different.
+    // We only check it on reading and error out if set but never set ourselves.
+    static const uint8_t HAS_CASSANDRA_SHADOWABLE_DELETION = 0x02u;
+    // This flag is Scylla-specific and used for writing shadowable tombstones.
+    static const uint8_t HAS_SCYLLA_SHADOWABLE_DELETION = 0x80u;
     uint8_t _flags;
     bool check_flag(const uint8_t flag) const {
         return (_flags & flag) != 0u;
@@ -600,6 +701,41 @@ public:
     explicit unfiltered_extended_flags_m(uint8_t flags) : _flags(flags) { }
     bool is_static() const {
         return check_flag(IS_STATIC);
+    }
+    bool has_cassandra_shadowable_deletion() const {
+        return check_flag(HAS_CASSANDRA_SHADOWABLE_DELETION);
+    }
+    bool has_scylla_shadowable_deletion() const {
+        return check_flag(HAS_SCYLLA_SHADOWABLE_DELETION);
+    }
+};
+
+class column_flags_m final {
+    static const uint8_t IS_DELETED = 0x01u;
+    static const uint8_t IS_EXPIRING = 0x02u;
+    static const uint8_t HAS_EMPTY_VALUE = 0x04u;
+    static const uint8_t USE_ROW_TIMESTAMP = 0x08u;
+    static const uint8_t USE_ROW_TTL = 0x10u;
+    uint8_t _flags;
+    bool check_flag(const uint8_t flag) const {
+        return (_flags & flag) != 0u;
+    }
+public:
+    explicit column_flags_m(uint8_t flags) : _flags(flags) { }
+    bool use_row_timestamp() const {
+        return check_flag(USE_ROW_TIMESTAMP);
+    }
+    bool use_row_ttl() const {
+        return check_flag(USE_ROW_TTL);
+    }
+    bool is_deleted() const {
+        return check_flag(IS_DELETED);
+    }
+    bool is_expiring() const {
+        return check_flag(IS_EXPIRING);
+    }
+    bool has_value() const {
+        return !check_flag(HAS_EMPTY_VALUE);
     }
 };
 }

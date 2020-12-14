@@ -138,6 +138,7 @@ private:
         }
     }
     const bytes_view::value_type* read_linearize() const {
+        seastar::memory::on_alloc_point();
         if (!external()) {
             return _u.small.data;
         } else  if (!_u.ptr->next) {
@@ -202,7 +203,11 @@ public:
 
     managed_bytes(bytes_view v) : managed_bytes(initialized_later(), v.size()) {
         if (!external()) {
+            // Workaround for https://github.com/scylladb/scylla/issues/4086
+            #pragma GCC diagnostic push
+            #pragma GCC diagnostic ignored "-Warray-bounds"
             std::copy(v.begin(), v.end(), _u.small.data);
+            #pragma GCC diagnostic pop
             return;
         }
         auto p = v.data();
@@ -265,9 +270,8 @@ public:
         : _u(o._u)
     {
         if (external()) {
-            if (_u.ptr) {
-                _u.ptr->backref = &_u.ptr;
-            }
+            // _u.ptr cannot be null
+            _u.ptr->backref = &_u.ptr;
         }
         o._u.small.size = 0;
     }

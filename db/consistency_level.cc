@@ -40,12 +40,13 @@
  */
 
 #include "db/consistency_level.hh"
+#include "db/consistency_level_validations.hh"
 
 #include <boost/range/algorithm/stable_partition.hpp>
 #include <boost/range/algorithm/find.hpp>
 #include <boost/range/algorithm/transform.hpp>
 #include "exceptions/exceptions.hh"
-#include "core/sstring.hh"
+#include <seastar/core/sstring.hh>
 #include "schema.hh"
 #include "database.hh"
 #include "unimplemented.hh"
@@ -60,7 +61,8 @@ namespace db {
 logging::logger cl_logger("consistency");
 
 size_t quorum_for(const keyspace& ks) {
-    return (ks.get_replication_strategy().get_replication_factor() / 2) + 1;
+    size_t replication_factor = ks.get_replication_strategy().get_replication_factor();
+    return replication_factor ? (replication_factor / 2) + 1 : 0;
 }
 
 size_t local_quorum_for(const keyspace& ks, const sstring& dc) {
@@ -71,8 +73,8 @@ size_t local_quorum_for(const keyspace& ks, const sstring& dc) {
     if (rs.get_type() == replication_strategy_type::network_topology) {
         const network_topology_strategy* nrs =
             static_cast<const network_topology_strategy*>(&rs);
-
-        return (nrs->get_replication_factor(dc) / 2) + 1;
+        size_t replication_factor = nrs->get_replication_factor(dc);
+        return replication_factor ? (replication_factor / 2) + 1 : 0;
     }
 
     return quorum_for(ks);
@@ -253,8 +255,12 @@ filter_for_query(consistency_level cl,
     return selected_endpoints;
 }
 
-std::vector<gms::inet_address> filter_for_query(consistency_level cl, keyspace& ks, std::vector<gms::inet_address>& live_endpoints, column_family* cf) {
-    return filter_for_query(cl, ks, live_endpoints, {}, read_repair_decision::NONE, nullptr, cf);
+std::vector<gms::inet_address> filter_for_query(consistency_level cl,
+        keyspace& ks,
+        std::vector<gms::inet_address>& live_endpoints,
+        const std::vector<gms::inet_address>& preferred_endpoints,
+        column_family* cf) {
+    return filter_for_query(cl, ks, live_endpoints, preferred_endpoints, read_repair_decision::NONE, nullptr, cf);
 }
 
 bool
@@ -291,7 +297,7 @@ is_sufficient_live_nodes(consistency_level cl,
     }
 }
 
-void validate_for_read(const sstring& keyspace_name, consistency_level cl) {
+void validate_for_read(consistency_level cl) {
     switch (cl) {
         case consistency_level::ANY:
             throw exceptions::invalid_request_exception("ANY ConsistencyLevel is only supported for writes");
@@ -302,7 +308,7 @@ void validate_for_read(const sstring& keyspace_name, consistency_level cl) {
     }
 }
 
-void validate_for_write(const sstring& keyspace_name, consistency_level cl) {
+void validate_for_write(consistency_level cl) {
     switch (cl) {
         case consistency_level::SERIAL:
         case consistency_level::LOCAL_SERIAL:
@@ -312,49 +318,37 @@ void validate_for_write(const sstring& keyspace_name, consistency_level cl) {
     }
 }
 
-#if 0
-    // This is the same than validateForWrite really, but we include a slightly different error message for SERIAL/LOCAL_SERIAL
-    public void validateForCasCommit(String keyspaceName) throws InvalidRequestException
-    {
-        switch (this)
-        {
-            case EACH_QUORUM:
-                requireNetworkTopologyStrategy(keyspaceName);
-                break;
-            case SERIAL:
-            case LOCAL_SERIAL:
-                throw new InvalidRequestException(this + " is not supported as conditional update commit consistency. Use ANY if you mean \"make sure it is accepted but I don't care how many replicas commit it for non-SERIAL reads\"");
-        }
+// This is the same than validateForWrite really, but we include a slightly different error message for SERIAL/LOCAL_SERIAL
+void validate_for_cas_learn(consistency_level cl, const sstring& keyspace) {
+    switch (cl) {
+    case consistency_level::SERIAL:
+    case consistency_level::LOCAL_SERIAL:
+        throw exceptions::invalid_request_exception(format("{} is not supported as conditional update commit consistency. Use ANY if you mean \"make sure it is accepted but I don't care how many replicas commit it for non-SERIAL reads\"", cl));
+    default:
+        break;
     }
-
-    public void validateForCas() throws InvalidRequestException
-    {
-        if (!isSerialConsistency())
-            throw new InvalidRequestException("Invalid consistency for conditional update. Must be one of SERIAL or LOCAL_SERIAL");
-    }
-#endif
+}
 
 bool is_serial_consistency(consistency_level cl) {
     return cl == consistency_level::SERIAL || cl == consistency_level::LOCAL_SERIAL;
 }
 
-void validate_counter_for_write(schema_ptr s, consistency_level cl) {
+void validate_for_cas(consistency_level cl)
+{
+    if (!is_serial_consistency(cl)) {
+        throw exceptions::invalid_request_exception("Invalid consistency for conditional update. Must be one of SERIAL or LOCAL_SERIAL");
+    }
+}
+
+
+void validate_counter_for_write(const schema& s, consistency_level cl) {
     if (cl == consistency_level::ANY) {
-        throw exceptions::invalid_request_exception(sprint("Consistency level ANY is not yet supported for counter table %s", s->cf_name()));
+        throw exceptions::invalid_request_exception(format("Consistency level ANY is not yet supported for counter table {}", s.cf_name()));
     }
 
     if (is_serial_consistency(cl)) {
         throw exceptions::invalid_request_exception("Counter operations are inherently non-serializable");
     }
 }
-
-#if 0
-    private void requireNetworkTopologyStrategy(String keyspaceName) throws InvalidRequestException
-    {
-        AbstractReplicationStrategy strategy = Keyspace.open(keyspaceName).getReplicationStrategy();
-        if (!(strategy instanceof NetworkTopologyStrategy))
-            throw new InvalidRequestException(String.format("consistency level %s not compatible with replication strategy (%s)", this, strategy.getClass().getName()));
-    }
-#endif
 
 }

@@ -57,7 +57,6 @@ namespace statements {
 
 /**
  * An <code>UPDATE</code> statement parsed from a CQL query statement.
- *
  */
 class update_statement : public modification_statement {
 public:
@@ -65,15 +64,20 @@ public:
     private static final Constants.Value EMPTY = new Constants.Value(ByteBufferUtil.EMPTY_BYTE_BUFFER);
 #endif
 
-    update_statement(statement_type type, uint32_t bound_terms, schema_ptr s, std::unique_ptr<attributes> attrs, uint64_t* cql_stats_counter_ptr);
+    update_statement(
+            statement_type type,
+            uint32_t bound_terms,
+            schema_ptr s,
+            std::unique_ptr<attributes> attrs,
+            cql_stats& stats);
 private:
     virtual bool require_full_clustering_key() const override;
 
     virtual bool allow_clustering_key_slices() const override;
 
-    virtual void add_update_for_key(mutation& m, const query::clustering_range& range, const update_parameters& params, const json_cache_opt& json_cache) override;
+    virtual void add_update_for_key(mutation& m, const query::clustering_range& range, const update_parameters& params, const json_cache_opt& json_cache) const override;
 
-    virtual void execute_operations_for_key(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const json_cache_opt& json_cache);
+    virtual void execute_operations_for_key(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const json_cache_opt& json_cache) const;
 };
 
 /*
@@ -82,21 +86,30 @@ private:
  */
 class insert_prepared_json_statement : public update_statement {
     ::shared_ptr<term> _term;
+    bool _default_unset;
 public:
-    insert_prepared_json_statement(uint32_t bound_terms, schema_ptr s, std::unique_ptr<attributes> attrs, uint64_t* cql_stats_counter_ptr, ::shared_ptr<term> t)
-        : update_statement(statement_type::INSERT, bound_terms, s, std::move(attrs), cql_stats_counter_ptr), _term(t) {
-        _restrictions = ::make_shared<restrictions::statement_restrictions>(s, false);
+    insert_prepared_json_statement(
+            uint32_t bound_terms,
+            schema_ptr s,
+            std::unique_ptr<attributes> attrs,
+            cql_stats& stats,
+            ::shared_ptr<term> t, bool default_unset)
+        : update_statement(statement_type::INSERT, bound_terms, s, std::move(attrs), stats)
+        , _term(t)
+        , _default_unset(default_unset) {
+        _restrictions = restrictions::statement_restrictions(s, false);
     }
 private:
-    virtual void execute_operations_for_key(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const json_cache_opt& json_cache) override;
+    virtual void execute_operations_for_key(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const json_cache_opt& json_cache) const override;
 
-    virtual dht::partition_range_vector build_partition_keys(const query_options& options, const json_cache_opt& json_cache) override;
+    virtual dht::partition_range_vector build_partition_keys(const query_options& options, const json_cache_opt& json_cache) const override;
 
-    virtual query::clustering_row_ranges create_clustering_ranges(const query_options& options, const json_cache_opt& json_cache) override;
+    virtual query::clustering_row_ranges create_clustering_ranges(const query_options& options, const json_cache_opt& json_cache) const override;
 
-    json_cache_opt maybe_prepare_json_cache(const query_options& options) override;
+    json_cache_opt maybe_prepare_json_cache(const query_options& options) const override;
 
-    void execute_set_value(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const column_definition& column, const bytes_opt& value);
+    void execute_set_value(mutation& m, const clustering_key_prefix& prefix, const update_parameters&
+        params, const column_definition& column, const bytes_opt& value) const;
 };
 
 }

@@ -34,6 +34,7 @@ namespace query {
 
 constexpr size_t result_memory_limiter::minimum_result_size;
 constexpr size_t result_memory_limiter::maximum_result_size;
+constexpr size_t result_memory_limiter::unlimited_result_size;
 
 thread_local semaphore result_memory_tracker::_dummy { 0 };
 
@@ -51,9 +52,9 @@ std::ostream& operator<<(std::ostream& out, const partition_slice& ps) {
     if (ps._specific_ranges) {
         out << ", specific=[" << *ps._specific_ranges << "]";
     }
-    out << ", options=" << sprint("%x", ps.options.mask()); // FIXME: pretty print options
+    out << ", options=" << format("{:x}", ps.options.mask()); // FIXME: pretty print options
     out << ", cql_format=" << ps.cql_format();
-    out << ", partition_row_limit=" << ps._partition_row_limit;
+    out << ", partition_row_limit=" << ps._partition_row_limit_low_bits;
     return out << "}";
 }
 
@@ -62,7 +63,7 @@ std::ostream& operator<<(std::ostream& out, const read_command& r) {
         << "cf_id=" << r.cf_id
         << ", version=" << r.schema_version
         << ", slice=" << r.slice << ""
-        << ", limit=" << r.row_limit
+        << ", limit=" << r.get_row_limit()
         << ", timestamp=" << r.timestamp.time_since_epoch().count() << "}"
         << ", partition_limit=" << r.partition_limit << "}";
 }
@@ -71,21 +72,87 @@ std::ostream& operator<<(std::ostream& out, const specific_ranges& s) {
     return out << "{" << s._pk << " : " << join(", ", s._ranges) << "}";
 }
 
+void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, position_in_partition_view pos, bool reversed) {
+    auto cmp = [reversed, cmp = position_in_partition::composite_tri_compare(s)] (const auto& a, const auto& b) {
+        return reversed ? cmp(b, a) : cmp(a, b);
+    };
+    auto start_bound = [reversed] (const auto& range) -> position_in_partition_view {
+        return reversed ? position_in_partition_view::for_range_end(range) : position_in_partition_view::for_range_start(range);
+    };
+    auto end_bound = [reversed] (const auto& range) -> position_in_partition_view {
+        return reversed ? position_in_partition_view::for_range_start(range) : position_in_partition_view::for_range_end(range);
+    };
+
+    auto it = ranges.begin();
+    while (it != ranges.end()) {
+        if (cmp(end_bound(*it), pos) <= 0) {
+            it = ranges.erase(it);
+            continue;
+        } else if (cmp(start_bound(*it), pos) <= 0) {
+            assert(cmp(pos, end_bound(*it)) < 0);
+            auto r = reversed ?
+                clustering_range(it->start(), clustering_range::bound(pos.key(), pos.get_bound_weight() != bound_weight::before_all_prefixed)) :
+                clustering_range(clustering_range::bound(pos.key(), pos.get_bound_weight() != bound_weight::after_all_prefixed), it->end());
+            *it = std::move(r);
+        }
+        ++it;
+    }
+}
+
+void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, const clustering_key& key, bool reversed) {
+    if (key.is_full(s)) {
+        return trim_clustering_row_ranges_to(s, ranges,
+                reversed ? position_in_partition_view::before_key(key) : position_in_partition_view::after_key(key), reversed);
+    }
+    auto full_key = key;
+    clustering_key::make_full(s, full_key);
+    return trim_clustering_row_ranges_to(s, ranges,
+            reversed ? position_in_partition_view::after_key(full_key) : position_in_partition_view::before_key(full_key), reversed);
+}
+
 partition_slice::partition_slice(clustering_row_ranges row_ranges,
-    std::vector<column_id> static_columns,
-    std::vector<column_id> regular_columns,
+    query::column_id_vector static_columns,
+    query::column_id_vector regular_columns,
     option_set options,
     std::unique_ptr<specific_ranges> specific_ranges,
     cql_serialization_format cql_format,
-    uint32_t partition_row_limit)
+    uint32_t partition_row_limit_low_bits,
+    uint32_t partition_row_limit_high_bits)
     : _row_ranges(std::move(row_ranges))
     , static_columns(std::move(static_columns))
     , regular_columns(std::move(regular_columns))
     , options(options)
     , _specific_ranges(std::move(specific_ranges))
     , _cql_format(std::move(cql_format))
-    , _partition_row_limit(partition_row_limit)
+    , _partition_row_limit_low_bits(partition_row_limit_low_bits)
+    , _partition_row_limit_high_bits(partition_row_limit_high_bits)
 {}
+
+partition_slice::partition_slice(clustering_row_ranges row_ranges,
+    query::column_id_vector static_columns,
+    query::column_id_vector regular_columns,
+    option_set options,
+    std::unique_ptr<specific_ranges> specific_ranges,
+    cql_serialization_format cql_format,
+    uint64_t partition_row_limit)
+    : partition_slice(std::move(row_ranges), std::move(static_columns), std::move(regular_columns), options,
+            std::move(specific_ranges), std::move(cql_format), static_cast<uint32_t>(partition_row_limit),
+            static_cast<uint32_t>(partition_row_limit >> 32))
+{}
+
+partition_slice::partition_slice(clustering_row_ranges ranges, const schema& s, const column_set& columns, option_set options)
+    : partition_slice(ranges, query::column_id_vector{}, query::column_id_vector{}, options)
+{
+    regular_columns.reserve(columns.count());
+    for (ordinal_column_id id = columns.find_first(); id != column_set::npos; id = columns.find_next(id)) {
+        const column_definition& def = s.column_at(id);
+        if (def.is_static()) {
+            static_columns.push_back(def.id);
+        } else if (def.is_regular()) {
+            regular_columns.push_back(def.id);
+        } // else clustering or partition key column - skip, these are controlled by options
+    }
+}
 
 partition_slice::partition_slice(partition_slice&&) = default;
 
@@ -100,7 +167,7 @@ partition_slice::partition_slice(const partition_slice& s)
     , options(s.options)
     , _specific_ranges(s._specific_ranges ? std::make_unique<specific_ranges>(*s._specific_ranges) : nullptr)
     , _cql_format(s._cql_format)
-    , _partition_row_limit(s._partition_row_limit)
+    , _partition_row_limit_low_bits(s._partition_row_limit_low_bits)
 {}
 
 partition_slice::~partition_slice()
@@ -166,10 +233,12 @@ std::ostream& operator<<(std::ostream& os, const query::result::printer& p) {
 }
 
 void result::ensure_counts() {
-    if (!_partition_count || !_row_count) {
-        std::tie(_partition_count, _row_count) = result_view::do_with(*this, [this] (auto&& view) {
+    if (!_partition_count || !row_count()) {
+        uint64_t row_count;
+        std::tie(_partition_count, row_count) = result_view::do_with(*this, [this] (auto&& view) {
             return view.count_partitions_and_rows();
         });
+        set_row_count(row_count);
     }
 }
 
@@ -181,7 +250,7 @@ result::result()
     }(), short_read::no, 0, 0)
 { }
 
-static void write_partial_partition(ser::writer_of_qr_partition<bytes_ostream>&& pw, const ser::qr_partition_view& pv, uint32_t rows_to_include) {
+static void write_partial_partition(ser::writer_of_qr_partition<bytes_ostream>&& pw, const ser::qr_partition_view& pv, uint64_t rows_to_include) {
     auto key = pv.key();
     auto static_cells_wr = (key ? std::move(pw).write_key(*key) : std::move(pw).skip_key())
             .start_static_row()
@@ -196,7 +265,7 @@ static void write_partial_partition(ser::writer_of_qr_partition<bytes_ostream>&&
     auto rows = pv.rows();
     // rows.size() can be 0 is there's a single static row
     auto it = rows.begin();
-    for (uint32_t i = 0; i < std::min(rows.size(), uint64_t{rows_to_include}); ++i) {
+    for (uint64_t i = 0; i < std::min(rows.size(), rows_to_include); ++i) {
         rows_wr.add(*it++);
     }
     std::move(rows_wr).end_rows().end_qr_partition();
@@ -209,7 +278,7 @@ foreign_ptr<lw_shared_ptr<query::result>> result_merger::get() {
 
     bytes_ostream w;
     auto partitions = ser::writer_of_query_result<bytes_ostream>(w).start_partitions();
-    uint32_t row_count = 0;
+    uint64_t row_count = 0;
     short_read is_short_read;
     uint32_t partition_count = 0;
 
@@ -218,8 +287,8 @@ foreign_ptr<lw_shared_ptr<query::result>> result_merger::get() {
             for (auto&& pv : rv._v.partitions()) {
                 auto rows = pv.rows();
                 // If rows.empty(), then there's a static row, or there wouldn't be a partition
-                const uint32_t rows_in_partition = rows.size() ? : 1;
-                const uint32_t rows_to_include = std::min(_max_rows - row_count, rows_in_partition);
+                const uint64_t rows_in_partition = rows.size() ? : 1;
+                const uint64_t rows_to_include = std::min(_max_rows - row_count, rows_in_partition);
                 row_count += rows_to_include;
                 if (rows_to_include >= rows_in_partition) {
                     partitions.add(pv);

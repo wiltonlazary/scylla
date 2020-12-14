@@ -51,7 +51,7 @@ extern "C" {
 
 #include <boost/algorithm/string/join.hpp>
 #include <boost/range.hpp>
-#include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
 
 #include "auth/authenticated_user.hh"
 #include "auth/common.hh"
@@ -61,18 +61,18 @@ extern "C" {
 #include "cql3/untyped_result_set.hh"
 #include "exceptions/exceptions.hh"
 #include "log.hh"
+#include "database.hh"
 
 namespace auth {
 
-const sstring& default_authorizer_name() {
-    static const sstring name = meta::AUTH_PACKAGE_NAME + "CassandraAuthorizer";
-    return name;
+std::string_view default_authorizer::qualified_java_name() const {
+    return "org.apache.cassandra.auth.CassandraAuthorizer";
 }
 
-static const sstring ROLE_NAME = "role";
-static const sstring RESOURCE_NAME = "resource";
-static const sstring PERMISSIONS_NAME = "permissions";
-static const sstring PERMISSIONS_CF = "role_permissions";
+static constexpr std::string_view ROLE_NAME = "role";
+static constexpr std::string_view RESOURCE_NAME = "resource";
+static constexpr std::string_view PERMISSIONS_NAME = "permissions";
+static constexpr std::string_view PERMISSIONS_CF = "role_permissions";
 
 static logging::logger alogger("default_authorizer");
 
@@ -94,15 +94,16 @@ default_authorizer::~default_authorizer() {
 static const sstring legacy_table_name{"permissions"};
 
 bool default_authorizer::legacy_metadata_exists() const {
-    return _qp.db().local().has_schema(meta::AUTH_KS, legacy_table_name);
+    return _qp.db().has_schema(meta::AUTH_KS, legacy_table_name);
 }
 
 future<bool> default_authorizer::any_granted() const {
-    static const sstring query = sprint("SELECT * FROM %s.%s LIMIT 1", meta::AUTH_KS, PERMISSIONS_CF);
+    static const sstring query = format("SELECT * FROM {}.{} LIMIT 1", meta::AUTH_KS, PERMISSIONS_CF);
 
-    return _qp.process(
+    return _qp.execute_internal(
             query,
             db::consistency_level::LOCAL_ONE,
+            infinite_timeout_config,
             {},
             true).then([this](::shared_ptr<cql3::untyped_result_set> results) {
         return !results->empty();
@@ -111,11 +112,12 @@ future<bool> default_authorizer::any_granted() const {
 
 future<> default_authorizer::migrate_legacy_metadata() const {
     alogger.info("Starting migration of legacy permissions metadata.");
-    static const sstring query = sprint("SELECT * FROM %s.%s", meta::AUTH_KS, legacy_table_name);
+    static const sstring query = format("SELECT * FROM {}.{}", meta::AUTH_KS, legacy_table_name);
 
-    return _qp.process(
+    return _qp.execute_internal(
             query,
-            db::consistency_level::LOCAL_ONE).then([this](::shared_ptr<cql3::untyped_result_set> results) {
+            db::consistency_level::LOCAL_ONE,
+            infinite_timeout_config).then([this](::shared_ptr<cql3::untyped_result_set> results) {
         return do_for_each(*results, [this](const cql3::untyped_result_set_row& row) {
             return do_with(
                     row.get_as<sstring>("username"),
@@ -158,7 +160,7 @@ future<> default_authorizer::start() {
                 _migration_manager).then([this] {
             _finished = do_after_system_ready(_as, [this] {
                 return async([this] {
-                    wait_for_schema_agreement(_migration_manager, _qp.db().local()).get0();
+                    wait_for_schema_agreement(_migration_manager, _qp.db(), _as).get0();
 
                     if (legacy_metadata_exists()) {
                         if (!any_granted().get0()) {
@@ -176,7 +178,7 @@ future<> default_authorizer::start() {
 
 future<> default_authorizer::stop() {
     _as.request_abort();
-    return _finished.handle_exception_type([](const sleep_aborted&) {});
+    return _finished.handle_exception_type([](const sleep_aborted&) {}).handle_exception_type([](const abort_requested_exception&) {});
 }
 
 future<permission_set>
@@ -185,17 +187,17 @@ default_authorizer::authorize(const role_or_anonymous& maybe_role, const resourc
         return make_ready_future<permission_set>(permissions::NONE);
     }
 
-    static const sstring query = sprint(
-            "SELECT %s FROM %s.%s WHERE %s = ? AND %s = ?",
+    static const sstring query = format("SELECT {} FROM {}.{} WHERE {} = ? AND {} = ?",
             PERMISSIONS_NAME,
             meta::AUTH_KS,
             PERMISSIONS_CF,
             ROLE_NAME,
             RESOURCE_NAME);
 
-    return _qp.process(
+    return _qp.execute_internal(
             query,
             db::consistency_level::LOCAL_ONE,
+            infinite_timeout_config,
             {*maybe_role.name, r.name()}).then([](::shared_ptr<cql3::untyped_result_set> results) {
         if (results->empty()) {
             return permissions::NONE;
@@ -207,13 +209,12 @@ default_authorizer::authorize(const role_or_anonymous& maybe_role, const resourc
 
 future<>
 default_authorizer::modify(
-        stdx::string_view role_name,
+        std::string_view role_name,
         permission_set set,
         const resource& resource,
-        stdx::string_view op) const {
+        std::string_view op) const {
     return do_with(
-            sprint(
-                    "UPDATE %s.%s SET %s = %s %s ? WHERE %s = ? AND %s = ?",
+            format("UPDATE {}.{} SET {} = {} {} ? WHERE {} = ? AND {} = ?",
                     meta::AUTH_KS,
                     PERMISSIONS_CF,
                     PERMISSIONS_NAME,
@@ -222,34 +223,35 @@ default_authorizer::modify(
                     ROLE_NAME,
                     RESOURCE_NAME),
             [this, &role_name, set, &resource](const auto& query) {
-        return _qp.process(
+        return _qp.execute_internal(
                 query,
                 db::consistency_level::ONE,
+                internal_distributed_timeout_config(),
                 {permissions::to_strings(set), sstring(role_name), resource.name()}).discard_result();
     });
 }
 
 
-future<> default_authorizer::grant(stdx::string_view role_name, permission_set set, const resource& resource) const {
+future<> default_authorizer::grant(std::string_view role_name, permission_set set, const resource& resource) const {
     return modify(role_name, std::move(set), resource, "+");
 }
 
-future<> default_authorizer::revoke(stdx::string_view role_name, permission_set set, const resource& resource) const {
+future<> default_authorizer::revoke(std::string_view role_name, permission_set set, const resource& resource) const {
     return modify(role_name, std::move(set), resource, "-");
 }
 
 future<std::vector<permission_details>> default_authorizer::list_all() const {
-    static const sstring query = sprint(
-            "SELECT %s, %s, %s FROM %s.%s",
+    static const sstring query = format("SELECT {}, {}, {} FROM {}.{}",
             ROLE_NAME,
             RESOURCE_NAME,
             PERMISSIONS_NAME,
             meta::AUTH_KS,
             PERMISSIONS_CF);
 
-    return _qp.process(
+    return _qp.execute_internal(
             query,
             db::consistency_level::ONE,
+            internal_distributed_timeout_config(),
             {},
             true).then([](::shared_ptr<cql3::untyped_result_set> results) {
         std::vector<permission_details> all_details;
@@ -267,16 +269,16 @@ future<std::vector<permission_details>> default_authorizer::list_all() const {
     });
 }
 
-future<> default_authorizer::revoke_all(stdx::string_view role_name) const {
-    static const sstring query = sprint(
-            "DELETE FROM %s.%s WHERE %s = ?",
+future<> default_authorizer::revoke_all(std::string_view role_name) const {
+    static const sstring query = format("DELETE FROM {}.{} WHERE {} = ?",
             meta::AUTH_KS,
             PERMISSIONS_CF,
             ROLE_NAME);
 
-    return _qp.process(
+    return _qp.execute_internal(
             query,
             db::consistency_level::ONE,
+            internal_distributed_timeout_config(),
             {sstring(role_name)}).discard_result().handle_exception([role_name](auto ep) {
         try {
             std::rethrow_exception(ep);
@@ -287,16 +289,16 @@ future<> default_authorizer::revoke_all(stdx::string_view role_name) const {
 }
 
 future<> default_authorizer::revoke_all(const resource& resource) const {
-    static const sstring query = sprint(
-            "SELECT %s FROM %s.%s WHERE %s = ? ALLOW FILTERING",
+    static const sstring query = format("SELECT {} FROM {}.{} WHERE {} = ? ALLOW FILTERING",
             ROLE_NAME,
             meta::AUTH_KS,
             PERMISSIONS_CF,
             RESOURCE_NAME);
 
-    return _qp.process(
+    return _qp.execute_internal(
             query,
             db::consistency_level::LOCAL_ONE,
+            infinite_timeout_config,
             {resource.name()}).then_wrapped([this, resource](future<::shared_ptr<cql3::untyped_result_set>> f) {
         try {
             auto res = f.get0();
@@ -304,16 +306,16 @@ future<> default_authorizer::revoke_all(const resource& resource) const {
                     res->begin(),
                     res->end(),
                     [this, res, resource](const cql3::untyped_result_set::row& r) {
-                static const sstring query = sprint(
-                        "DELETE FROM %s.%s WHERE %s = ? AND %s = ?",
+                static const sstring query = format("DELETE FROM {}.{} WHERE {} = ? AND {} = ?",
                         meta::AUTH_KS,
                         PERMISSIONS_CF,
                         ROLE_NAME,
                         RESOURCE_NAME);
 
-                return _qp.process(
+                return _qp.execute_internal(
                         query,
                         db::consistency_level::LOCAL_ONE,
+                        infinite_timeout_config,
                         {r.get_as<sstring>(ROLE_NAME), resource.name()}).discard_result().handle_exception(
                                 [resource](auto ep) {
                     try {

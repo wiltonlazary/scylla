@@ -40,20 +40,29 @@
 #include "locator/everywhere_replication_strategy.hh"
 #include "utils/class_registrator.hh"
 #include "utils/fb_utilities.hh"
+#include "locator/token_metadata.hh"
 
 namespace locator {
 
-everywhere_replication_strategy::everywhere_replication_strategy(const sstring& keyspace_name, token_metadata& token_metadata, snitch_ptr& snitch, const std::map<sstring, sstring>& config_options) :
+everywhere_replication_strategy::everywhere_replication_strategy(const sstring& keyspace_name, const shared_token_metadata& token_metadata, snitch_ptr& snitch, const std::map<sstring, sstring>& config_options) :
         abstract_replication_strategy(keyspace_name, token_metadata, snitch, config_options, replication_strategy_type::everywhere_topology) {}
 
-std::vector<inet_address> everywhere_replication_strategy::get_natural_endpoints(const token& search_token) {
-    if (_token_metadata.sorted_tokens().empty()) {
-        return std::vector<inet_address>({utils::fb_utilities::get_broadcast_address()});
-    }
-    return calculate_natural_endpoints(search_token, _token_metadata);
+std::vector<inet_address> everywhere_replication_strategy::calculate_natural_endpoints(const token& search_token, const token_metadata& tm, can_yield) const {
+    return tm.get_all_endpoints();
 }
 
-using registry = class_registrator<abstract_replication_strategy, everywhere_replication_strategy, const sstring&, token_metadata&, snitch_ptr&, const std::map<sstring, sstring>&>;
+std::vector<inet_address> everywhere_replication_strategy::do_get_natural_endpoints(const token& search_token, const token_metadata& tm, can_yield can_yield) {
+    if (tm.sorted_tokens().empty()) {
+        return std::vector<inet_address>({utils::fb_utilities::get_broadcast_address()});
+    }
+    return calculate_natural_endpoints(search_token, tm, can_yield);
+}
+
+size_t everywhere_replication_strategy::get_replication_factor() const {
+    return _shared_token_metadata.get()->get_all_endpoints_count();
+}
+
+using registry = class_registrator<abstract_replication_strategy, everywhere_replication_strategy, const sstring&, const shared_token_metadata&, snitch_ptr&, const std::map<sstring, sstring>&>;
 static registry registrator("org.apache.cassandra.locator.EverywhereStrategy");
 static registry registrator_short_name("EverywhereStrategy");
 }

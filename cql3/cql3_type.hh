@@ -54,41 +54,42 @@ namespace cql3 {
 class ut_name;
 
 class cql3_type final {
-    sstring _name;
     data_type _type;
-    bool _native;
 public:
-    cql3_type(sstring name, data_type type, bool native = true)
-            : _name(std::move(name)), _type(std::move(type)), _native(native) {}
+    cql3_type(data_type type) : _type(std::move(type)) {}
     bool is_collection() const { return _type->is_collection(); }
     bool is_counter() const { return _type->is_counter(); }
-    bool is_native() const { return _native; }
+    bool is_native() const { return _type->is_native(); }
+    bool is_user_type() const { return _type->is_user_type(); }
     data_type get_type() const { return _type; }
-    sstring to_string() const;
+    const sstring& to_string() const { return _type->cql3_type_name(); }
 
     // For UserTypes, we need to know the current keyspace to resolve the
     // actual type used, so Raw is a "not yet prepared" CQL3Type.
     class raw {
+        virtual sstring to_string() const = 0;
+    protected:
+        bool _frozen = false;
     public:
         virtual ~raw() {}
-        bool _frozen = false;
         virtual bool supports_freezing() const = 0;
         virtual bool is_collection() const;
         virtual bool is_counter() const;
         virtual bool is_duration() const;
+        virtual bool is_user_type() const;
+        bool is_frozen() const;
         virtual bool references_user_type(const sstring&) const;
-        virtual std::experimental::optional<sstring> keyspace() const;
+        virtual std::optional<sstring> keyspace() const;
         virtual void freeze();
-        virtual shared_ptr<cql3_type> prepare_internal(const sstring& keyspace, lw_shared_ptr<user_types_metadata>) = 0;
-        virtual shared_ptr<cql3_type> prepare(database& db, const sstring& keyspace);
-        static shared_ptr<raw> from(shared_ptr<cql3_type> type);
+        virtual cql3_type prepare_internal(const sstring& keyspace, const user_types_metadata&) = 0;
+        virtual cql3_type prepare(database& db, const sstring& keyspace);
+        static shared_ptr<raw> from(cql3_type type);
         static shared_ptr<raw> user_type(ut_name name);
         static shared_ptr<raw> map(shared_ptr<raw> t1, shared_ptr<raw> t2);
         static shared_ptr<raw> list(shared_ptr<raw> t);
         static shared_ptr<raw> set(shared_ptr<raw> t);
         static shared_ptr<raw> tuple(std::vector<shared_ptr<raw>> ts);
         static shared_ptr<raw> frozen(shared_ptr<raw> t);
-        virtual sstring to_string() const = 0;
         friend std::ostream& operator<<(std::ostream& os, const raw& r);
     };
 
@@ -103,7 +104,7 @@ private:
 
 public:
     enum class kind : int8_t {
-        ASCII, BIGINT, BLOB, BOOLEAN, COUNTER, DECIMAL, DOUBLE, EMPTY, FLOAT, INT, SMALLINT, TINYINT, INET, TEXT, TIMESTAMP, UUID, VARCHAR, VARINT, TIMEUUID, DATE, TIME, DURATION
+        ASCII, BIGINT, BLOB, BOOLEAN, COUNTER, DECIMAL, DOUBLE, EMPTY, FLOAT, INT, SMALLINT, TINYINT, INET, TEXT, TIMESTAMP, UUID, VARINT, TIMEUUID, DATE, TIME, DURATION
     };
     using kind_enum = super_enum<kind,
         kind::ASCII,
@@ -122,54 +123,43 @@ public:
         kind::TEXT,
         kind::TIMESTAMP,
         kind::UUID,
-        kind::VARCHAR,
         kind::VARINT,
         kind::TIMEUUID,
         kind::DATE,
         kind::TIME,
         kind::DURATION>;
     using kind_enum_set = enum_set<kind_enum>;
-private:
-    std::experimental::optional<kind_enum_set::prepared> _kind;
-    static shared_ptr<cql3_type> make(sstring name, data_type type, kind kind_) {
-        return make_shared<cql3_type>(std::move(name), std::move(type), kind_);
-    }
-public:
-    static thread_local shared_ptr<cql3_type> ascii;
-    static thread_local shared_ptr<cql3_type> bigint;
-    static thread_local shared_ptr<cql3_type> blob;
-    static thread_local shared_ptr<cql3_type> boolean;
-    static thread_local shared_ptr<cql3_type> double_;
-    static thread_local shared_ptr<cql3_type> empty;
-    static thread_local shared_ptr<cql3_type> float_;
-    static thread_local shared_ptr<cql3_type> int_;
-    static thread_local shared_ptr<cql3_type> smallint;
-    static thread_local shared_ptr<cql3_type> text;
-    static thread_local shared_ptr<cql3_type> timestamp;
-    static thread_local shared_ptr<cql3_type> tinyint;
-    static thread_local shared_ptr<cql3_type> uuid;
-    static thread_local shared_ptr<cql3_type> varchar;
-    static thread_local shared_ptr<cql3_type> timeuuid;
-    static thread_local shared_ptr<cql3_type> date;
-    static thread_local shared_ptr<cql3_type> time;
-    static thread_local shared_ptr<cql3_type> inet;
-    static thread_local shared_ptr<cql3_type> varint;
-    static thread_local shared_ptr<cql3_type> decimal;
-    static thread_local shared_ptr<cql3_type> counter;
-    static thread_local shared_ptr<cql3_type> duration;
 
-    static const std::vector<shared_ptr<cql3_type>>& values();
+    static thread_local cql3_type ascii;
+    static thread_local cql3_type bigint;
+    static thread_local cql3_type blob;
+    static thread_local cql3_type boolean;
+    static thread_local cql3_type double_;
+    static thread_local cql3_type empty;
+    static thread_local cql3_type float_;
+    static thread_local cql3_type int_;
+    static thread_local cql3_type smallint;
+    static thread_local cql3_type text;
+    static thread_local cql3_type timestamp;
+    static thread_local cql3_type tinyint;
+    static thread_local cql3_type uuid;
+    static thread_local cql3_type timeuuid;
+    static thread_local cql3_type date;
+    static thread_local cql3_type time;
+    static thread_local cql3_type inet;
+    static thread_local cql3_type varint;
+    static thread_local cql3_type decimal;
+    static thread_local cql3_type counter;
+    static thread_local cql3_type duration;
+
+    static const std::vector<cql3_type>& values();
 public:
-    cql3_type(sstring name, data_type type, kind kind_)
-        : _name(std::move(name)), _type(std::move(type)), _native(true), _kind(kind_enum_set::prepare(kind_)) {
-    }
-    kind_enum_set::prepared get_kind() const {
-        assert(_kind);
-        return *_kind;
-    }
+    kind_enum_set::prepared get_kind() const;
 };
 
-shared_ptr<cql3_type> make_cql3_tuple_type(tuple_type t);
+inline bool operator==(const cql3_type& a, const cql3_type& b) {
+    return a.get_type() == b.get_type();
+}
 
 #if 0
     public static class Custom implements CQL3Type

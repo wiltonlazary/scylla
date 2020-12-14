@@ -20,9 +20,9 @@
  */
 
 #include "api.hh"
-#include "http/file_handler.hh"
-#include "http/transformers.hh"
-#include "http/api_docs.hh"
+#include <seastar/http/file_handler.hh>
+#include <seastar/http/transformers.hh>
+#include <seastar/http/api_docs.hh>
 #include "storage_service.hh"
 #include "commitlog.hh"
 #include "gossiper.hh"
@@ -36,10 +36,13 @@
 #include "endpoint_snitch.hh"
 #include "compaction_manager.hh"
 #include "hinted_handoff.hh"
-#include "http/exception.hh"
+#include "error_injection.hh"
+#include <seastar/http/exception.hh>
 #include "stream_manager.hh"
 #include "system.hh"
 #include "api/config.hh"
+
+logging::logger apilog("api");
 
 namespace api {
 
@@ -66,10 +69,16 @@ future<> set_server_init(http_context& ctx) {
         rb->set_api_doc(r);
         rb02->set_api_doc(r);
         rb02->register_api_file(r, "swagger20_header");
-        set_config(rb02, ctx, r);
         rb->register_function(r, "system",
                 "The system related API");
         set_system(ctx, r);
+    });
+}
+
+future<> set_server_config(http_context& ctx) {
+    auto rb02 = std::make_shared < api_registry_builder20 > (ctx.api_doc, "/v2");
+    return ctx.http_server.set_routes([&ctx, rb02](routes& r) {
+        set_config(rb02, ctx, r);
     });
 }
 
@@ -84,8 +93,40 @@ static future<> register_api(http_context& ctx, const sstring& api_name,
     });
 }
 
+future<> set_transport_controller(http_context& ctx, cql_transport::controller& ctl) {
+    return ctx.http_server.set_routes([&ctx, &ctl] (routes& r) { set_transport_controller(ctx, r, ctl); });
+}
+
+future<> unset_transport_controller(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_transport_controller(ctx, r); });
+}
+
+future<> set_rpc_controller(http_context& ctx, thrift_controller& ctl) {
+    return ctx.http_server.set_routes([&ctx, &ctl] (routes& r) { set_rpc_controller(ctx, r, ctl); });
+}
+
+future<> unset_rpc_controller(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_rpc_controller(ctx, r); });
+}
+
 future<> set_server_storage_service(http_context& ctx) {
     return register_api(ctx, "storage_service", "The storage service API", set_storage_service);
+}
+
+future<> set_server_repair(http_context& ctx, sharded<netw::messaging_service>& ms) {
+    return ctx.http_server.set_routes([&ctx, &ms] (routes& r) { set_repair(ctx, r, ms); });
+}
+
+future<> unset_server_repair(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_repair(ctx, r); });
+}
+
+future<> set_server_snapshot(http_context& ctx, sharded<db::snapshot_ctl>& snap_ctl) {
+    return ctx.http_server.set_routes([&ctx, &snap_ctl] (routes& r) { set_snapshot(ctx, r, snap_ctl); });
+}
+
+future<> unset_server_snapshot(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_snapshot(ctx, r); });
 }
 
 future<> set_server_snitch(http_context& ctx) {
@@ -102,9 +143,14 @@ future<> set_server_load_sstable(http_context& ctx) {
                 "The column family API", set_column_family);
 }
 
-future<> set_server_messaging_service(http_context& ctx) {
+future<> set_server_messaging_service(http_context& ctx, sharded<netw::messaging_service>& ms) {
     return register_api(ctx, "messaging_service",
-                "The messaging service API", set_messaging_service);
+                "The messaging service API", [&ms] (http_context& ctx, routes& r) {
+                    set_messaging_service(ctx, r, ms);
+                });
+}
+future<> unset_server_messaging_service(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_messaging_service(ctx, r); });
 }
 
 future<> set_server_storage_proxy(http_context& ctx) {
@@ -151,6 +197,9 @@ future<> set_server_done(http_context& ctx) {
         rb->register_function(r, "collectd",
                 "The collectd API");
         set_collectd(ctx, r);
+        rb->register_function(r, "error_injection",
+                "The error injection API");
+        set_error_injection(ctx, r);
     });
 }
 

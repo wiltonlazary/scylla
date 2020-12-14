@@ -23,7 +23,9 @@
 
 // database.hh
 class database;
-class column_family;
+class keyspace;
+class table;
+using column_family = table;
 class memtable_list;
 
 // mutation.hh

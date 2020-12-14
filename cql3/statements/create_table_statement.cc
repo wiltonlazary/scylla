@@ -52,7 +52,10 @@
 #include "auth/resource.hh"
 #include "auth/service.hh"
 #include "schema_builder.hh"
-#include "service/storage_service.hh"
+#include "db/extensions.hh"
+#include "database.hh"
+#include "types/user.hh"
+#include "gms/feature_service.hh"
 
 namespace cql3 {
 
@@ -62,7 +65,7 @@ create_table_statement::create_table_statement(::shared_ptr<cf_name> name,
                                                ::shared_ptr<cf_prop_defs> properties,
                                                bool if_not_exists,
                                                column_set_type static_columns,
-                                               const stdx::optional<utils::UUID>& id)
+                                               const std::optional<utils::UUID>& id)
     : schema_altering_statement{name}
     , _use_compact_storage(false)
     , _static_columns{static_columns}
@@ -72,21 +75,21 @@ create_table_statement::create_table_statement(::shared_ptr<cf_name> name,
 {
 }
 
-future<> create_table_statement::check_access(const service::client_state& state) {
+future<> create_table_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
     return state.has_keyspace_access(keyspace(), auth::permission::CREATE);
 }
 
-void create_table_statement::validate(service::storage_proxy&, const service::client_state& state) {
+void create_table_statement::validate(service::storage_proxy&, const service::client_state& state) const {
     // validated in announceMigration()
 }
 
 // Column definitions
-std::vector<column_definition> create_table_statement::get_columns()
+std::vector<column_definition> create_table_statement::get_columns() const
 {
     std::vector<column_definition> column_defs;
     for (auto&& col : _columns) {
         column_kind kind = column_kind::regular_column;
-        if (_static_columns.count(col.first)) {
+        if (_static_columns.contains(col.first)) {
             kind = column_kind::static_column;
         }
         column_defs.emplace_back(col.first->name(), col.second, kind);
@@ -94,14 +97,15 @@ std::vector<column_definition> create_table_statement::get_columns()
     return column_defs;
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) {
-    return make_ready_future<>().then([this, is_local_only, &proxy] {
-        return service::get_local_migration_manager().announce_new_column_family(get_cf_meta_data(proxy.get_db().local()), is_local_only);
+future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const {
+    auto schema = get_cf_meta_data(proxy.get_db().local());
+    return make_ready_future<>().then([this, is_local_only, schema = std::move(schema)] {
+        return service::get_local_migration_manager().announce_new_column_family(std::move(schema), is_local_only);
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();
             using namespace cql_transport;
-            return make_shared<event::schema_change>(
+            return ::make_shared<event::schema_change>(
                     event::schema_change::change_type::CREATED,
                     event::schema_change::target_type::TABLE,
                     this->keyspace(),
@@ -122,16 +126,16 @@ future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::
  * @return a CFMetaData instance corresponding to the values parsed from this statement
  * @throws InvalidRequestException on failure to validate parsed parameters
  */
-schema_ptr create_table_statement::get_cf_meta_data(const database& db) {
+schema_ptr create_table_statement::get_cf_meta_data(const database& db) const {
     schema_builder builder{keyspace(), column_family(), _id};
     apply_properties_to(builder, db);
     return builder.build(_use_compact_storage ? schema_builder::compact_storage::yes : schema_builder::compact_storage::no);
 }
 
-void create_table_statement::apply_properties_to(schema_builder& builder, const database& db) {
+void create_table_statement::apply_properties_to(schema_builder& builder, const database& db) const {
     auto&& columns = get_columns();
     for (auto&& column : columns) {
-        builder.with_column(column);
+        builder.with_column_ordered(column);
     }
 #if 0
     cfmd.defaultValidator(defaultValidator)
@@ -144,10 +148,10 @@ void create_table_statement::apply_properties_to(schema_builder& builder, const 
         addColumnMetadataFromAliases(cfmd, Collections.singletonList(valueAlias), defaultValidator, ColumnDefinition.Kind.COMPACT_VALUE);
 #endif
 
-    _properties->apply_to_builder(builder, db.get_config().extensions());
+    _properties->apply_to_builder(builder, _properties->make_schema_extensions(db.extensions()));
 }
 
-void create_table_statement::add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind)
+void create_table_statement::add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind) const
 {
     assert(aliases.size() == types.size());
     for (size_t i = 0; i < aliases.size(); i++) {
@@ -164,7 +168,7 @@ create_table_statement::prepare(database& db, cql_stats& stats) {
     abort();
 }
 
-future<> create_table_statement::grant_permissions_to_creator(const service::client_state& cs) {
+future<> create_table_statement::grant_permissions_to_creator(const service::client_state& cs) const {
     return do_with(auth::make_data_resource(keyspace(), column_family()), [&cs](const auth::resource& r) {
         return auth::grant_applicable_permissions(
                 *cs.get_auth_service(),
@@ -185,10 +189,10 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     const sstring& cf_name = _cf_name->get_column_family();
     std::regex name_regex("\\w+");
     if (!std::regex_match(std::string(cf_name), name_regex)) {
-        throw exceptions::invalid_request_exception(sprint("\"%s\" is not a valid table name (must be alphanumeric character only: [0-9A-Za-z]+)", cf_name.c_str()));
+        throw exceptions::invalid_request_exception(format("\"{}\" is not a valid table name (must be alphanumeric character only: [0-9A-Za-z]+)", cf_name.c_str()));
     }
     if (cf_name.size() > size_t(schema::NAME_LENGTH)) {
-        throw exceptions::invalid_request_exception(sprint("Table names shouldn't be more than %d characters long (got \"%s\")", schema::NAME_LENGTH, cf_name.c_str()));
+        throw exceptions::invalid_request_exception(format("Table names shouldn't be more than {:d} characters long (got \"{}\")", schema::NAME_LENGTH, cf_name.c_str()));
     }
 
     // Check for duplicate column names
@@ -196,32 +200,51 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         return e1->text() == e2->text();
     });
     if (i != _defined_names.end()) {
-        throw exceptions::invalid_request_exception(sprint("Multiple definition of identifier %s", (*i)->text()));
+        throw exceptions::invalid_request_exception(format("Multiple definition of identifier {}", (*i)->text()));
     }
 
-    _properties.validate(db.get_config().extensions());
+    _properties.validate(db, _properties.properties()->make_schema_extensions(db.extensions()));
+    const bool has_default_ttl = _properties.properties()->get_default_time_to_live() > 0;
 
     auto stmt = ::make_shared<create_table_statement>(_cf_name, _properties.properties(), _if_not_exists, _static_columns, _properties.properties()->get_id());
 
-    std::experimental::optional<std::map<bytes, data_type>> defined_multi_cell_collections;
+    std::optional<std::map<bytes, data_type>> defined_multi_cell_columns;
     for (auto&& entry : _definitions) {
         ::shared_ptr<column_identifier> id = entry.first;
-        ::shared_ptr<cql3_type> pt = entry.second->prepare(db, keyspace());
-        if (pt->is_counter() && !service::get_local_storage_service().cluster_supports_counters()) {
-            throw exceptions::invalid_request_exception("Counter support is not enabled");
+        cql3_type pt = entry.second->prepare(db, keyspace());
+
+        if (has_default_ttl && pt.is_counter()) {
+            throw exceptions::invalid_request_exception("Cannot set default_time_to_live on a table with counters");
         }
-        if (pt->is_collection() && pt->get_type()->is_multi_cell()) {
-            if (!defined_multi_cell_collections) {
-                defined_multi_cell_collections = std::map<bytes, data_type>{};
+
+        if (pt.get_type()->is_multi_cell()) {
+            if (pt.get_type()->is_user_type()) {
+                // check for multi-cell types (non-frozen UDTs or collections) inside a non-frozen UDT
+                auto type = static_cast<const user_type_impl*>(pt.get_type().get());
+                for (auto&& inner: type->all_types()) {
+                    if (inner->is_multi_cell()) {
+                        // a nested non-frozen UDT should have already been rejected when defining the type
+                        assert(inner->is_collection());
+                        throw exceptions::invalid_request_exception("Non-frozen UDTs with nested non-frozen collections are not supported");
+                    }
+                }
+
+                if (!db.features().cluster_supports_nonfrozen_udts()) {
+                    throw exceptions::invalid_request_exception("Non-frozen UDT support is not enabled");
+                }
             }
-            defined_multi_cell_collections->emplace(id->name(), pt->get_type());
+
+            if (!defined_multi_cell_columns) {
+                defined_multi_cell_columns = std::map<bytes, data_type>{};
+            }
+            defined_multi_cell_columns->emplace(id->name(), pt.get_type());
         }
-        stmt->_columns.emplace(id, pt->get_type()); // we'll remove what is not a column below
+        stmt->_columns.emplace(id, pt.get_type()); // we'll remove what is not a column below
     }
     if (_key_aliases.empty()) {
-        throw exceptions::invalid_request_exception("No PRIMARY KEY specifed (exactly one required)");
+        throw exceptions::invalid_request_exception("No PRIMARY KEY specified (exactly one required)");
     } else if (_key_aliases.size() > 1) {
-        throw exceptions::invalid_request_exception("Multiple PRIMARY KEYs specifed (exactly one required)");
+        throw exceptions::invalid_request_exception("Multiple PRIMARY KEYs specified (exactly one required)");
     }
 
     stmt->_use_compact_storage = _properties.use_compact_storage();
@@ -232,13 +255,13 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         stmt->_key_aliases.emplace_back(alias->name());
         auto t = get_type_and_remove(stmt->_columns, alias);
         if (t->is_counter()) {
-            throw exceptions::invalid_request_exception(sprint("counter type is not supported for PRIMARY KEY part %s", alias->text()));
+            throw exceptions::invalid_request_exception(format("counter type is not supported for PRIMARY KEY part {}", alias->text()));
         }
         if (t->references_duration()) {
-            throw exceptions::invalid_request_exception(sprint("duration type is not supported for PRIMARY KEY part %s", alias->text()));
+            throw exceptions::invalid_request_exception(format("duration type is not supported for PRIMARY KEY part {}", alias->text()));
         }
-        if (_static_columns.count(alias) > 0) {
-            throw exceptions::invalid_request_exception(sprint("Static column %s cannot be part of the PRIMARY KEY", alias->text()));
+        if (_static_columns.contains(alias)) {
+            throw exceptions::invalid_request_exception(format("Static column {} cannot be part of the PRIMARY KEY", alias->text()));
         }
         key_types.emplace_back(t);
     }
@@ -251,8 +274,8 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
             if (stmt->_columns.empty()) {
                 throw exceptions::invalid_request_exception("No definition found that is not part of the PRIMARY KEY");
             }
-            if (defined_multi_cell_collections) {
-                throw exceptions::invalid_request_exception("Non-frozen collection types are not supported with COMPACT STORAGE");
+            if (defined_multi_cell_columns) {
+                throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
             }
         }
         stmt->_clustering_key_types = std::vector<data_type>{};
@@ -260,20 +283,20 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         // If we use compact storage and have only one alias, it is a
         // standard "dynamic" CF, otherwise it's a composite
         if (_properties.use_compact_storage() && _column_aliases.size() == 1) {
-            if (defined_multi_cell_collections) {
-                throw exceptions::invalid_request_exception("Collection types are not supported with COMPACT STORAGE");
+            if (defined_multi_cell_columns) {
+                throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
             }
             auto alias = _column_aliases[0];
-            if (_static_columns.count(alias) > 0) {
-                throw exceptions::invalid_request_exception(sprint("Static column %s cannot be part of the PRIMARY KEY", alias->text()));
+            if (_static_columns.contains(alias)) {
+                throw exceptions::invalid_request_exception(format("Static column {} cannot be part of the PRIMARY KEY", alias->text()));
             }
             stmt->_column_aliases.emplace_back(alias->name());
             auto at = get_type_and_remove(stmt->_columns, alias);
             if (at->is_counter()) {
-                throw exceptions::invalid_request_exception(sprint("counter type is not supported for PRIMARY KEY part %s", stmt->_column_aliases[0]));
+                throw exceptions::invalid_request_exception(format("counter type is not supported for PRIMARY KEY part {}", stmt->_column_aliases[0]));
             }
             if (at->references_duration()) {
-                throw exceptions::invalid_request_exception(sprint("duration type is not supported for PRIMARY KEY part %s", stmt->_column_aliases[0]));
+                throw exceptions::invalid_request_exception(format("duration type is not supported for PRIMARY KEY part {}", stmt->_column_aliases[0]));
             }
             stmt->_clustering_key_types.emplace_back(at);
         } else {
@@ -282,20 +305,20 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
                 stmt->_column_aliases.emplace_back(t->name());
                 auto type = get_type_and_remove(stmt->_columns, t);
                 if (type->is_counter()) {
-                    throw exceptions::invalid_request_exception(sprint("counter type is not supported for PRIMARY KEY part %s", t->text()));
+                    throw exceptions::invalid_request_exception(format("counter type is not supported for PRIMARY KEY part {}", t->text()));
                 }
                 if (type->references_duration()) {
-                    throw exceptions::invalid_request_exception(sprint("duration type is not supported for PRIMARY KEY part %s", t->text()));
+                    throw exceptions::invalid_request_exception(format("duration type is not supported for PRIMARY KEY part {}", t->text()));
                 }
-                if (_static_columns.count(t) > 0) {
-                    throw exceptions::invalid_request_exception(sprint("Static column %s cannot be part of the PRIMARY KEY", t->text()));
+                if (_static_columns.contains(t)) {
+                    throw exceptions::invalid_request_exception(format("Static column {} cannot be part of the PRIMARY KEY", t->text()));
                 }
                 types.emplace_back(type);
             }
 
             if (_properties.use_compact_storage()) {
-                if (defined_multi_cell_collections) {
-                    throw exceptions::invalid_request_exception("Collection types are not supported with COMPACT STORAGE");
+                if (defined_multi_cell_columns) {
+                    throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
                 }
                 stmt->_clustering_key_types = types;
             } else {
@@ -328,7 +351,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
 #endif
         } else {
             if (stmt->_columns.size() > 1) {
-                throw exceptions::invalid_request_exception(sprint("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: %s)",
+                throw exceptions::invalid_request_exception(format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: {})",
                     ::join( ", ", stmt->_columns | boost::adaptors::map_keys)));
             }
 #if 0
@@ -365,32 +388,36 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
             auto& c = _column_aliases.at(i);
 
             if (!(*id == *c)) {
-                if (_properties.find_ordering_info(c)) {
-                    throw exceptions::invalid_request_exception(sprint("The order of columns in the CLUSTERING ORDER directive must be the one of the clustering key (%s must appear before %s)", c, id));
+                if (_properties.find_ordering_info(*c)) {
+                    throw exceptions::invalid_request_exception(format("The order of columns in the CLUSTERING ORDER directive must be the one of the clustering key ({} must appear before {})", c, id));
                 } else {
-                    throw exceptions::invalid_request_exception(sprint("Missing CLUSTERING ORDER for column %s", c));
+                    throw exceptions::invalid_request_exception(format("Missing CLUSTERING ORDER for column {}", c));
                 }
             }
             ++i;
         }
     }
 
-    return std::make_unique<prepared>(stmt);
+    return std::make_unique<prepared_statement>(stmt);
 }
 
 data_type create_table_statement::raw_statement::get_type_and_remove(column_map_type& columns, ::shared_ptr<column_identifier> t)
 {
     auto it = columns.find(t);
     if (it == columns.end()) {
-        throw exceptions::invalid_request_exception(sprint("Unknown definition %s referenced in PRIMARY KEY", t->text()));
+        throw exceptions::invalid_request_exception(format("Unknown definition {} referenced in PRIMARY KEY", t->text()));
     }
     auto type = it->second;
-    if (type->is_collection() && type->is_multi_cell()) {
-        throw exceptions::invalid_request_exception(sprint("Invalid collection type for PRIMARY KEY component %s", t->text()));
+    if (type->is_multi_cell()) {
+        if (type->is_collection()) {
+            throw exceptions::invalid_request_exception(format("Invalid non-frozen collection type for PRIMARY KEY component {}", t->text()));
+        } else {
+            throw exceptions::invalid_request_exception(format("Invalid non-frozen user-defined type for PRIMARY KEY component {}", t->text()));
+        }
     }
     columns.erase(t);
 
-    return _properties.get_reversable_type(t, type);
+    return _properties.get_reversable_type(*t, type);
 }
 
 void create_table_statement::raw_statement::add_definition(::shared_ptr<column_identifier> def, ::shared_ptr<cql3_type::raw> type, bool is_static) {

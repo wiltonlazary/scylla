@@ -41,37 +41,55 @@
 
 #pragma once
 
+#include <type_traits>
 #include "service/migration_listener.hh"
 #include "gms/endpoint_state.hh"
-#include "db/schema_tables.hh"
-#include "core/distributed.hh"
+#include <seastar/core/distributed.hh>
+#include <seastar/core/abort_source.hh>
 #include "gms/inet_address.hh"
+#include "gms/feature.hh"
 #include "message/msg_addr.hh"
 #include "utils/UUID.hh"
 #include "utils/serialized_action.hh"
 
 #include <vector>
 
+class canonical_mutation;
+class frozen_mutation;
+namespace cql3 { namespace functions { class user_function; }}
+namespace netw { class messaging_service; }
+
 namespace service {
 
-class migration_manager : public seastar::async_sharded_service<migration_manager> {
-    std::vector<migration_listener*> _listeners;
+template<typename M>
+concept MergeableMutation = std::is_same<M, canonical_mutation>::value || std::is_same<M, frozen_mutation>::value;
+
+class migration_manager : public seastar::async_sharded_service<migration_manager>,
+                            public seastar::peering_sharded_service<migration_manager> {
+private:
+    migration_notifier& _notifier;
+
     std::unordered_map<netw::msg_addr, serialized_action, netw::msg_addr::hash> _schema_pulls;
+    std::vector<gms::feature::listener_registration> _feature_listeners;
+    seastar::gate _background_tasks;
     static const std::chrono::milliseconds migration_delay;
+    gms::feature_service& _feat;
+    netw::messaging_service& _messaging;
+    seastar::abort_source _as;
 public:
-    migration_manager();
+    migration_manager(migration_notifier&, gms::feature_service&, netw::messaging_service& ms);
 
-    /// Register a migration listener on current shard.
-    void register_listener(migration_listener* listener);
-
-    /// Unregister a migration listener on current shard.
-    void unregister_listener(migration_listener* listener);
+    migration_notifier& get_notifier() { return _notifier; }
+    const migration_notifier& get_notifier() const { return _notifier; }
 
     future<> schedule_schema_pull(const gms::inet_address& endpoint, const gms::endpoint_state& state);
 
     future<> maybe_schedule_schema_pull(const utils::UUID& their_version, const gms::inet_address& endpoint);
 
-    future<> submit_migration_task(const gms::inet_address& endpoint);
+    future<> submit_migration_task(const gms::inet_address& endpoint, bool can_ignore_down_node = true);
+
+    // Makes sure that this node knows about all schema changes known by "nodes" that were made prior to this call.
+    future<> sync_schema(const database& db, const std::vector<gms::inet_address>& nodes);
 
     // Fetches schema from remote node and applies it locally.
     // Differs from submit_migration_task() in that all errors are propagated.
@@ -81,20 +99,17 @@ public:
 
     // Merge mutations received from src.
     // Keep mutations alive around whole async operation.
+    future<> merge_schema_from(netw::msg_addr src, const std::vector<canonical_mutation>& mutations);
+    // Deprecated. The canonical mutation should be used instead.
     future<> merge_schema_from(netw::msg_addr src, const std::vector<frozen_mutation>& mutations);
 
-    future<> notify_create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm);
-    future<> notify_create_column_family(const schema_ptr& cfm);
-    future<> notify_create_user_type(const user_type& type);
-    future<> notify_create_view(const view_ptr& view);
-    future<> notify_update_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm);
-    future<> notify_update_column_family(const schema_ptr& cfm, bool columns_changed);
-    future<> notify_update_user_type(const user_type& type);
-    future<> notify_update_view(const view_ptr& view, bool columns_changed);
-    future<> notify_drop_keyspace(const sstring& ks_name);
-    future<> notify_drop_column_family(const schema_ptr& cfm);
-    future<> notify_drop_user_type(const user_type& type);
-    future<> notify_drop_view(const view_ptr& view);
+    template<typename M>
+    requires MergeableMutation<M>
+    future<> merge_schema_in_background(netw::msg_addr src, const std::vector<M>& mutations) {
+        return with_gate(_background_tasks, [this, src, &mutations] {
+            return merge_schema_from(src, mutations);
+        });
+    }
 
     bool should_pull_schema_from(const gms::inet_address& endpoint);
     bool has_compatible_schema_tables_version(const gms::inet_address& endpoint);
@@ -111,13 +126,21 @@ public:
 
     future<> announce_new_column_family(schema_ptr cfm, bool announce_locally = false);
 
+    future<> announce_new_column_family(schema_ptr cfm, api::timestamp_type timestamp, bool announce_locally = false);
+
     future<> announce_new_type(user_type new_type, bool announce_locally = false);
+
+    future<> announce_new_function(shared_ptr<cql3::functions::user_function> func, bool announce_locally);
+
+    future<> announce_function_drop(shared_ptr<cql3::functions::user_function> func, bool announce_locally);
 
     future<> announce_type_update(user_type updated_type, bool announce_locally = false);
 
     future<> announce_keyspace_drop(const sstring& ks_name, bool announce_locally = false);
 
-    future<> announce_column_family_drop(const sstring& ks_name, const sstring& cf_name, bool announce_locally = false);
+    class drop_views_tag;
+    using drop_views = bool_class<drop_views_tag>;
+    future<> announce_column_family_drop(const sstring& ks_name, const sstring& cf_name, bool announce_locally = false, drop_views drop_views = drop_views::no);
 
     future<> announce_type_drop(user_type dropped_type, bool announce_locally = false);
 
@@ -135,8 +158,6 @@ public:
 
     static future<> announce(std::vector<mutation> mutations, bool announce_locally);
 
-    static future<> push_schema_mutation(const gms::inet_address& endpoint, const std::vector<mutation>& schema);
-
     // Returns a future on the local application of the schema
     static future<> announce(std::vector<mutation> schema);
 
@@ -151,7 +172,14 @@ public:
 
     void init_messaging_service();
 private:
-    void uninit_messaging_service();
+    future<> uninit_messaging_service();
+
+    static future<> include_keyspace_and_announce(
+            const keyspace_metadata& keyspace, std::vector<mutation> mutations, bool announce_locally);
+
+    static future<> do_announce_new_type(user_type new_type, bool announce_locally);
+
+    future<> push_schema_mutation(const gms::inet_address& endpoint, const std::vector<mutation>& schema);
 };
 
 extern distributed<migration_manager> _the_migration_manager;
@@ -166,16 +194,18 @@ inline migration_manager& get_local_migration_manager() {
 
 // Returns schema of given version, either from cache or from remote node identified by 'from'.
 // Doesn't affect current node's schema in any way.
-future<schema_ptr> get_schema_definition(table_schema_version, netw::msg_addr from);
+future<schema_ptr> get_schema_definition(table_schema_version, netw::msg_addr from, netw::messaging_service& ms);
 
 // Returns schema of given version, either from cache or from remote node identified by 'from'.
 // The returned schema may not be synchronized. See schema::is_synced().
 // Intended to be used in the read path.
-future<schema_ptr> get_schema_for_read(table_schema_version, netw::msg_addr from);
+future<schema_ptr> get_schema_for_read(table_schema_version, netw::msg_addr from, netw::messaging_service& ms);
 
 // Returns schema of given version, either from cache or from remote node identified by 'from'.
 // Ensures that this node is synchronized with the returned schema. See schema::is_synced().
 // Intended to be used in the write path, which relies on synchronized schema.
-future<schema_ptr> get_schema_for_write(table_schema_version, netw::msg_addr from);
+future<schema_ptr> get_schema_for_write(table_schema_version, netw::msg_addr from, netw::messaging_service& ms);
+
+future<column_mapping> get_column_mapping(utils::UUID table_id, table_schema_version v);
 
 }

@@ -39,15 +39,15 @@
 #include <boost/range/adaptor/map.hpp>
 #include "gms/failure_detector.hh"
 #include "gms/gossiper.hh"
-#include "gms/i_failure_detector.hh"
 #include "gms/i_failure_detection_event_listener.hh"
 #include "gms/endpoint_state.hh"
 #include "gms/application_state.hh"
 #include "gms/inet_address.hh"
-#include "service/storage_service.hh"
 #include "log.hh"
+#include "db/config.hh"
 #include <iostream>
 #include <chrono>
+#include "database.hh"
 
 namespace gms {
 
@@ -57,24 +57,10 @@ constexpr std::chrono::milliseconds failure_detector::DEFAULT_MAX_PAUSE;
 
 using clk = arrival_window::clk;
 
-static clk::duration get_initial_value() {
-    auto& cfg = service::get_local_storage_service().db().local().get_config();
-    return std::chrono::milliseconds(cfg.fd_initial_value_ms());
-}
-
-clk::duration arrival_window::get_max_interval() {
-    auto& cfg = service::get_local_storage_service().db().local().get_config();
-    return std::chrono::milliseconds(cfg.fd_max_interval_ms());
-}
-
-static clk::duration get_min_interval() {
-    return gossiper::INTERVAL;
-}
-
 void arrival_window::add(clk::time_point value, const gms::inet_address& ep) {
     if (_tlast > clk::time_point::min()) {
         auto inter_arrival_time = value - _tlast;
-        if (inter_arrival_time <= get_max_interval() && inter_arrival_time >= get_min_interval()) {
+        if (inter_arrival_time <= _max_interval && inter_arrival_time >= _min_interval) {
             _arrival_intervals.add(inter_arrival_time.count());
         } else  {
             logger.debug("failure_detector: Ignoring interval time of {} for {}, mean={}, size={}", inter_arrival_time.count(), ep, mean(), size());
@@ -83,7 +69,7 @@ void arrival_window::add(clk::time_point value, const gms::inet_address& ep) {
         // We use a very large initial interval since the "right" average depends on the cluster size
         // and it's better to err high (false negatives, which will be corrected by waiting a bit longer)
         // than low (false positives, which cause "flapping").
-        _arrival_intervals.add(get_initial_value().count());
+        _arrival_intervals.add(_initial.count());
     }
     _tlast = value;
 }
@@ -109,72 +95,6 @@ std::ostream& operator<<(std::ostream& os, const arrival_window& w) {
     return os;
 }
 
-sstring failure_detector::get_all_endpoint_states() {
-    std::stringstream ss;
-    for (auto& entry : get_local_gossiper().endpoint_state_map) {
-        auto& ep = entry.first;
-        auto& state = entry.second;
-        ss << ep << "\n";
-        append_endpoint_state(ss, state);
-    }
-    return sstring(ss.str());
-}
-
-std::map<sstring, sstring> failure_detector::get_simple_states() {
-    std::map<sstring, sstring> nodes_status;
-    for (auto& entry : get_local_gossiper().endpoint_state_map) {
-        auto& ep = entry.first;
-        auto& state = entry.second;
-        std::stringstream ss;
-        ss << ep;
-
-        if (state.is_alive()) {
-            nodes_status.emplace(sstring(ss.str()), "UP");
-        } else {
-            nodes_status.emplace(sstring(ss.str()), "DOWN");
-        }
-    }
-    return nodes_status;
-}
-
-int failure_detector::get_down_endpoint_count() {
-    return get_local_gossiper().endpoint_state_map.size() - get_up_endpoint_count();
-}
-
-int failure_detector::get_up_endpoint_count() {
-    return boost::count_if(get_local_gossiper().endpoint_state_map | boost::adaptors::map_values, std::mem_fn(&endpoint_state::is_alive));
-}
-
-sstring failure_detector::get_endpoint_state(sstring address) {
-    std::stringstream ss;
-    auto* eps = get_local_gossiper().get_endpoint_state_for_endpoint_ptr(inet_address(address));
-    if (eps) {
-        append_endpoint_state(ss, *eps);
-        return sstring(ss.str());
-    } else {
-        return sstring("unknown endpoint ") + address;
-    }
-}
-
-void failure_detector::append_endpoint_state(std::stringstream& ss, const endpoint_state& state) {
-    ss << "  generation:" << state.get_heart_beat_state().get_generation() << "\n";
-    ss << "  heartbeat:" << state.get_heart_beat_state().get_heart_beat_version() << "\n";
-    for (const auto& entry : state.get_application_state_map()) {
-        auto& app_state = entry.first;
-        auto& versioned_val = entry.second;
-        if (app_state == application_state::TOKENS) {
-            continue;
-        }
-        ss << "  " << app_state << ":" << versioned_val.version << ":" << versioned_val.value << "\n";
-    }
-    const auto& app_state_map = state.get_application_state_map();
-    if (app_state_map.count(application_state::TOKENS)) {
-        ss << "  TOKENS:" << app_state_map.at(application_state::TOKENS).version << ":<hidden>\n";
-    } else {
-        ss << "  TOKENS: not present" << "\n";
-    }
-}
-
 void failure_detector::set_phi_convict_threshold(double phi) {
     _phi = phi;
 }
@@ -183,17 +103,13 @@ double failure_detector::get_phi_convict_threshold() {
     return _phi;
 }
 
-bool failure_detector::is_alive(inet_address ep) {
-    return get_local_gossiper().is_alive(ep);
-}
-
 void failure_detector::report(inet_address ep) {
     logger.trace("failure_detector: reporting {}", ep);
     auto now = clk::now();
     auto it = _arrival_samples.find(ep);
     if (it == _arrival_samples.end()) {
         // avoid adding an empty ArrivalWindow to the Map
-        auto heartbeat_window = arrival_window(SAMPLE_SIZE);
+        auto heartbeat_window = arrival_window(SAMPLE_SIZE, _initial, _max_interval, gossiper::INTERVAL);
         heartbeat_window.add(now, ep);
         _arrival_samples.emplace(ep, heartbeat_window);
     } else {
@@ -265,7 +181,5 @@ std::ostream& operator<<(std::ostream& os, const failure_detector& x) {
     }
     return os;
 }
-
-distributed<failure_detector> _the_failure_detector;
 
 } // namespace gms

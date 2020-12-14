@@ -47,9 +47,9 @@
 #include "cql3/statements/raw/cf_statement.hh"
 #include "cql3/cql_statement.hh"
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 
@@ -65,7 +65,7 @@ private:
     const bool _is_column_family_level;
 
     future<::shared_ptr<messages::result_message>>
-    execute0(service::storage_proxy& proxy, service::query_state& state, const query_options& options, bool);
+    execute0(service::storage_proxy& proxy, service::query_state& state, const query_options& options, bool) const;
 protected:
     explicit schema_altering_statement(timeout_config_selector timeout_selector = &timeout_config::other_timeout);
 
@@ -77,25 +77,20 @@ protected:
      *
      * By default, this function does nothing.
      */
-    virtual future<> grant_permissions_to_creator(const service::client_state&);
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
+    virtual future<> grant_permissions_to_creator(const service::client_state&) const;
 
     virtual bool depends_on_keyspace(const sstring& ks_name) const override;
 
     virtual bool depends_on_column_family(const sstring& cf_name) const override;
 
-    virtual uint32_t get_bound_terms() override;
+    virtual uint32_t get_bound_terms() const override;
 
     virtual void prepare_keyspace(const service::client_state& state) override;
 
-    virtual future<::shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) = 0;
+    virtual future<::shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) const = 0;
 
     virtual future<::shared_ptr<messages::result_message>>
-    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) override;
-
-    virtual future<::shared_ptr<messages::result_message>>
-    execute_internal(service::storage_proxy&, service::query_state& state, const query_options& options) override;
+    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const override;
 };
 
 }

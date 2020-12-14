@@ -24,10 +24,37 @@
 #include "keys.hh"
 #include "dht/i_partitioner.hh"
 #include "clustering_bounds_comparator.hh"
+#include <boost/algorithm/string.hpp>
+#include <boost/any.hpp>
 
 std::ostream& operator<<(std::ostream& out, const partition_key& pk) {
     return out << "pk{" << to_hex(pk) << "}";
 }
+
+template<typename T>
+static std::ostream& print_key(std::ostream& out, const T& key_with_schema) {
+    const auto& [schema, key] = key_with_schema;
+    auto type_iterator = key.get_compound_type(schema)->types().begin();
+    bool first = true;
+    for (auto&& e : key.components(schema)) {
+        if (!first) {
+            out << ":";
+        }
+        first = false;
+        out << (*type_iterator)->to_string(to_bytes(e));
+        ++type_iterator;
+    }
+    return out;
+}
+
+std::ostream& operator<<(std::ostream& out, const partition_key::with_schema_wrapper& pk) {
+    return print_key(out, pk);
+}
+
+std::ostream& operator<<(std::ostream& out, const clustering_key_prefix::with_schema_wrapper& ck) {
+    return print_key(out, ck);
+}
+
 std::ostream& operator<<(std::ostream& out, const partition_key_view& pk) {
     return out << "pk{" << to_hex(pk.representation()) << "}";
 }
@@ -49,28 +76,36 @@ partition_key_view::legacy_tri_compare(const schema& s, partition_key_view o) co
 
 int
 partition_key_view::ring_order_tri_compare(const schema& s, partition_key_view k2) const {
-    auto t1 = dht::global_partitioner().get_token(s, *this);
-    auto t2 = dht::global_partitioner().get_token(s, k2);
+    auto t1 = dht::get_token(s, *this);
+    auto t2 = dht::get_token(s, k2);
     if (t1 != t2) {
         return t1 < t2 ? -1 : 1;
     }
     return legacy_tri_compare(s, k2);
 }
 
+partition_key partition_key::from_nodetool_style_string(const schema_ptr s, const sstring& key) {
+    std::vector<sstring> vec;
+    boost::split(vec, key, boost::is_any_of(":"));
+
+    auto it = std::begin(vec);
+    if (vec.size() != s->partition_key_type()->types().size()) {
+        throw std::invalid_argument("partition key '" + key + "' has mismatch number of components");
+    }
+    std::vector<bytes> r;
+    r.reserve(vec.size());
+    for (auto t : s->partition_key_type()->types()) {
+        r.emplace_back(t->from_string(*it++));
+    }
+    return partition_key::from_range(std::move(r));
+}
+
 std::ostream& operator<<(std::ostream& out, const bound_kind k) {
-    switch(k) {
+    switch (k) {
     case bound_kind::excl_end:
         return out << "excl end";
     case bound_kind::incl_start:
         return out << "incl start";
-    case bound_kind::excl_end_incl_start:
-        return out << "excl end + incl start";
-    case bound_kind::static_clustering:
-        return out << "static clustering";
-    case bound_kind ::clustering:
-        return out << "clustering";
-    case bound_kind::incl_end_excl_start:
-        return out << "incl end + excl start";
     case bound_kind::incl_end:
         return out << "incl end";
     case bound_kind::excl_start:
@@ -80,21 +115,17 @@ std::ostream& operator<<(std::ostream& out, const bound_kind k) {
 }
 
 bound_kind invert_kind(bound_kind k) {
-    switch(k) {
+    switch (k) {
     case bound_kind::excl_start: return bound_kind::incl_end;
     case bound_kind::incl_start: return bound_kind::excl_end;
     case bound_kind::excl_end:   return bound_kind::incl_start;
     case bound_kind::incl_end:   return bound_kind::excl_start;
-    case bound_kind::excl_end_incl_start:   return bound_kind::incl_end_excl_start;
-    case bound_kind::incl_end_excl_start:   return bound_kind::excl_end_incl_start;
-    case bound_kind::static_clustering:   return bound_kind::static_clustering;
-    case bound_kind::clustering:   return bound_kind::clustering;
     }
     abort();
 }
 
 int32_t weight(bound_kind k) {
-    switch(k) {
+    switch (k) {
     case bound_kind::excl_end:
         return -2;
     case bound_kind::incl_start:
@@ -103,10 +134,8 @@ int32_t weight(bound_kind k) {
         return 1;
     case bound_kind::excl_start:
         return 2;
-    default:
-        throw std::invalid_argument(sprint("weight() is not defined for bound_kind {}", k));
     }
     abort();
 }
 
-const thread_local clustering_key_prefix bound_view::empty_prefix = clustering_key::make_empty();
+const thread_local clustering_key_prefix bound_view::_empty_prefix = clustering_key::make_empty();

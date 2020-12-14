@@ -43,15 +43,29 @@
 #include <deque>
 #include <unordered_set>
 #include <seastar/util/lazy.hh>
-#include "mutation.hh"
+#include <seastar/core/weak_ptr.hh>
+#include <seastar/core/checked_ptr.hh>
 #include "utils/UUID_gen.hh"
 #include "tracing/tracing.hh"
 #include "gms/inet_address.hh"
 #include "auth/authenticated_user.hh"
+#include "db/consistency_level_type.hh"
+#include "types.hh"
+
+namespace cql3{
+class query_options;
+struct raw_value_view;
+
+namespace statements {
+class prepared_statement;
+}
+}
 
 namespace tracing {
 
 extern logging::logger trace_state_logger;
+
+using prepared_checked_weak_ptr = seastar::checked_ptr<seastar::weak_ptr<cql3::statements::prepared_statement>>;
 
 class trace_state final {
 public:
@@ -91,25 +105,15 @@ private:
     int _pending_trace_events = 0;
     shared_ptr<tracing> _local_tracing_ptr;
 
-    struct params_values {
-        std::experimental::optional<std::unordered_set<gms::inet_address>> batchlog_endpoints;
-        std::experimental::optional<api::timestamp_type> user_timestamp;
-        std::experimental::optional<sstring> query;
-        std::experimental::optional<db::consistency_level> cl;
-        std::experimental::optional<db::consistency_level> serial_cl;
-        std::experimental::optional<int32_t> page_size;
+    struct params_values;
+    struct params_values_deleter {
+        void operator()(params_values* pv);
     };
 
     class params_ptr {
     private:
-        std::unique_ptr<params_values> _vals;
-
-        params_values* get_ptr_safe() {
-            if (!_vals) {
-                _vals = std::make_unique<params_values>();
-            }
-            return _vals.get();
-        }
+        std::unique_ptr<params_values, params_values_deleter> _vals;
+        params_values* get_ptr_safe();
 
     public:
         explicit operator bool() const {
@@ -161,14 +165,6 @@ public:
     }
 
     ~trace_state();
-
-    /**
-     * Stop a foreground state and write pending records to I/O.
-     *
-     * @note The tracing session's "duration" is the time it was in the "foreground"
-     * state.
-     */
-    void stop_foreground_and_write() noexcept;
 
     const utils::UUID& session_id() const {
         return _records->session_id;
@@ -228,11 +224,18 @@ public:
     }
 
 private:
+    /**
+     * Stop a foreground state and write pending records to I/O.
+     *
+     * @note The tracing session's "duration" is the time it was in the "foreground" state.
+     */
+    void stop_foreground_and_write() noexcept;
+
     bool should_log_slow_query(elapsed_clock::duration e) const {
         return log_slow_query() && e > _slow_query_threshold;
     }
 
-    void init_session_records(trace_type type, std::chrono::seconds slow_query_ttl, std::experimental::optional<utils::UUID> session_id = std::experimental::nullopt, span_id parent_id = span_id::illegal_id) {
+    void init_session_records(trace_type type, std::chrono::seconds slow_query_ttl, std::optional<utils::UUID> session_id = std::nullopt, span_id parent_id = span_id::illegal_id) {
         _records = make_lw_shared<one_session_records>();
         _records->session_id = session_id ? *session_id : utils::UUID_gen::get_time_UUID();
 
@@ -270,9 +273,9 @@ private:
      * This overload is meant for secondary sessions.
      */
     void begin() {
-        std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
         _start = elapsed_clock::now();
-        std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
         set_state(state::foreground);
     }
 
@@ -305,9 +308,7 @@ private:
      *
      * @param val the set of batchlog endpoints
      */
-    void set_batchlog_endpoints(const std::unordered_set<gms::inet_address>& val) {
-        _params_ptr->batchlog_endpoints.emplace(val);
-    }
+    void set_batchlog_endpoints(const std::unordered_set<gms::inet_address>& val);
 
     /**
      * Stores a consistency level of a query being traced.
@@ -317,9 +318,7 @@ private:
      *
      * @param val the consistency level
      */
-    void set_consistency_level(db::consistency_level val) {
-        _params_ptr->cl.emplace(val);
-    }
+    void set_consistency_level(db::consistency_level val);
 
     /**
      * Stores an optional serial consistency level of a query being traced.
@@ -329,11 +328,17 @@ private:
      *
      * @param val the optional value with a serial consistency level
      */
-    void set_optional_serial_consistency_level(const std::experimental::optional<db::consistency_level>& val) {
-        if (val) {
-            _params_ptr->serial_cl.emplace(*val);
-        }
-    }
+    void set_optional_serial_consistency_level(const std::optional<db::consistency_level>& val);
+
+    /**
+     * Returns the string with the representation of the given raw value.
+     * If the value is NULL or unset the 'null' or 'unset value' strings are returned correspondingly.
+     *
+     * @param v view of the given raw value
+     * @param t type object corresponding to the given raw value.
+     * @return the string with the representation of the given raw value.
+     */
+    sstring raw_value_to_sstring(const cql3::raw_value_view& v, const data_type& t);
 
     /**
      * Stores a page size of a query being traced.
@@ -343,11 +348,21 @@ private:
      *
      * @param val the PAGE size
      */
-    void set_page_size(int32_t val) {
-        if (val > 0) {
-            _params_ptr->page_size.emplace(val);
-        }
-    }
+    void set_page_size(int32_t val);
+
+    /**
+     * Set a size of the request being traces.
+     *
+     * @param s a request size
+     */
+    void set_request_size(size_t s) noexcept;
+
+    /**
+     * Set a size of the response of the query being traces.
+     *
+     * @param s a response size
+     */
+    void set_response_size(size_t s) noexcept;
 
     /**
      * Store a query string.
@@ -357,9 +372,7 @@ private:
      *
      * @param val the query string
      */
-    void set_query(const sstring& val) {
-        _params_ptr->query.emplace(val);
-    }
+    void add_query(sstring_view val);
 
     /**
      * Store a user provided timestamp.
@@ -369,13 +382,20 @@ private:
      *
      * @param val the timestamp
      */
-    void set_user_timestamp(api::timestamp_type val) {
-        _params_ptr->user_timestamp.emplace(val);
-    }
+    void set_user_timestamp(api::timestamp_type val);
 
-    void set_username(const stdx::optional<auth::authenticated_user>& user) {
+    /**
+     * Store a pointer to a prepared statement that is being traced.
+     *
+     * There may be more than one prepared statement that is traced in case of a BATCH command.
+     *
+     * @param prepared a checked weak pointer to a prepared statement
+     */
+    void add_prepared_statement(prepared_checked_weak_ptr& prepared);
+
+    void set_username(const std::optional<auth::authenticated_user>& user) {
         if (user) {
-            _records->session_rec.username = sprint("%s", *user);
+            _records->session_rec.username = format("{}", *user);
         }
     }
 
@@ -386,9 +406,30 @@ private:
     /**
      * Fill the map in a session's record with the values set so far.
      *
-     * @param params_map the map to fill
      */
     void build_parameters_map();
+
+    /**
+     * Store prepared statement parameters for traced query
+     *
+     * @param prepared_options_ptr parameters of the prepared statement
+     */
+    void add_prepared_query_options(const cql3::query_options& prepared_options_ptr);
+
+    /**
+     * Fill the map in a session's record with the parameters' values of a single prepared statement.
+     *
+     * Parameters values will be stored with a key '@ref param_name_prefix[X]' where X is an index of the corresponding
+     * parameter.
+     *
+     * @param prepared prepared statement handle
+     * @param names_opt CQL cell names used in the current invocation of the prepared statement
+     * @param values CQL value used in the current invocation of the prepared statement
+     * @param param_name_prefix prefix of the parameter key in the map, e.g. "param" or "param[1]"
+     */
+    void build_parameters_map_for_one_prepared(const prepared_checked_weak_ptr& prepared_ptr,
+            std::optional<std::vector<sstring_view>>& names_opt,
+            std::vector<cql3::raw_value_view>& values, const sstring& param_name_prefix);
 
     /**
      * The actual trace message storing method.
@@ -445,13 +486,45 @@ private:
     friend void trace(const trace_state_ptr& p, A&&... a) noexcept;
 
     friend void set_page_size(const trace_state_ptr& p, int32_t val);
+    friend void set_request_size(const trace_state_ptr& p, size_t s) noexcept;
+    friend void set_response_size(const trace_state_ptr& p, size_t s) noexcept;
     friend void set_batchlog_endpoints(const trace_state_ptr& p, const std::unordered_set<gms::inet_address>& val);
     friend void set_consistency_level(const trace_state_ptr& p, db::consistency_level val);
-    friend void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::experimental::optional<db::consistency_level>&val);
-    friend void set_query(const trace_state_ptr& p, const sstring& val);
+    friend void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::optional<db::consistency_level>&val);
+    friend void add_query(const trace_state_ptr& p, sstring_view val);
     friend void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val);
-    friend void set_username(const trace_state_ptr& p, const stdx::optional<auth::authenticated_user>& user);
+    friend void add_prepared_statement(const trace_state_ptr& p, prepared_checked_weak_ptr& prepared);
+    friend void set_username(const trace_state_ptr& p, const std::optional<auth::authenticated_user>& user);
     friend void add_table_name(const trace_state_ptr& p, const sstring& ks_name, const sstring& cf_name);
+    friend void add_prepared_query_options(const trace_state_ptr& state, const cql3::query_options& prepared_options_ptr);
+    friend void stop_foreground(const trace_state_ptr& state) noexcept;
+    friend void stop_foreground_prepared(const trace_state_ptr& state, const cql3::query_options* prepared_options_ptr) noexcept;
+};
+
+class trace_state_ptr final {
+private:
+    lw_shared_ptr<trace_state> _state_ptr;
+
+public:
+    trace_state_ptr() = default;
+    trace_state_ptr(lw_shared_ptr<trace_state> state_ptr)
+        : _state_ptr(std::move(state_ptr))
+    {}
+    trace_state_ptr(std::nullptr_t)
+        : _state_ptr(nullptr)
+    {}
+
+    explicit operator bool() const noexcept {
+        return __builtin_expect(bool(_state_ptr), false);
+    }
+
+    trace_state* operator->() const noexcept {
+        return _state_ptr.get();
+    }
+
+    trace_state& operator*() const noexcept {
+        return *_state_ptr;
+    }
 };
 
 inline void trace_state::trace_internal(sstring message) {
@@ -511,9 +584,9 @@ void trace_state::trace(const char* fmt, A&&... a) noexcept {
 
 inline elapsed_clock::duration trace_state::elapsed() {
     using namespace std::chrono;
-    std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     elapsed_clock::duration elapsed = elapsed_clock::now() - _start;
-    std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 
     return elapsed;
 }
@@ -521,6 +594,18 @@ inline elapsed_clock::duration trace_state::elapsed() {
 inline void set_page_size(const trace_state_ptr& p, int32_t val) {
     if (p) {
         p->set_page_size(val);
+    }
+}
+
+inline void set_request_size(const trace_state_ptr& p, size_t s) noexcept {
+    if (p) {
+        p->set_request_size(s);
+    }
+}
+
+inline void set_response_size(const trace_state_ptr& p, size_t s) noexcept {
+    if (p) {
+        p->set_response_size(s);
     }
 }
 
@@ -536,15 +621,15 @@ inline void set_consistency_level(const trace_state_ptr& p, db::consistency_leve
     }
 }
 
-inline void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::experimental::optional<db::consistency_level>& val) {
+inline void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::optional<db::consistency_level>& val) {
     if (p) {
         p->set_optional_serial_consistency_level(val);
     }
 }
 
-inline void set_query(const trace_state_ptr& p, const sstring& val) {
+inline void add_query(const trace_state_ptr& p, sstring_view val) {
     if (p) {
-        p->set_query(val);
+        p->add_query(std::move(val));
     }
 }
 
@@ -554,7 +639,13 @@ inline void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val
     }
 }
 
-inline void set_username(const trace_state_ptr& p, const stdx::optional<auth::authenticated_user>& user) {
+inline void add_prepared_statement(const trace_state_ptr& p, prepared_checked_weak_ptr& prepared) {
+    if (p) {
+        p->add_prepared_statement(prepared);
+    }
+}
+
+inline void set_username(const trace_state_ptr& p, const std::optional<auth::authenticated_user>& user) {
     if (p) {
         p->set_username(user);
     }
@@ -615,7 +706,7 @@ inline void trace(const trace_state_ptr& p, A&&... a) noexcept {
     }
 }
 
-inline std::experimental::optional<trace_info> make_trace_info(const trace_state_ptr& state) {
+inline std::optional<trace_info> make_trace_info(const trace_state_ptr& state) {
     // We want to trace the remote replicas' operations only when a full tracing
     // is requested or when a slow query logging is enabled and the session is
     // still active.
@@ -627,12 +718,18 @@ inline std::experimental::optional<trace_info> make_trace_info(const trace_state
         return trace_info{state->session_id(), state->type(), state->write_on_close(), state->raw_props(), state->slow_query_threshold_us(), state->slow_query_ttl_sec(), state->my_span_id()};
     }
 
-    return std::experimental::nullopt;
+    return std::nullopt;
 }
 
 inline void stop_foreground(const trace_state_ptr& state) noexcept {
     if (state) {
         state->stop_foreground_and_write();
+    }
+}
+
+inline void add_prepared_query_options(const trace_state_ptr& state, const cql3::query_options& prepared_options_ptr) {
+    if (state) {
+        state->add_prepared_query_options(prepared_options_ptr);
     }
 }
 
@@ -653,7 +750,7 @@ class global_trace_state_ptr {
 public:
     // Note: the trace_state_ptr must come from the current shard
     global_trace_state_ptr(trace_state_ptr t)
-            : _cpu_of_origin(engine().cpu_id())
+            : _cpu_of_origin(this_shard_id())
             , _ptr(std::move(t))
     { }
 
@@ -676,7 +773,7 @@ public:
             return nullptr;
         }
 
-        if (_cpu_of_origin != engine().cpu_id()) {
+        if (_cpu_of_origin != this_shard_id()) {
             auto opt_trace_info = make_trace_info(_ptr);
             if (opt_trace_info) {
                 trace_state_ptr new_trace_state = tracing::get_local_tracing_instance().create_session(*opt_trace_info);

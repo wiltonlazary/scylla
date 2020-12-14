@@ -23,30 +23,31 @@
 #include <vector>
 #include <typeinfo>
 #include <limits>
-#include "core/future.hh"
-#include "core/future-util.hh"
-#include "core/sstring.hh"
-#include "core/fstream.hh"
-#include "core/shared_ptr.hh"
-#include "core/do_with.hh"
-#include "core/thread.hh"
+#include <seastar/core/future.hh>
+#include <seastar/core/future-util.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/shared_ptr_incomplete.hh>
+#include <seastar/core/do_with.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/byteorder.hh>
+#include <seastar/core/aligned_buffer.hh>
 #include <iterator>
 
+#include "dht/sharder.hh"
 #include "types.hh"
-#include "m_format_write_helpers.hh"
+#include "writer.hh"
 #include "m_format_read_helpers.hh"
 #include "sstables.hh"
 #include "progress_monitor.hh"
 #include "compress.hh"
 #include "unimplemented.hh"
 #include "index_reader.hh"
-#include "remove.hh"
 #include "memtable.hh"
 #include "range.hh"
 #include "downsampling.hh"
-#include <boost/filesystem/operations.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/transformed.hpp>
@@ -55,20 +56,27 @@
 #include <boost/range/algorithm/set_algorithm.hpp>
 #include <boost/range/algorithm_ext/is_sorted.hpp>
 #include <regex>
-#include <core/align.hh>
+#include <seastar/core/align.hh>
 #include "range_tombstone_list.hh"
 #include "counters.hh"
 #include "binary_search.hh"
 #include "utils/bloom_filter.hh"
-
+#include "utils/memory_data_sink.hh"
+#include "utils/cached_file.hh"
 #include "checked-file-impl.hh"
 #include "integrity_checked_file_impl.hh"
-#include "service/storage_service.hh"
 #include "db/extensions.hh"
 #include "unimplemented.hh"
 #include "vint-serialization.hh"
-#include "db/large_partition_handler.hh"
+#include "db/large_data_handler.hh"
+#include "db/config.hh"
 #include "sstables/random_access_reader.hh"
+#include "sstables/sstables_manager.hh"
+#include "utils/UUID_gen.hh"
+#include "database.hh"
+#include "sstables_manager.hh"
+#include <boost/algorithm/string/predicate.hpp>
+#include "tracing/traced_file.hh"
 
 thread_local disk_error_signal_type sstable_read_error;
 thread_local disk_error_signal_type sstable_write_error;
@@ -77,10 +85,28 @@ namespace sstables {
 
 logging::logger sstlog("sstable");
 
-static const db::config& get_config();
+bool use_binary_search_in_promoted_index = true;
+
+namespace bi = boost::intrusive;
+
+class sstable_tracker {
+    bi::list<sstable,
+        bi::member_hook<sstable, sstable::tracker_link_type, &sstable::_tracker_link>,
+        bi::constant_time_size<false>> _sstables;
+public:
+    void add(sstable& sst) {
+        _sstables.push_back(sst);
+    }
+};
+
+static thread_local sstable_tracker tracker;
 
 // Because this is a noop and won't hold any state, it is better to use a global than a
 // thread_local. It will be faster, specially on non-x86.
+struct noop_write_monitor final : public write_monitor {
+    virtual void on_write_started(const writer_offset_tracker&) { };
+    virtual void on_data_write_completed() override { }
+};
 static noop_write_monitor default_noop_write_monitor;
 write_monitor& default_write_monitor() {
     return default_noop_write_monitor;
@@ -96,52 +122,65 @@ read_monitor_generator& default_read_monitor_generator() {
     return noop_read_monitor_generator;
 }
 
-static future<file> open_sstable_component_file(const io_error_handler& error_handler, sstring name, open_flags flags,
-        file_open_options options) {
-    if (flags != open_flags::ro && get_config().enable_sstable_data_integrity_check()) {
-        return open_integrity_checked_file_dma(name, flags, options).then([&error_handler] (auto f) {
-            return make_checked_file(error_handler, std::move(f));
+static future<file> open_sstable_component_file_non_checked(std::string_view name, open_flags flags, file_open_options options,
+        bool check_integrity) noexcept {
+    if (flags != open_flags::ro && check_integrity) {
+        return open_integrity_checked_file_dma(name, flags, options);
+    }
+    return open_file_dma(name, flags, options);
+}
+
+future<> sstable::rename_new_sstable_component_file(sstring from_name, sstring to_name) {
+    return sstable_write_io_check(rename_file, from_name, to_name).handle_exception([from_name, to_name] (std::exception_ptr ep) {
+        sstlog.error("Could not rename SSTable component {} to {}. Found exception: {}", from_name, to_name, ep);
+        return make_exception_future<>(ep);
+    });
+}
+
+future<file> sstable::new_sstable_component_file(const io_error_handler& error_handler, component_type type, open_flags flags, file_open_options options) noexcept {
+  try {
+    auto create_flags = open_flags::create | open_flags::exclusive;
+    auto readonly = (flags & create_flags) != create_flags;
+    auto name = !readonly && _temp_dir ? temp_filename(type) : filename(type);
+
+    auto f = open_sstable_component_file_non_checked(name, flags, options,
+                    _manager.config().enable_sstable_data_integrity_check());
+
+    if (type != component_type::TOC && type != component_type::TemporaryTOC) {
+        for (auto * ext : _manager.config().extensions().sstable_file_io_extensions()) {
+            f = with_file_close_on_failure(std::move(f), [ext, this, type, flags] (file f) {
+               return ext->wrap_file(*this, type, f, flags).then([f](file nf) mutable {
+                   return nf ? nf : std::move(f);
+               });
+            });
+        }
+    }
+
+    f = with_file_close_on_failure(std::move(f), [&error_handler] (file f) {
+        return make_checked_file(error_handler, std::move(f));
+    });
+
+    if (!readonly) {
+        f = with_file_close_on_failure(std::move(f).handle_exception([name] (auto ep) {
+            sstlog.error("Could not create SSTable component {}. Found exception: {}", name, ep);
+            return make_exception_future<file>(ep);
+        }), [this, type, name = std::move(name)] (file fd) mutable {
+            return rename_new_sstable_component_file(name, filename(type)).then([fd = std::move(fd)] () mutable {
+                return make_ready_future<file>(std::move(fd));
+            });
         });
     }
-    return open_checked_file_dma(error_handler, name, flags, options);
-}
-
-future<file> new_sstable_component_file(const io_error_handler& error_handler, sstring name, open_flags flags,
-        file_open_options options = {}) {
-    return open_sstable_component_file(error_handler, name, flags, options).handle_exception([name] (auto ep) {
-        sstlog.error("Could not create SSTable component {}. Found exception: {}", name, ep);
-        return make_exception_future<file>(ep);
-    });
-}
-
-utils::phased_barrier& background_jobs() {
-    static thread_local utils::phased_barrier gate;
-    return gate;
-}
-
-future<> await_background_jobs() {
-    sstlog.debug("Waiting for background jobs");
-    return background_jobs().advance_and_await().finally([] {
-        sstlog.debug("Waiting done");
-    });
-}
-
-future<> await_background_jobs_on_all_shards() {
-    return smp::invoke_on_all([] {
-        return await_background_jobs();
-    });
-}
-
-shared_sstable
-make_sstable(schema_ptr schema, sstring dir, int64_t generation, sstable_version_types v, sstable_format_types f, gc_clock::time_point now,
-            io_error_handler_gen error_handler_gen, size_t buffer_size) {
-    return make_lw_shared<sstable>(std::move(schema), std::move(dir), generation, v, f, now, std::move(error_handler_gen), buffer_size);
+    return f;
+  } catch (...) {
+      return current_exception_as_future<file>();
+  }
 }
 
 std::unordered_map<sstable::version_types, sstring, enum_hash<sstable::version_types>> sstable::_version_string = {
     { sstable::version_types::ka , "ka" },
     { sstable::version_types::la , "la" },
     { sstable::version_types::mc , "mc" },
+    { sstable::version_types::md , "md" },
 };
 
 std::unordered_map<sstable::format_types, sstring, enum_hash<sstable::format_types>> sstable::_format_string = {
@@ -174,15 +213,6 @@ static void check_buf_size(temporary_buffer<char>& buf, size_t expected) {
     }
 }
 
-template <typename T, typename U>
-static void check_truncate_and_assign(T& to, const U from) {
-    static_assert(std::is_integral<T>::value && std::is_integral<U>::value, "T and U must be integral");
-    to = from;
-    if (to != from) {
-        throw std::overflow_error("assigning U to T caused an overflow");
-    }
-}
-
 // Base parser, parses an integer type
 template <typename T>
 typename std::enable_if_t<std::is_integral<T>::value, void>
@@ -193,7 +223,7 @@ read_integer(temporary_buffer<char>& buf, T& i) {
 
 template <typename T>
 typename std::enable_if_t<std::is_integral<T>::value, future<>>
-parse(sstable_version_types v, random_access_reader& in, T& i) {
+parse(const schema&, sstable_version_types v, random_access_reader& in, T& i) {
     return in.read_exactly(sizeof(T)).then([&i] (auto buf) {
         check_buf_size(buf, sizeof(T));
 
@@ -202,33 +232,15 @@ parse(sstable_version_types v, random_access_reader& in, T& i) {
     });
 }
 
-template <typename T>
-inline typename std::enable_if_t<std::is_integral<T>::value, void>
-write(sstable_version_types v, file_writer& out, T i) {
-    auto *nr = reinterpret_cast<const net::packed<T> *>(&i);
-    i = net::hton(*nr);
-    auto p = reinterpret_cast<const char*>(&i);
-    out.write(p, sizeof(T)).get();
-}
 
 template <typename T>
 typename std::enable_if_t<std::is_enum<T>::value, future<>>
-parse(sstable_version_types v, random_access_reader& in, T& i) {
-    return parse(v, in, reinterpret_cast<typename std::underlying_type<T>::type&>(i));
+parse(const schema& s, sstable_version_types v, random_access_reader& in, T& i) {
+    return parse(s, v, in, reinterpret_cast<typename std::underlying_type<T>::type&>(i));
 }
 
-template <typename T>
-inline typename std::enable_if_t<std::is_enum<T>::value, void>
-write(sstable_version_types v, file_writer& out, T i) {
-    write(v, out, static_cast<typename std::underlying_type<T>::type>(i));
-}
-
-future<> parse(sstable_version_types v, random_access_reader& in, bool& i) {
-    return parse(v, in, reinterpret_cast<uint8_t&>(i));
-}
-
-inline void write(sstable_version_types v, file_writer& out, bool i) {
-    write(v, out, static_cast<uint8_t>(i));
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, bool& i) {
+    return parse(s, v, in, reinterpret_cast<uint8_t&>(i));
 }
 
 template <typename To, typename From>
@@ -243,7 +255,7 @@ static inline To convert(From f) {
     return conv.to;
 }
 
-future<> parse(sstable_version_types, random_access_reader& in, double& d) {
+future<> parse(const schema&, sstable_version_types, random_access_reader& in, double& d) {
     return in.read_exactly(sizeof(double)).then([&d] (auto buf) {
         check_buf_size(buf, sizeof(double));
 
@@ -253,15 +265,8 @@ future<> parse(sstable_version_types, random_access_reader& in, double& d) {
     });
 }
 
-inline void write(sstable_version_types v, file_writer& out, double d) {
-    auto *nr = reinterpret_cast<const net::packed<unsigned long> *>(&d);
-    auto tmp = net::hton(*nr);
-    auto p = reinterpret_cast<const char*>(&tmp);
-    out.write(p, sizeof(unsigned long)).get();
-}
-
 template <typename T>
-future<> parse(sstable_version_types, random_access_reader& in, T& len, bytes& s) {
+future<> parse(const schema&, sstable_version_types, random_access_reader& in, T& len, bytes& s) {
     return in.read_exactly(len).then([&s, len] (auto buf) {
         check_buf_size(buf, len);
         // Likely a different type of char. Most bufs are unsigned, whereas the bytes type is signed.
@@ -269,60 +274,38 @@ future<> parse(sstable_version_types, random_access_reader& in, T& len, bytes& s
     });
 }
 
-inline void write(sstable_version_types v, file_writer& out, const bytes& s) {
-    out.write(s).get();
-}
-
-inline void write(sstable_version_types v, file_writer& out, bytes_view s) {
-    out.write(reinterpret_cast<const char*>(s.data()), s.size()).get();
-}
-
-inline void write(sstable_version_types v, file_writer& out, bytes_ostream s) {
-    for (bytes_view fragment : s) {
-        write(v, out, fragment);
-    }
-}
-
 // All composite parsers must come after this
 template<typename First, typename... Rest>
-future<> parse(sstable_version_types v, random_access_reader& in, First& first, Rest&&... rest) {
-    return parse(v, in, first).then([v, &in, &rest...] {
-        return parse(v, in, std::forward<Rest>(rest)...);
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, First& first, Rest&&... rest) {
+    return parse(s, v, in, first).then([v, &s, &in, &rest...] {
+        return parse(s, v, in, std::forward<Rest>(rest)...);
     });
-}
-
-template<typename First, typename... Rest>
-inline void write(sstable_version_types v, file_writer& out, const First& first, Rest&&... rest) {
-    write(v, out, first);
-    write(v, out, std::forward<Rest>(rest)...);
 }
 
 // Intended to be used for a type that describes itself through describe_type().
 template <class T>
 typename std::enable_if_t<!std::is_integral<T>::value && !std::is_enum<T>::value, future<>>
-parse(sstable_version_types v, random_access_reader& in, T& t) {
-    return t.describe_type(v, [v, &in] (auto&&... what) -> future<> {
-        return parse(v, in, what...);
+parse(const schema& s, sstable_version_types v, random_access_reader& in, T& t) {
+    return t.describe_type(v, [v, &s, &in] (auto&&... what) -> future<> {
+        return parse(s, v, in, what...);
     });
 }
 
 template <class T>
-inline void write(sstable_version_types v, file_writer& out, const vint<T>& t) {
-    write_vint(out, t.value);
-}
-
-template <class T>
-future<> parse(sstable_version_types v, random_access_reader& in, vint<T>& t) {
+future<> parse(const schema&, sstable_version_types v, random_access_reader& in, vint<T>& t) {
     return read_vint(in, t.value);
 }
 
-template <class T>
-inline typename std::enable_if_t<!std::is_integral<T>::value && !std::is_enum<T>::value, void>
-write(sstable_version_types v, file_writer& out, const T& t) {
-    // describe_type() is not const correct, so cheat here:
-    const_cast<T&>(t).describe_type(v, [v, &out] (auto&&... what) -> void {
-        write(v, out, std::forward<decltype(what)>(what)...);
+future<> parse(const schema&, sstable_version_types, random_access_reader& in, utils::UUID& uuid) {
+    return in.read_exactly(uuid.serialized_size()).then([&uuid] (temporary_buffer<char> buf) {
+        check_buf_size(buf, utils::UUID::serialized_size());
+
+        uuid = utils::UUID_gen::get_UUID(const_cast<int8_t*>(reinterpret_cast<const int8_t*>(buf.get())));
     });
+}
+
+inline void write(sstable_version_types v, file_writer& out, const utils::UUID& uuid) {
+    out.write(uuid.serialize());
 }
 
 // For all types that take a size, we provide a template that takes the type
@@ -331,36 +314,29 @@ write(sstable_version_types v, file_writer& out, const T& t) {
 // are contiguous, it is not always the case. So we want to have the
 // flexibility of parsing them separately.
 template <typename Size>
-future<> parse(sstable_version_types v, random_access_reader& in, disk_string<Size>& s) {
+future<> parse(const schema& schema, sstable_version_types v, random_access_reader& in, disk_string<Size>& s) {
     auto len = std::make_unique<Size>();
-    auto f = parse(v, in, *len);
-    return f.then([v, &in, &s, len = std::move(len)] {
-        return parse(v, in, *len, s.value);
+    auto f = parse(schema, v, in, *len);
+    return f.then([v, &schema, &in, &s, len = std::move(len)] {
+        return parse(schema, v, in, *len, s.value);
     });
 }
 
-template <typename Size, typename Members>
-future<> parse(sstable_version_types v, random_access_reader& in, disk_array_vint_size<Size, Members>& arr) {
-    auto len = std::make_unique<Size>();
+future<> parse(const schema& schema, sstable_version_types v, random_access_reader& in, disk_string_vint_size& s) {
+    auto len = std::make_unique<uint64_t>();
     auto f = read_vint(in, *len);
-    return f.then([v, &in, &arr, len = std::move(len)] {
-        return parse(v, in, *len, arr.elements);
+    return f.then([v, &schema, &in, &s, len = std::move(len)] {
+        return parse(schema, v, in, *len, s.value);
     });
 }
 
-template <typename Size>
-inline void write(sstable_version_types v, file_writer& out, const disk_string<Size>& s) {
-    Size len = 0;
-    check_truncate_and_assign(len, s.value.size());
-    write(v, out, len);
-    write(v, out, s.value);
-}
-
-template <typename Size>
-inline void write(sstable_version_types v, file_writer& out, const disk_string_view<Size>& s) {
-    Size len;
-    check_truncate_and_assign(len, s.value.size());
-    write(v, out, len, s.value);
+template <typename Members>
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, disk_array_vint_size<Members>& arr) {
+    auto len = std::make_unique<uint64_t>();
+    auto f = read_vint(in, *len);
+    return f.then([v, &s, &in, &arr, len = std::move(len)] {
+        return parse(s, v, in, *len, arr.elements);
+    });
 }
 
 // We cannot simply read the whole array at once, because we don't know its
@@ -373,21 +349,21 @@ inline void write(sstable_version_types v, file_writer& out, const disk_string_v
 // We'll offer a specialization for that case below.
 template <typename Size, typename Members>
 typename std::enable_if_t<!std::is_integral<Members>::value, future<>>
-parse(sstable_version_types v, random_access_reader& in, Size& len, utils::chunked_vector<Members>& arr) {
+parse(const schema& s, sstable_version_types v, random_access_reader& in, Size& len, utils::chunked_vector<Members>& arr) {
 
     auto count = make_lw_shared<size_t>(0);
     auto eoarr = [count, len] { return *count == len; };
 
-    return do_until(eoarr, [v, count, &in, &arr] {
+    return do_until(eoarr, [v, &s, count, &in, &arr] {
         arr.emplace_back();
         (*count)++;
-        return parse(v, in, arr.back());
+        return parse(s, v, in, arr.back());
     });
 }
 
 template <typename Size, typename Members>
 typename std::enable_if_t<std::is_integral<Members>::value, future<>>
-parse(sstable_version_types, random_access_reader& in, Size& len, utils::chunked_vector<Members>& arr) {
+parse(const schema&, sstable_version_types, random_access_reader& in, Size& len, utils::chunked_vector<Members>& arr) {
     auto done = make_lw_shared<size_t>(0);
     return repeat([&in, &len, &arr, done]  {
         auto now = std::min(len - *done, 100000 / sizeof(Members));
@@ -407,80 +383,27 @@ parse(sstable_version_types, random_access_reader& in, Size& len, utils::chunked
 // We resize the array here, before we pass it to the integer / non-integer
 // specializations
 template <typename Size, typename Members>
-future<> parse(sstable_version_types v, random_access_reader& in, disk_array<Size, Members>& arr) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, disk_array<Size, Members>& arr) {
     auto len = make_lw_shared<Size>();
-    auto f = parse(v, in, *len);
-    return f.then([v, &in, &arr, len] {
+    auto f = parse(s, v, in, *len);
+    return f.then([v, &s, &in, &arr, len] {
         arr.elements.reserve(*len);
-        return parse(v, in, *len, arr.elements);
+        return parse(s, v, in, *len, arr.elements);
     }).finally([len] {});
 }
 
-template <typename Members>
-inline typename std::enable_if_t<!std::is_integral<Members>::value, void>
-write(sstable_version_types v, file_writer& out, const utils::chunked_vector<Members>& arr) {
-    for (auto& a : arr) {
-        write(v, out, a);
-    }
-}
-
-template <typename Members>
-inline typename std::enable_if_t<std::is_integral<Members>::value, void>
-write(sstable_version_types v, file_writer& out, const utils::chunked_vector<Members>& arr) {
-    std::vector<Members> tmp;
-    size_t per_loop = 100000 / sizeof(Members);
-    tmp.resize(per_loop);
-    size_t idx = 0;
-    while (idx != arr.size()) {
-        auto now = std::min(arr.size() - idx, per_loop);
-        // copy arr into tmp converting each entry into big-endian representation.
-        auto nr = arr.begin() + idx;
-        for (size_t i = 0; i < now; i++) {
-            tmp[i] = net::hton(nr[i]);
-        }
-        auto p = reinterpret_cast<const char*>(tmp.data());
-        auto bytes = now * sizeof(Members);
-        out.write(p, bytes).get();
-        idx += now;
-    }
-}
-
-template <typename Size, typename Members>
-inline void write(sstable_version_types v, file_writer& out, const disk_array<Size, Members>& arr) {
-    Size len = 0;
-    check_truncate_and_assign(len, arr.elements.size());
-    write(v, out, len);
-    write(v, out, arr.elements);
-}
-
-template <typename Size, typename Members>
-inline void write(sstable_version_types v, file_writer& out, const disk_array_vint_size<Size, Members>& arr) {
-    Size len = 0;
-    check_truncate_and_assign(len, arr.elements.size());
-    write_vint(out, len);
-    write(v, out, arr.elements);
-}
-
-template <typename Size, typename Members>
-inline void write(sstable_version_types v, file_writer& out, const disk_array_ref<Size, Members>& arr) {
-    Size len = 0;
-    check_truncate_and_assign(len, arr.elements.size());
-    write(v, out, len);
-    write(v, out, arr.elements);
-}
-
 template <typename Size, typename Key, typename Value>
-future<> parse(sstable_version_types v, random_access_reader& in, Size& len, std::unordered_map<Key, Value>& map) {
-    return do_with(Size(), [v, &in, len, &map] (Size& count) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, Size& len, std::unordered_map<Key, Value>& map) {
+    return do_with(Size(), [v, &s, &in, len, &map] (Size& count) {
         auto eos = [len, &count] { return len == count++; };
-        return do_until(eos, [v, len, &in, &map] {
+        return do_until(eos, [v, &s, len, &in, &map] {
             struct kv {
                 Key key;
                 Value value;
             };
 
-            return do_with(kv(), [v, &in, &map] (auto& el) {
-                return parse(v, in, el.key, el.value).then([&el, &map] {
+            return do_with(kv(), [v, &s, &in, &map] (auto& el) {
+                return parse(s, v, in, el.key, el.value).then([&el, &map] {
                     map.emplace(el.key, el.value);
                 });
             });
@@ -488,28 +411,18 @@ future<> parse(sstable_version_types v, random_access_reader& in, Size& len, std
     });
 }
 
+template <typename First, typename Second>
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, std::pair<First, Second>& p) {
+    return parse(s, v, in, p.first, p.second);
+}
+
 template <typename Size, typename Key, typename Value>
-future<> parse(sstable_version_types v, random_access_reader& in, disk_hash<Size, Key, Value>& h) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, disk_hash<Size, Key, Value>& h) {
     auto w = std::make_unique<Size>();
-    auto f = parse(v, in, *w);
-    return f.then([v, &in, &h, w = std::move(w)] {
-        return parse(v, in, *w, h.map);
+    auto f = parse(s, v, in, *w);
+    return f.then([v, &s, &in, &h, w = std::move(w)] {
+        return parse(s, v, in, *w, h.map);
     });
-}
-
-template <typename Key, typename Value>
-inline void write(sstable_version_types v, file_writer& out, const std::unordered_map<Key, Value>& map) {
-    for (auto& val: map) {
-        write(v, out, val.first, val.second);
-    };
-}
-
-template <typename Size, typename Key, typename Value>
-inline void write(sstable_version_types v, file_writer& out, const disk_hash<Size, Key, Value>& h) {
-    Size len = 0;
-    check_truncate_and_assign(len, h.map.size());
-    write(v, out, len);
-    write(v, out, h.map);
 }
 
 // Abstract parser/sizer/writer for a single tagged member of a tagged union
@@ -517,7 +430,7 @@ template <typename DiskSetOfTaggedUnion>
 struct single_tagged_union_member_serdes {
     using value_type = typename DiskSetOfTaggedUnion::value_type;
     virtual ~single_tagged_union_member_serdes() {}
-    virtual future<> do_parse(sstable_version_types version, random_access_reader& in, value_type& v) const = 0;
+    virtual future<> do_parse(const schema& s, sstable_version_types version, random_access_reader& in, value_type& v) const = 0;
     virtual uint32_t do_size(sstable_version_types version, const value_type& v) const = 0;
     virtual void do_write(sstable_version_types version, file_writer& out, const value_type& v) const = 0;
 };
@@ -527,9 +440,9 @@ template <typename DiskSetOfTaggedUnion, typename Member>
 struct single_tagged_union_member_serdes_for final : single_tagged_union_member_serdes<DiskSetOfTaggedUnion> {
     using base = single_tagged_union_member_serdes<DiskSetOfTaggedUnion>;
     using value_type = typename base::value_type;
-    virtual future<> do_parse(sstable_version_types version, random_access_reader& in, value_type& v) const {
+    virtual future<> do_parse(const schema& s, sstable_version_types version, random_access_reader& in, value_type& v) const {
         v = Member();
-        return parse(version, in, boost::get<Member>(v).value);
+        return parse(s, version, in, boost::get<Member>(v).value);
     }
     virtual uint32_t do_size(sstable_version_types version, const value_type& v) const override {
         return serialized_size(version, boost::get<Member>(v).value);
@@ -548,12 +461,12 @@ struct disk_set_of_tagged_union<TagType, Members...>::serdes {
     serdes_map_type map = {
         {Members::tag(), make_shared<single_tagged_union_member_serdes_for<disk_set, Members>>()}...
     };
-    future<> lookup_and_parse(sstable_version_types v, random_access_reader& in, TagType tag, uint32_t& size, disk_set& s, value_type& value) const {
+    future<> lookup_and_parse(const schema& schema, sstable_version_types v, random_access_reader& in, TagType tag, uint32_t& size, disk_set& s, value_type& value) const {
         auto i = map.find(tag);
         if (i == map.end()) {
             return in.read_exactly(size).discard_result();
         } else {
-            return i->second->do_parse(v, in, value).then([tag, &s, &value] () mutable {
+            return i->second->do_parse(schema, v, in, value).then([tag, &s, &value] () mutable {
                 s.data.emplace(tag, std::move(value));
             });
         }
@@ -571,17 +484,17 @@ typename disk_set_of_tagged_union<TagType, Members...>::serdes disk_set_of_tagge
 
 template <typename TagType, typename... Members>
 future<>
-parse(sstable_version_types v, random_access_reader& in, disk_set_of_tagged_union<TagType, Members...>& s) {
+parse(const schema& schema, sstable_version_types v, random_access_reader& in, disk_set_of_tagged_union<TagType, Members...>& s) {
     using disk_set = disk_set_of_tagged_union<TagType, Members...>;
     using key_type = typename disk_set::key_type;
     using value_type = typename disk_set::value_type;
     return do_with(0u, 0u, 0u, value_type{}, [&] (key_type& nr_elements, key_type& new_key, unsigned& new_size, value_type& new_value) {
-        return parse(v, in, nr_elements).then([&] {
+        return parse(schema, v, in, nr_elements).then([&, v] {
             auto rng = boost::irange<key_type>(0, nr_elements); // do_for_each doesn't like an rvalue range
-            return do_for_each(rng.begin(), rng.end(), [&] (key_type ignore) {
-                return parse(v, in, new_key).then([&] {
-                    return parse(v, in, new_size).then([&] {
-                        return disk_set::s_serdes.lookup_and_parse(v, in, TagType(new_key), new_size, s, new_value);
+            return do_for_each(rng.begin(), rng.end(), [&, v] (key_type ignore) {
+                return parse(schema, v, in, new_key).then([&, v] {
+                    return parse(schema, v, in, new_size).then([&, v] {
+                        return disk_set::s_serdes.lookup_and_parse(schema, v, in, TagType(new_key), new_size, s, new_value);
                     });
                 });
             });
@@ -602,14 +515,14 @@ void write(sstable_version_types v, file_writer& out, const disk_set_of_tagged_u
     }
 }
 
-future<> parse(sstable_version_types v, random_access_reader& in, summary& s) {
+future<> parse(const schema& schema, sstable_version_types v, random_access_reader& in, summary& s) {
     using pos_type = typename decltype(summary::positions)::value_type;
 
-    return parse(v, in, s.header.min_index_interval,
+    return parse(schema, v, in, s.header.min_index_interval,
                      s.header.size,
                      s.header.memory_size,
                      s.header.sampling_level,
-                     s.header.size_at_full_sampling).then([v, &in, &s] {
+                     s.header.size_at_full_sampling).then([v, &schema, &in, &s] {
         return in.read_exactly(s.header.size * sizeof(pos_type)).then([&in, &s] (auto buf) {
             auto len = s.header.size * sizeof(pos_type);
             check_buf_size(buf, len);
@@ -631,20 +544,22 @@ future<> parse(sstable_version_types v, random_access_reader& in, summary& s) {
                 s.positions.push_back(s.header.memory_size);
                 return make_ready_future<>();
             });
-        }).then([v, &in, &s] {
-            in.seek(sizeof(summary::header) + s.header.memory_size);
-            return parse(v, in, s.first_key, s.last_key);
         }).then([&in, &s] {
-            in.seek(s.positions[0] + sizeof(summary::header));
+            return in.seek(sizeof(summary::header) + s.header.memory_size);
+        }).then([v, &schema, &in, &s] {
+            return parse(schema, v, in, s.first_key, s.last_key);
+        }).then([&in, &s] {
+            return in.seek(s.positions[0] + sizeof(summary::header));
+        }).then([&schema, &in, &s] {
             s.entries.reserve(s.header.size);
 
-            return do_with(int(0), [&in, &s] (int& idx) mutable {
-                return do_until([&s] { return s.entries.size() == s.header.size; }, [&s, &in, &idx] () mutable {
+            return do_with(int(0), [&schema, &in, &s] (int& idx) mutable {
+                return do_until([&s] { return s.entries.size() == s.header.size; }, [&schema, &s, &in, &idx] () mutable {
                     auto pos = s.positions[idx++];
                     auto next = s.positions[idx];
 
                     auto entrysize = next - pos;
-                    return in.read_exactly(entrysize).then([&s, entrysize] (auto buf) mutable {
+                    return in.read_exactly(entrysize).then([&schema, &s, entrysize] (auto buf) mutable {
                         check_buf_size(buf, entrysize);
 
                         auto keysize = entrysize - 8;
@@ -653,9 +568,9 @@ future<> parse(sstable_version_types v, random_access_reader& in, summary& s) {
 
                         // position is little-endian encoded
                         auto position = seastar::read_le<uint64_t>(buf.get());
-                        auto token = dht::global_partitioner().get_token(key_view(key_data));
-                        auto token_data = s.add_summary_data(bytes_view(token._data));
-                        s.entries.push_back({ dht::token_view(dht::token::kind::key, token_data), key_data, position });
+                        auto token = schema.get_partitioner().get_token(key_view(key_data));
+                        s.add_summary_data(token.data());
+                        s.entries.push_back({ token, key_data, position });
                         return make_ready_future<>();
                     });
                 });
@@ -673,7 +588,7 @@ inline void write(sstable_version_types v, file_writer& out, const summary_entry
     // endianness. We can treat it as little endian to preserve portability.
     write(v, out, entry.key);
     auto p = seastar::cpu_to_le<uint64_t>(entry.position);
-    out.write(reinterpret_cast<const char*>(&p), sizeof(p)).get();
+    out.write(reinterpret_cast<const char*>(&p), sizeof(p));
 }
 
 inline void write(sstable_version_types v, file_writer& out, const summary& s) {
@@ -685,7 +600,7 @@ inline void write(sstable_version_types v, file_writer& out, const summary& s) {
                   s.header.size_at_full_sampling);
     for (auto&& e : s.positions) {
         auto p = seastar::cpu_to_le(e);
-        out.write(reinterpret_cast<const char*>(&p), sizeof(p)).get();
+        out.write(reinterpret_cast<const char*>(&p), sizeof(p));
     }
     write(v, out, s.entries);
     write(v, out, s.first_key, s.last_key);
@@ -694,20 +609,20 @@ inline void write(sstable_version_types v, file_writer& out, const summary& s) {
 future<summary_entry&> sstable::read_summary_entry(size_t i) {
     // The last one is the boundary marker
     if (i >= (_components->summary.entries.size())) {
-        throw std::out_of_range(sprint("Invalid Summary index: %ld", i));
+        throw std::out_of_range(format("Invalid Summary index: {:d}", i));
     }
 
     return make_ready_future<summary_entry&>(_components->summary.entries[i]);
 }
 
-future<> parse(sstable_version_types v, random_access_reader& in, deletion_time& d) {
-    return parse(v, in, d.local_deletion_time, d.marked_for_delete_at);
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, deletion_time& d) {
+    return parse(s, v, in, d.local_deletion_time, d.marked_for_delete_at);
 }
 
 template <typename Child>
-future<> parse(sstable_version_types v, random_access_reader& in, std::unique_ptr<metadata>& p) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, std::unique_ptr<metadata>& p) {
     p.reset(new Child);
-    return parse(v, in, *static_cast<Child *>(p.get()));
+    return parse(s, v, in, *static_cast<Child *>(p.get()));
 }
 
 template <typename Child>
@@ -715,54 +630,59 @@ inline void write(sstable_version_types v, file_writer& out, const std::unique_p
     write(v, out, *static_cast<Child *>(p.get()));
 }
 
-future<> parse(sstable_version_types v, random_access_reader& in, statistics& s) {
-    return parse(v, in, s.hash).then([v, &in, &s] {
-        return do_for_each(s.hash.map.begin(), s.hash.map.end(), [v, &in, &s] (auto val) mutable {
-            in.seek(val.second);
-
-            switch (val.first) {
+future<> parse(const schema& schema, sstable_version_types v, random_access_reader& in, statistics& s) {
+    return parse(schema, v, in, s.offsets).then([v, &schema, &in, &s] {
+        // Old versions of Scylla do not respect the order.
+        // See https://github.com/scylladb/scylla/issues/3937
+        boost::sort(s.offsets.elements, [] (auto&& e1, auto&& e2) { return e1.first < e2.first; });
+        return do_for_each(s.offsets.elements.begin(), s.offsets.elements.end(), [v, &schema, &in, &s] (auto val) mutable {
+            return in.seek(val.second).then([v, &schema, &in, &s, type = val.first] {
+                switch (type) {
                 case metadata_type::Validation:
-                    return parse<validation_metadata>(v, in, s.contents[val.first]);
+                    return parse<validation_metadata>(schema, v, in, s.contents[type]);
                 case metadata_type::Compaction:
-                    return parse<compaction_metadata>(v, in, s.contents[val.first]);
+                    return parse<compaction_metadata>(schema, v, in, s.contents[type]);
                 case metadata_type::Stats:
-                    return parse<stats_metadata>(v, in, s.contents[val.first]);
+                    return parse<stats_metadata>(schema, v, in, s.contents[type]);
                 case metadata_type::Serialization:
-                    if (v != sstable_version_types::mc) {
+                    if (v < sstable_version_types::mc) {
                         throw std::runtime_error(
                             "Statistics is malformed: SSTable is in 2.x format but contains serialization header.");
                     } else {
-                        return parse<serialization_header>(v, in, s.contents[val.first]);
+                        return parse<serialization_header>(schema, v, in, s.contents[type]);
                     }
                     return make_ready_future<>();
                 default:
-                    sstlog.warn("Invalid metadata type at Statistics file: {} ", int(val.first));
+                    sstlog.warn("Invalid metadata type at Statistics file: {} ", int(type));
                     return make_ready_future<>();
                 }
+            });
         });
     });
 }
 
 inline void write(sstable_version_types v, file_writer& out, const statistics& s) {
-    write(v, out, s.hash);
-    auto types = boost::copy_range<std::vector<metadata_type>>(s.hash.map | boost::adaptors::map_keys);
-    // use same sort order as seal_statistics
-    boost::sort(types);
-    for (auto t : types) {
-        s.contents.at(t)->write(v, out);
+    write(v, out, s.offsets);
+    for (auto&& e : s.offsets.elements) {
+        s.contents.at(e.first)->write(v, out);
     }
 }
 
-future<> parse(sstable_version_types v, random_access_reader& in, utils::estimated_histogram& eh) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, utils::estimated_histogram& eh) {
     auto len = std::make_unique<uint32_t>();
 
-    auto f = parse(v, in, *len);
+    auto f = parse(s, v, in, *len);
     return f.then([&in, &eh, len = std::move(len)] {
         uint32_t length = *len;
 
         if (length == 0) {
             throw malformed_sstable_exception("Estimated histogram with zero size found. Can't continue!");
         }
+
+        // Arrays are potentially pre-initialized by the estimated_histogram constructor.
+        eh.bucket_offsets.clear();
+        eh.buckets.clear();
+
         eh.bucket_offsets.reserve(length - 1);
         eh.buckets.reserve(length);
 
@@ -786,7 +706,7 @@ future<> parse(sstable_version_types v, random_access_reader& in, utils::estimat
     });
 }
 
-inline void write(sstable_version_types v, file_writer& out, const utils::estimated_histogram& eh) {
+void write(sstable_version_types v, file_writer& out, const utils::estimated_histogram& eh) {
     uint32_t len = 0;
     check_truncate_and_assign(len, eh.buckets.size());
 
@@ -811,7 +731,7 @@ inline void write(sstable_version_types v, file_writer& out, const utils::estima
 
     auto p = reinterpret_cast<const char*>(elements.data());
     auto bytes = elements.size() * sizeof(element);
-    out.write(p, bytes).get();
+    out.write(p, bytes);
 }
 
 struct streaming_histogram_element {
@@ -824,10 +744,10 @@ struct streaming_histogram_element {
     auto describe_type(sstable_version_types v, Describer f) { return f(key, value); }
 };
 
-future<> parse(sstable_version_types v, random_access_reader& in, utils::streaming_histogram& sh) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, utils::streaming_histogram& sh) {
     auto a = std::make_unique<disk_array<uint32_t, streaming_histogram_element>>();
 
-    auto f = parse(v, in, sh.max_bin_size, *a);
+    auto f = parse(s, v, in, sh.max_bin_size, *a);
     return f.then([&sh, a = std::move(a)] {
         auto length = a->elements.size();
         if (length > sh.max_bin_size) {
@@ -854,7 +774,7 @@ future<> parse(sstable_version_types v, random_access_reader& in, utils::streami
     });
 }
 
-inline void write(sstable_version_types v, file_writer& out, const utils::streaming_histogram& sh) {
+void write(sstable_version_types v, file_writer& out, const utils::streaming_histogram& sh) {
     uint32_t max_bin_size;
     check_truncate_and_assign(max_bin_size, sh.max_bin_size);
 
@@ -865,27 +785,27 @@ inline void write(sstable_version_types v, file_writer& out, const utils::stream
     write(v, out, max_bin_size, a);
 }
 
-future<> parse(sstable_version_types v, random_access_reader& in, commitlog_interval& ci) {
-    return parse(v, in, ci.start).then([&ci, v, &in] {
-        return parse(v, in, ci.end);
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, commitlog_interval& ci) {
+    return parse(s, v, in, ci.start).then([&ci, v, &s, &in] {
+        return parse(s, v, in, ci.end);
     });
 }
 
-inline void write(sstable_version_types v, file_writer& out, const commitlog_interval& ci) {
+void write(sstable_version_types v, file_writer& out, const commitlog_interval& ci) {
     write(v, out, ci.start);
     write(v, out, ci.end);
 }
 
-future<> parse(sstable_version_types v, random_access_reader& in, compression& c) {
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, compression& c) {
     auto data_len_ptr = make_lw_shared<uint64_t>(0);
     auto chunk_len_ptr = make_lw_shared<uint32_t>(0);
 
-    return parse(v, in, c.name, c.options, *chunk_len_ptr, *data_len_ptr).then([v, &in, &c, chunk_len_ptr, data_len_ptr] {
+    return parse(s, v, in, c.name, c.options, *chunk_len_ptr, *data_len_ptr).then([v, &s, &in, &c, chunk_len_ptr, data_len_ptr] {
         c.set_uncompressed_chunk_length(*chunk_len_ptr);
         c.set_uncompressed_file_length(*data_len_ptr);
 
-      return do_with(uint32_t(), c.offsets.get_writer(), [v, &in, &c] (uint32_t& len, compression::segmented_offsets::writer& offsets) {
-        return parse(v, in, len).then([&in, &c, &len, &offsets] {
+      return do_with(uint32_t(), c.offsets.get_writer(), [v, &s, &in, &c] (uint32_t& len, compression::segmented_offsets::writer& offsets) {
+        return parse(s, v, in, len).then([&in, &c, &len, &offsets] {
             auto eoarr = [&c, &len] { return c.offsets.size() == len; };
 
             return do_until(eoarr, [&in, &c, &len, &offsets] () {
@@ -921,36 +841,34 @@ void write(sstable_version_types v, file_writer& out, const compression& c) {
         }
         auto p = reinterpret_cast<const char*>(tmp.data());
         auto bytes = now * sizeof(uint64_t);
-        out.write(p, bytes).get();
+        out.write(p, bytes);
         idx += now;
     }
 }
 
 // This is small enough, and well-defined. Easier to just read it all
 // at once
-future<> sstable::read_toc() {
+future<> sstable::read_toc() noexcept {
     if (_recognized_components.size()) {
         return make_ready_future<>();
     }
 
-    auto file_path = filename(component_type::TOC);
+    sstlog.debug("Reading TOC file {}", filename(component_type::TOC));
 
-    sstlog.debug("Reading TOC file {} ", file_path);
-
-    return open_checked_file_dma(_read_error_handler, file_path, open_flags::ro).then([this, file_path] (file f) {
+    return with_file(new_sstable_component_file(_read_error_handler, component_type::TOC, open_flags::ro), [this] (file f) {
         auto bufptr = allocate_aligned_buffer<char>(4096, 4096);
         auto buf = bufptr.get();
 
         auto fut = f.dma_read(0, buf, 4096);
-        return std::move(fut).then([this, f = std::move(f), bufptr = std::move(bufptr), file_path] (size_t size) mutable {
+        return std::move(fut).then([this, f = std::move(f), bufptr = std::move(bufptr)] (size_t size) mutable {
             // This file is supposed to be very small. Theoretically we should check its size,
             // but if we so much as read a whole page from it, there is definitely something fishy
             // going on - and this simplifies the code.
             if (size >= 4096) {
-                throw malformed_sstable_exception("SSTable too big: " + to_sstring(size) + " bytes", file_path);
+                throw malformed_sstable_exception("SSTable TOC too big: " + to_sstring(size) + " bytes", filename(component_type::TOC));
             }
 
-            std::experimental::string_view buf(bufptr.get(), size);
+            std::string_view buf(bufptr.get(), size);
             std::vector<sstring> comps;
 
             boost::split(comps , buf, boost::is_any_of("\n"));
@@ -964,20 +882,19 @@ future<> sstable::read_toc() {
                     _recognized_components.insert(reverse_map(c, sstable_version_constants::get_component_map(_version)));
                 } catch (std::out_of_range& oor) {
                     _unrecognized_components.push_back(c);
-                    sstlog.info("Unrecognized TOC component was found: {} in sstable {}", c, file_path);
+                    sstlog.info("Unrecognized TOC component was found: {} in sstable {}", c, filename(component_type::TOC));
                 }
             }
             if (!_recognized_components.size()) {
-                throw malformed_sstable_exception("Empty TOC", file_path);
+                throw malformed_sstable_exception("Empty TOC", filename(component_type::TOC));
             }
-            return f.close().finally([f] {});
         });
-    }).then_wrapped([file_path] (future<> f) {
+    }).then_wrapped([this] (future<> f) {
         try {
             f.get();
         } catch (std::system_error& e) {
             if (e.code() == std::error_code(ENOENT, std::system_category())) {
-                throw malformed_sstable_exception(file_path + ": file not found");
+                throw malformed_sstable_exception(filename(component_type::TOC) + ": file not found");
             }
             throw;
         }
@@ -1004,7 +921,48 @@ void sstable::generate_toc(compressor_ptr c, double filter_fp_chance) {
     _recognized_components.insert(component_type::Scylla);
 }
 
+file_writer::~file_writer() {
+    if (_closed) {
+        return;
+    }
+    try {
+        // close() should be called by the owner of the file_writer.
+        // However it may not be called on exception handling paths
+        // so auto-close the output_stream so it won't be destructed while open.
+        _out.close().get();
+    } catch (...) {
+        sstlog.warn("Error while auto-closing {}: {}. Ignored.", get_filename(), std::current_exception());
+    }
+}
+
+void file_writer::close() {
+    assert(!_closed && "file_writer already closed");
+    try {
+        _closed = true;
+        _out.close().get();
+    } catch (...) {
+        auto e = std::current_exception();
+        sstlog.error("Error while closing {}: {}", get_filename(), e);
+        std::rethrow_exception(e);
+    }
+}
+
+const char* file_writer::get_filename() const noexcept {
+    return _filename ? _filename->c_str() : "<anonymous output_stream>";
+}
+
+future<file_writer> sstable::make_component_file_writer(component_type c, file_output_stream_options options, open_flags oflags) noexcept {
+    // Note: file_writer::make closes the file if file_writer creation fails
+    // so we don't need to use with_file_close_on_failure here.
+    return futurize_invoke([this, c] { return filename(c); }).then([this, c, options = std::move(options), oflags] (sstring filename) mutable {
+        return new_sstable_component_file(_write_error_handler, c, oflags).then([options = std::move(options), filename = std::move(filename)] (file f) mutable {
+            return file_writer::make(std::move(f), std::move(options), std::move(filename));
+        });
+    });
+}
+
 void sstable::write_toc(const io_priority_class& pc) {
+    touch_temp_dir().get0();
     auto file_path = filename(component_type::TemporaryTOC);
 
     sstlog.debug("Writing TOC file {} ", file_path);
@@ -1013,21 +971,19 @@ void sstable::write_toc(const io_priority_class& pc) {
     // If creation of temporary TOC failed, it implies that that boot failed to
     // delete a sstable with temporary for this column family, or there is a
     // sstable being created in parallel with the same generation.
-    file f = new_sstable_component_file(_write_error_handler, file_path, open_flags::wo | open_flags::create | open_flags::exclusive).get0();
+    file_output_stream_options options;
+    options.buffer_size = 4096;
+    options.io_priority_class = pc;
+    auto w = make_component_file_writer(component_type::TemporaryTOC, std::move(options)).get0();
 
     bool toc_exists = file_exists(filename(component_type::TOC)).get0();
     if (toc_exists) {
         // TOC will exist at this point if write_components() was called with
         // the generation of a sstable that exists.
-        f.close().get();
+        w.close();
         remove_file(file_path).get();
-        throw std::runtime_error(sprint("SSTable write failed due to existence of TOC file for generation %ld of %s.%s", _generation, _schema->ks_name(), _schema->cf_name()));
+        throw std::runtime_error(format("SSTable write failed due to existence of TOC file for generation {:d} of {}.{}", _generation, _schema->ks_name(), _schema->cf_name()));
     }
-
-    file_output_stream_options options;
-    options.buffer_size = 4096;
-    options.io_priority_class = pc;
-    auto w = file_writer(std::move(f), std::move(options));
 
     for (auto&& key : _recognized_components) {
             // new line character is appended to the end of each component name.
@@ -1035,8 +991,8 @@ void sstable::write_toc(const io_priority_class& pc) {
         bytes b = bytes(reinterpret_cast<const bytes::value_type *>(value.c_str()), value.size());
         write(_version, w, b);
     }
-    w.flush().get();
-    w.close().get();
+    w.flush();
+    w.close();
 
     // Flushing parent directory to guarantee that temporary TOC file reached
     // the disk.
@@ -1050,52 +1006,53 @@ void sstable::write_toc(const io_priority_class& pc) {
 future<> sstable::seal_sstable() {
     // SSTable sealing is about renaming temporary TOC file after guaranteeing
     // that each component reached the disk safely.
-    return open_checked_directory(_write_error_handler, _dir).then([this] (file dir_f) {
-        // Guarantee that every component of this sstable reached the disk.
-        return sstable_write_io_check([&] { return dir_f.flush(); }).then([this] {
-            // Rename TOC because it's no longer temporary.
-            return sstable_write_io_check([&] {
-                return engine().rename_file(filename(component_type::TemporaryTOC), filename(component_type::TOC));
+    return remove_temp_dir().then([this] {
+        return open_checked_directory(_write_error_handler, _dir).then([this] (file dir_f) {
+            // Guarantee that every component of this sstable reached the disk.
+            return sstable_write_io_check([&] { return dir_f.flush(); }).then([this] {
+                // Rename TOC because it's no longer temporary.
+                return sstable_write_io_check([&] {
+                    return rename_file(filename(component_type::TemporaryTOC), filename(component_type::TOC));
+                });
+            }).then([this, dir_f] () mutable {
+                // Guarantee that the changes above reached the disk.
+                return sstable_write_io_check([&] { return dir_f.flush(); });
+            }).then([this, dir_f] () mutable {
+                return sstable_write_io_check([&] { return dir_f.close(); });
+            }).then([this, dir_f] {
+                if (_marked_for_deletion == mark_for_deletion::implicit) {
+                    _marked_for_deletion = mark_for_deletion::none;
+                }
+                // If this point was reached, sstable should be safe in disk.
+                sstlog.debug("SSTable with generation {} of {}.{} was sealed successfully.", _generation, _schema->ks_name(), _schema->cf_name());
             });
-        }).then([this, dir_f] () mutable {
-            // Guarantee that the changes above reached the disk.
-            return sstable_write_io_check([&] { return dir_f.flush(); });
-        }).then([this, dir_f] () mutable {
-            return sstable_write_io_check([&] { return dir_f.close(); });
-        }).then([this, dir_f] {
-            // If this point was reached, sstable should be safe in disk.
-            sstlog.debug("SSTable with generation {} of {}.{} was sealed successfully.", _generation, _schema->ks_name(), _schema->cf_name());
         });
     });
 }
 
-void write_crc(sstable_version_types v, io_error_handler& error_handler, const sstring file_path, const checksum& c) {
+void sstable::write_crc(const checksum& c) {
+    auto file_path = filename(component_type::CRC);
     sstlog.debug("Writing CRC file {} ", file_path);
-
-    auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
-    file f = new_sstable_component_file(error_handler, file_path, oflags).get0();
 
     file_output_stream_options options;
     options.buffer_size = 4096;
-    auto w = file_writer(std::move(f), std::move(options));
-    write(v, w, c);
-    w.close().get();
+    auto w = make_component_file_writer(component_type::CRC, std::move(options)).get0();
+    write(get_version(), w, c);
+    w.close();
 }
 
 // Digest file stores the full checksum of data file converted into a string.
-void write_digest(sstable_version_types v, io_error_handler& error_handler, const sstring file_path, uint32_t full_checksum) {
+void sstable::write_digest(uint32_t full_checksum) {
+    auto file_path = filename(component_type::Digest);
     sstlog.debug("Writing Digest file {} ", file_path);
-
-    auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
-    auto f = new_sstable_component_file(error_handler, file_path, oflags).get0();
 
     file_output_stream_options options;
     options.buffer_size = 4096;
-    auto w = file_writer(std::move(f), std::move(options));
+    auto w = make_component_file_writer(component_type::Digest, std::move(options)).get0();
 
     auto digest = to_sstring<bytes>(full_checksum);
-    write(v, w, digest);
-    w.close().get();
+    write(get_version(), w, digest);
+    w.close();
 }
 
 thread_local std::array<std::vector<int>, downsampling::BASE_SAMPLING_LEVEL> downsampling::_sample_pattern_cache;
@@ -1107,12 +1064,11 @@ future<> sstable::read_simple(T& component, const io_priority_class& pc) {
 
     auto file_path = filename(Type);
     sstlog.debug(("Reading " + sstable_version_constants::get_component_map(_version).at(Type) + " file {} ").c_str(), file_path);
-    return open_file_dma(file_path, open_flags::ro).then([this, &component] (file fi) {
+    return new_sstable_component_file(_read_error_handler, Type, open_flags::ro).then([this, &component] (file fi) {
         auto fut = fi.size();
         return fut.then([this, &component, fi = std::move(fi)] (uint64_t size) {
-            auto f = make_checked_file(_read_error_handler, fi);
-            auto r = make_lw_shared<file_random_access_reader>(std::move(f), size, sstable_buffer_size);
-            auto fut = parse(_version, *r, component);
+            auto r = make_lw_shared<file_random_access_reader>(std::move(fi), size, sstable_buffer_size);
+            auto fut = parse(*_schema, _version, *r, component);
             return fut.finally([r] {
                 return r->close();
             }).then([r] {});
@@ -1125,27 +1081,54 @@ future<> sstable::read_simple(T& component, const io_priority_class& pc) {
                 throw malformed_sstable_exception(file_path + ": file not found");
             }
             throw;
+        } catch (malformed_sstable_exception &e) {
+            throw malformed_sstable_exception(e.what(), file_path);
         }
     });
 }
 
-template <component_type Type, typename T>
-void sstable::write_simple(const T& component, const io_priority_class& pc) {
-    auto file_path = filename(Type);
-    sstlog.debug(("Writing " + sstable_version_constants::get_component_map(_version).at(Type) + " file {} ").c_str(), file_path);
-    file f = new_sstable_component_file(_write_error_handler, file_path, open_flags::wo | open_flags::create | open_flags::exclusive).get0();
+void sstable::do_write_simple(component_type type, const io_priority_class& pc,
+        noncopyable_function<void (version_types version, file_writer& writer)> write_component) {
+    auto file_path = filename(type);
+    sstlog.debug(("Writing " + sstable_version_constants::get_component_map(_version).at(type) + " file {} ").c_str(), file_path);
 
     file_output_stream_options options;
     options.buffer_size = sstable_buffer_size;
     options.io_priority_class = pc;
-    auto w = file_writer(std::move(f), std::move(options));
-    write(_version, w, component);
-    w.flush().get();
-    w.close().get();
+    auto w = make_component_file_writer(type, std::move(options)).get0();
+    std::exception_ptr eptr;
+    try {
+        write_component(_version, w);
+        w.flush();
+    } catch (...) {
+        eptr = std::current_exception();
+    }
+    try {
+        w.close();
+    } catch (...) {
+        std::exception_ptr close_eptr = std::current_exception();
+        sstlog.warn("failed to close file_writer: {}", close_eptr);
+        // If write succeeded but close failed, we rethrow close's exception.
+        if (!eptr) {
+            eptr = close_eptr;
+        }
+    }
+    if (eptr) {
+        std::rethrow_exception(eptr);
+    }
+}
+
+template <component_type Type, typename T>
+void sstable::write_simple(const T& component, const io_priority_class& pc) {
+    do_write_simple(Type, pc, [&component] (version_types v, file_writer& w) {
+        write(v, w, component);
+    });
 }
 
 template future<> sstable::read_simple<component_type::Filter>(sstables::filter& f, const io_priority_class& pc);
 template void sstable::write_simple<component_type::Filter>(const sstables::filter& f, const io_priority_class& pc);
+
+template void sstable::write_simple<component_type::Summary>(const sstables::summary_ka&, const io_priority_class&);
 
 future<> sstable::read_compression(const io_priority_class& pc) {
      // FIXME: If there is no compression, we should expect a CRC file to be present.
@@ -1164,6 +1147,27 @@ void sstable::write_compression(const io_priority_class& pc) {
     write_simple<component_type::CompressionInfo>(_components->compression, pc);
 }
 
+void sstable::validate_partitioner() {
+    auto entry = _components->statistics.contents.find(metadata_type::Validation);
+    if (entry == _components->statistics.contents.end()) {
+        throw std::runtime_error("Validation metadata not available");
+    }
+    auto& p = entry->second;
+    if (!p) {
+        throw std::runtime_error("Validation is malformed");
+    }
+
+    validation_metadata& v = *static_cast<validation_metadata *>(p.get());
+    if (v.partitioner.value != to_bytes(_schema->get_partitioner().name())) {
+        throw std::runtime_error(
+                fmt::format(FMT_STRING("SSTable {} uses {} partitioner which is different than {} partitioner used by the database"),
+                            get_filename(),
+                            sstring(reinterpret_cast<char*>(v.partitioner.value.data()), v.partitioner.value.size()),
+                            _schema->get_partitioner().name()));
+    }
+
+}
+
 void sstable::validate_min_max_metadata() {
     auto entry = _components->statistics.contents.find(metadata_type::Stats);
     if (entry == _components->statistics.contents.end()) {
@@ -1175,18 +1179,6 @@ void sstable::validate_min_max_metadata() {
     }
 
     stats_metadata& s = *static_cast<stats_metadata *>(p.get());
-    auto is_composite_valid = [] (const bytes& b) {
-        auto v = composite_view(b);
-        try {
-            size_t s = 0;
-            for (auto& c : v.components()) {
-                s += c.first.size() + sizeof(composite::size_type) + sizeof(composite::eoc_type);
-            }
-            return s == b.size();
-        } catch (marshal_exception&) {
-            return false;
-        }
-    };
     auto clear_incorrect_min_max_column_names = [&s] {
         s.min_column_names.elements.clear();
         s.max_column_names.elements.clear();
@@ -1199,27 +1191,20 @@ void sstable::validate_min_max_metadata() {
     }
 
     // The min/max metadata is wrong if:
-    // 1) it's not empty and schema defines no clustering key.
-    // 2) their size differ.
-    // 3) column name is stored instead of clustering value.
-    // 4) clustering component is stored as composite.
-    if ((!_schema->clustering_key_size() && (min_column_names.size() || max_column_names.size())) ||
-            (min_column_names.size() != max_column_names.size())) {
+    // - it's not empty and schema defines no clustering key.
+    //
+    // Notes:
+    // - we are going to rely on min/max column names for
+    //   clustering filtering only from md-format sstables,
+    //   see sstable::may_contain_rows().
+    //   We choose not to clear_incorrect_min_max_column_names
+    //   from older versions here as this disturbs sstable unit tests.
+    //
+    // - now that we store min/max metadata for range tombstones,
+    //   their size may differ.
+    if (!_schema->clustering_key_size()) {
         clear_incorrect_min_max_column_names();
         return;
-    }
-
-    for (auto i = 0U; i < min_column_names.size(); i++) {
-        if (_schema->get_column_definition(min_column_names[i].value) || _schema->get_column_definition(max_column_names[i].value)) {
-            clear_incorrect_min_max_column_names();
-            break;
-        }
-
-        if (_schema->is_compound() && _schema->clustering_key_size() > 1 && _schema->is_dense() &&
-                (is_composite_valid(min_column_names[i].value) || is_composite_valid(max_column_names[i].value))) {
-            clear_incorrect_min_max_column_names();
-            break;
-        }
     }
 }
 
@@ -1231,23 +1216,29 @@ void sstable::validate_max_local_deletion_time() {
     }
 }
 
-void sstable::set_clustering_components_ranges() {
+void sstable::set_position_range() {
     if (!_schema->clustering_key_size()) {
         return;
     }
-    auto& min_column_names = get_stats_metadata().min_column_names.elements;
-    auto& max_column_names = get_stats_metadata().max_column_names.elements;
 
-    auto s = std::min(min_column_names.size(), max_column_names.size());
-    _clustering_components_ranges.reserve(s);
-    for (auto i = 0U; i < s; i++) {
-        auto r = nonwrapping_range<bytes_view>({{ min_column_names[i].value, true }}, {{ max_column_names[i].value, true }});
-        _clustering_components_ranges.push_back(std::move(r));
+    auto& min_elements = get_stats_metadata().min_column_names.elements;
+    auto& max_elements = get_stats_metadata().max_column_names.elements;
+
+    if (min_elements.empty() && max_elements.empty()) {
+        return;
     }
-}
 
-const std::vector<nonwrapping_range<bytes_view>>& sstable::clustering_components_ranges() const {
-    return _clustering_components_ranges;
+    auto pip = [] (const utils::chunked_vector<disk_string<uint16_t>>& column_names, bound_kind kind) {
+        std::vector<bytes> key_bytes;
+        key_bytes.reserve(column_names.size());
+        for (auto& value : column_names) {
+            key_bytes.emplace_back(bytes_view(value));
+        }
+        auto ckp = clustering_key_prefix(std::move(key_bytes));
+        return position_in_partition(position_in_partition::range_tag_t(), kind, std::move(ckp));
+    };
+
+    _position_range = position_range(pip(min_elements, bound_kind::incl_start), pip(max_elements, bound_kind::incl_end));
 }
 
 double sstable::estimate_droppable_tombstone_ratio(gc_clock::time_point gc_before) const {
@@ -1271,20 +1262,20 @@ void sstable::write_statistics(const io_priority_class& pc) {
 void sstable::rewrite_statistics(const io_priority_class& pc) {
     auto file_path = filename(component_type::TemporaryStatistics);
     sstlog.debug("Rewriting statistics component of sstable {}", get_filename());
-    file f = new_sstable_component_file(_write_error_handler, file_path, open_flags::wo | open_flags::create | open_flags::truncate).get0();
 
     file_output_stream_options options;
     options.buffer_size = sstable_buffer_size;
     options.io_priority_class = pc;
-    auto w = file_writer(std::move(f), std::move(options));
+    auto w = make_component_file_writer(component_type::TemporaryStatistics, std::move(options),
+            open_flags::wo | open_flags::create | open_flags::truncate).get0();
     write(_version, w, _components->statistics);
-    w.flush().get();
-    w.close().get();
+    w.flush();
+    w.close();
     // rename() guarantees atomicity when renaming a file into place.
     sstable_write_io_check(rename_file, file_path, filename(component_type::Statistics)).get();
 }
 
-future<> sstable::read_summary(const io_priority_class& pc) {
+future<> sstable::read_summary(const io_priority_class& pc) noexcept {
     if (_components->summary) {
         return make_ready_future<>();
     }
@@ -1303,42 +1294,43 @@ future<> sstable::read_summary(const io_priority_class& pc) {
     });
 }
 
-future<file> sstable::open_file(component_type type, open_flags flags, file_open_options opts) {
-    auto f = new_sstable_component_file(_read_error_handler, filename(type), flags, opts);
-    if ((type != component_type::Data && type != component_type::Index)
-                    || get_config().extensions().sstable_file_io_extensions().empty()) {
-        return f;
-    }
-    return f.then([this, type, flags](file f) {
-        return do_with(std::move(f), [this, type, flags](file& f) {
-            auto ext_range = get_config().extensions().sstable_file_io_extensions();
-            return do_for_each(ext_range.begin(), ext_range.end(), [this, &f, type, flags](auto& ext) {
-                // note: we're potentially wrapping more than once. extension mechanism
-                // is responsible for order being sane.
-                return ext->wrap_file(*this, type, f, flags).then([&f](file of) {
-                    if (of) {
-                        f = std::move(of);
-                    }
-                });
-            }).then([&f] {
-                return f;
-            });
-        });
-    });
+future<file> sstable::open_file(component_type type, open_flags flags, file_open_options opts) noexcept {
+    return new_sstable_component_file(_read_error_handler, type, flags, opts);
 }
 
-future<> sstable::open_data() {
-    return when_all(open_file(component_type::Index, open_flags::ro),
-                    open_file(component_type::Data, open_flags::ro))
-                    .then([this] (auto files) {
+future<> sstable::open_or_create_data(open_flags oflags, file_open_options options) noexcept {
+    return when_all_succeed(
+        open_file(component_type::Index, oflags, options).then([this] (file f) { _index_file = std::move(f); }),
+        open_file(component_type::Data, oflags, options).then([this] (file f) { _data_file = std::move(f); })
+    ).discard_result();
+}
 
-        _index_file = std::get<file>(std::get<0>(files).get());
-        _data_file = std::get<file>(std::get<1>(files).get());
-
+future<> sstable::open_data() noexcept {
+    return open_or_create_data(open_flags::ro).then([this] {
         return this->update_info_for_opened_data();
     }).then([this] {
         if (_shards.empty()) {
             _shards = compute_shards_for_this_sstable();
+        }
+        auto* sm = _components->scylla_metadata->data.get<scylla_metadata_type::Sharding, sharding_metadata>();
+        if (!sm) {
+            _open = true;
+            return make_ready_future<>();
+        }
+        auto c = &sm->token_ranges.elements;
+        // Sharding information uses a lot of memory and once we're doing with this computation we will no longer use it.
+        return do_until([c] { return c->empty(); }, [c] {
+            c->pop_back();
+            return make_ready_future<>();
+        }).then([this, c] () mutable {
+            *c = {};
+            _open = true;
+            return make_ready_future<>();
+        });
+    }).then([this] {
+        auto* ld_stats = _components->scylla_metadata->data.get<scylla_metadata_type::LargeDataStats, scylla_metadata::large_data_stats>();
+        if (ld_stats) {
+            _large_data_stats.emplace(*ld_stats);
         }
     });
 }
@@ -1357,26 +1349,27 @@ future<> sstable::update_info_for_opened_data() {
     }).then([this] {
         if (this->has_component(component_type::Filter)) {
             return io_check([&] {
-                return engine().file_size(this->filename(component_type::Filter));
+                return file_size(this->filename(component_type::Filter));
             }).then([this] (auto size) {
                 _filter_file_size = size;
             });
         }
         return make_ready_future<>();
     }).then([this] {
-        this->set_clustering_components_ranges();
+        this->set_position_range();
         this->set_first_and_last_keys();
+        _run_identifier = _components->scylla_metadata->get_optional_run_identifier().value_or(utils::make_random_uuid());
 
         // Get disk usage for this sstable (includes all components).
         _bytes_on_disk = 0;
         return do_for_each(_recognized_components, [this] (component_type c) {
             return this->sstable_write_io_check([&, c] {
-                return engine().file_exists(this->filename(c)).then([this, c] (bool exists) {
+                return file_exists(this->filename(c)).then([this, c] (bool exists) {
                     // ignore summary that isn't present in disk but was previously generated by read_summary().
                     if (!exists && c == component_type::Summary && _components->summary.memory_footprint()) {
                         return make_ready_future<uint64_t>(0);
                     }
-                    return engine().file_size(this->filename(c));
+                    return file_size(this->filename(c));
                 });
             }).then([this] (uint64_t bytes) {
                 _bytes_on_disk += bytes;
@@ -1385,21 +1378,12 @@ future<> sstable::update_info_for_opened_data() {
     });
 }
 
-future<> sstable::create_data() {
+future<> sstable::create_data() noexcept {
     auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
     file_open_options opt;
     opt.extent_allocation_size_hint = 32 << 20;
     opt.sloppy_size = true;
-    return when_all(open_file(component_type::Index, oflags, opt),
-                    open_file(component_type::Data, oflags, opt)).then([this] (auto files) {
-        // FIXME: If both files could not be created, the first get below will
-        // throw an exception, and second get() will not be attempted, and
-        // we'll get a warning about the second future being destructed
-        // without its exception being examined.
-
-        _index_file = std::get<file>(std::get<0>(files).get());
-        _data_file = std::get<file>(std::get<1>(files).get());
-    });
+    return open_or_create_data(oflags, std::move(opt));
 }
 
 future<> sstable::read_filter(const io_priority_class& pc) {
@@ -1413,7 +1397,7 @@ future<> sstable::read_filter(const io_priority_class& pc) {
         read_simple<component_type::Filter>(filter, pc).get();
         auto nr_bits = filter.buckets.elements.size() * std::numeric_limits<typename decltype(filter.buckets.elements)::value_type>::digits;
         large_bitset bs(nr_bits, std::move(filter.buckets.elements));
-        utils::filter_format format = (_version == sstable_version_types::mc)
+        utils::filter_format format = (_version >= sstable_version_types::mc)
                                       ? utils::filter_format::m_format
                                       : utils::filter_format::k_l_format;
         _components->filter = utils::filter::create_filter(filter.hashes, std::move(bs), format);
@@ -1434,22 +1418,30 @@ void sstable::write_filter(const io_priority_class& pc) {
 
 // This interface is only used during tests, snapshot loading and early initialization.
 // No need to set tunable priorities for it.
-future<> sstable::load(const io_priority_class& pc) {
+future<> sstable::load(const io_priority_class& pc) noexcept {
     return read_toc().then([this, &pc] {
-        return seastar::when_all_succeed(
-                read_statistics(pc),
-                read_compression(pc),
-                read_scylla_metadata(pc),
-                read_filter(pc),
-                read_summary(pc)).then([this] {
-            validate_min_max_metadata();
-            validate_max_local_deletion_time();
-            return open_data();
+        // read scylla-meta after toc. Might need it to parse
+        // rest (hint extensions)
+        return read_scylla_metadata(pc).then([this, &pc] {
+            // Read statistics ahead of others - if summary is missing
+            // we'll attempt to re-generate it and we need statistics for that
+            return read_statistics(pc).then([this, &pc] {
+                return seastar::when_all_succeed(
+                        read_compression(pc),
+                        read_filter(pc),
+                        read_summary(pc)).then_unpack([this] {
+                            validate_min_max_metadata();
+                            validate_max_local_deletion_time();
+                            validate_partitioner();
+                            return open_data();
+                        });
+            });
         });
     });
 }
 
-future<> sstable::load(sstables::foreign_sstable_open_info info) {
+future<> sstable::load(sstables::foreign_sstable_open_info info) noexcept {
+    static_assert(std::is_nothrow_move_constructible_v<sstables::foreign_sstable_open_info>);
     return read_toc().then([this, info = std::move(info)] () mutable {
         _components = std::move(info.components);
         _data_file = make_checked_file(_read_error_handler, info.data.to_file());
@@ -1457,509 +1449,19 @@ future<> sstable::load(sstables::foreign_sstable_open_info info) {
         _shards = std::move(info.owners);
         validate_min_max_metadata();
         validate_max_local_deletion_time();
+        validate_partitioner();
         return update_info_for_opened_data();
-    });
-}
-
-future<sstable_open_info> sstable::load_shared_components(const schema_ptr& s, sstring dir, int generation, version_types v, format_types f,
-        const io_priority_class& pc) {
-    auto sst = sstables::make_sstable(s, dir, generation, v, f);
-    return sst->load(pc).then([sst] () mutable {
-        auto info = sstable_open_info{make_lw_shared<shareable_components>(std::move(*sst->_components)),
-            std::move(sst->_shards), std::move(sst->_data_file), std::move(sst->_index_file)};
-        return make_ready_future<sstable_open_info>(std::move(info));
     });
 }
 
 future<foreign_sstable_open_info> sstable::get_open_info() & {
     return _components.copy().then([this] (auto c) mutable {
         return foreign_sstable_open_info{std::move(c), this->get_shards_for_this_sstable(), _data_file.dup(), _index_file.dup(),
-            _generation, _version, _format};
+            _generation, _version, _format, data_size()};
     });
 }
 
-static composite::eoc bound_kind_to_start_marker(bound_kind start_kind) {
-    return start_kind == bound_kind::excl_start
-         ? composite::eoc::end
-         : composite::eoc::start;
-}
-
-static composite::eoc bound_kind_to_end_marker(bound_kind end_kind) {
-    return end_kind == bound_kind::excl_end
-         ? composite::eoc::start
-         : composite::eoc::end;
-}
-
-class bytes_writer_for_column_name {
-    bytes _buf;
-    bytes::iterator _pos;
-public:
-    void prepare(size_t size) {
-        _buf = bytes(bytes::initialized_later(), size);
-        _pos = _buf.begin();
-    }
-
-    template<typename... Args>
-    void write(Args&&... args) {
-        auto write_one = [this] (bytes_view data) {
-            _pos = std::copy(data.begin(), data.end(), _pos);
-        };
-        auto ignore = { (write_one(bytes_view(args)), 0)... };
-        (void)ignore;
-    }
-
-    bytes&& release() && {
-        return std::move(_buf);
-    }
-};
-
-class file_writer_for_column_name {
-    sstable_version_types _v;
-    file_writer& _fw;
-public:
-    file_writer_for_column_name(sstable_version_types v, file_writer& fw) : _v(v), _fw(fw) { }
-
-    void prepare(uint16_t size) {
-        sstables::write(_v, _fw, size);
-    }
-
-    template<typename... Args>
-    void write(Args&&... args) {
-        sstables::write(_v, _fw, std::forward<Args>(args)...);
-    }
-};
-
-template<typename Writer>
-static void write_compound_non_dense_column_name(sstable_version_types v, Writer& out, const composite& clustering_key, const std::vector<bytes_view>& column_names, composite::eoc marker = composite::eoc::none) {
-    // was defined in the schema, for example.
-    auto c = composite::from_exploded(column_names, true, marker);
-    auto ck_bview = bytes_view(clustering_key);
-
-    // The marker is not a component, so if the last component is empty (IOW,
-    // only serializes to the marker), then we just replace the key's last byte
-    // with the marker. If the component however it is not empty, then the
-    // marker should be in the end of it, and we just join them together as we
-    // do for any normal component
-    if (c.size() == 1) {
-        ck_bview.remove_suffix(1);
-    }
-    size_t sz = ck_bview.size() + c.size();
-    if (sz > std::numeric_limits<uint16_t>::max()) {
-        throw std::runtime_error(sprint("Column name too large (%d > %d)", sz, std::numeric_limits<uint16_t>::max()));
-    }
-    out.prepare(uint16_t(sz));
-    out.write(ck_bview, c);
-}
-
-static void write_compound_non_dense_column_name(sstable_version_types v, file_writer& out, const composite& clustering_key, const std::vector<bytes_view>& column_names, composite::eoc marker = composite::eoc::none) {
-    auto w = file_writer_for_column_name(v, out);
-    write_compound_non_dense_column_name(v, w, clustering_key, column_names, marker);
-}
-
-template<typename Writer>
-static void write_column_name(sstable_version_types v, Writer& out, bytes_view column_names) {
-    size_t sz = column_names.size();
-    if (sz > std::numeric_limits<uint16_t>::max()) {
-        throw std::runtime_error(sprint("Column name too large (%d > %d)", sz, std::numeric_limits<uint16_t>::max()));
-    }
-    out.prepare(uint16_t(sz));
-    out.write(column_names);
-}
-
-static void write_column_name(sstable_version_types v, file_writer& out, bytes_view column_names) {
-    auto w = file_writer_for_column_name(v, out);
-    write_column_name(v, w, column_names);
-}
-
-template<typename Writer>
-static void write_column_name(sstable_version_types v, Writer& out, const schema& s, const composite& clustering_element, const std::vector<bytes_view>& column_names, composite::eoc marker = composite::eoc::none) {
-    if (s.is_dense()) {
-        write_column_name(v, out, bytes_view(clustering_element));
-    } else if (s.is_compound()) {
-        write_compound_non_dense_column_name(v, out, clustering_element, column_names, marker);
-    } else {
-        write_column_name(v, out, column_names[0]);
-    }
-}
-
-void sstable::write_range_tombstone_bound(file_writer& out,
-        const schema& s,
-        const composite& clustering_element,
-        const std::vector<bytes_view>& column_names,
-        composite::eoc marker) {
-    if (!_correctly_serialize_non_compound_range_tombstones && !clustering_element.is_compound()) {
-        auto vals = clustering_element.values();
-        write_compound_non_dense_column_name(_version, out, composite::serialize_value(vals, true), column_names, marker);
-    } else {
-        write_column_name(_version, out, s, clustering_element, column_names, marker);
-    }
-}
-
-static void output_promoted_index_entry(bytes_ostream& promoted_index,
-        const bytes& first_col,
-        const bytes& last_col,
-        uint64_t offset, uint64_t width) {
-    char s[2];
-    write_be(s, uint16_t(first_col.size()));
-    promoted_index.write(s, 2);
-    promoted_index.write(first_col);
-    write_be(s, uint16_t(last_col.size()));
-    promoted_index.write(s, 2);
-    promoted_index.write(last_col);
-    char q[8];
-    write_be(q, uint64_t(offset));
-    promoted_index.write(q, 8);
-    write_be(q, uint64_t(width));
-    promoted_index.write(q, 8);
-}
-
-// Call maybe_flush_pi_block() before writing the given sstable atom to the
-// output. This may start a new promoted-index block depending on how much
-// data we've already written since the start of the current block. Starting
-// a new block involves both outputting the range of the old block to the
-// index file, and outputting again the currently-open range tombstones to
-// the data file.
-// TODO: currently, maybe_flush_pi_block serializes the column name on every
-// call, saving it in _pi_write.block_last_colname which we need for closing
-// each block, as well as for closing the last block. We could instead save
-// just the unprocessed arguments, and serialize them only when needed at the
-// end of the block. For this we would need this function to take rvalue
-// references (so data is moved in), and need not to use vector of byte_view
-// (which might be gone later).
-void sstable::maybe_flush_pi_block(file_writer& out,
-        const composite& clustering_key,
-        const std::vector<bytes_view>& column_names,
-        composite::eoc marker) {
-    if (!_schema->clustering_key_size()) {
-        return;
-    }
-    bytes_writer_for_column_name w;
-    write_column_name(_version, w, *_schema, clustering_key, column_names, marker);
-    maybe_flush_pi_block(out, clustering_key, std::move(w).release());
-}
-
-// Overload can only be called if the schema has clustering keys.
-void sstable::maybe_flush_pi_block(file_writer& out,
-        const composite& clustering_key,
-        bytes colname) {
-    if (_pi_write.block_first_colname.empty()) {
-        // This is the first column in the partition, or first column since we
-        // closed a promoted-index block. Remember its name and position -
-        // we'll need to write it to the promoted index.
-        _pi_write.block_start_offset = out.offset();
-        _pi_write.block_next_start_offset = out.offset() + _pi_write.desired_block_size;
-        _pi_write.block_first_colname = colname;
-        _pi_write.block_last_colname = std::move(colname);
-    } else if (out.offset() >= _pi_write.block_next_start_offset) {
-        // If we wrote enough bytes to the partition since we output a sample
-        // to the promoted index, output one now and start a new one.
-        output_promoted_index_entry(_pi_write.data,
-                _pi_write.block_first_colname,
-                _pi_write.block_last_colname,
-                _pi_write.block_start_offset - _c_stats.start_offset,
-                out.offset() - _pi_write.block_start_offset);
-        _pi_write.numblocks++;
-        _pi_write.block_start_offset = out.offset();
-        // Because the new block can be read without the previous blocks, we
-        // need to repeat the range tombstones which are still open.
-        // Note that block_start_offset is before outputting those (so the new
-        // block includes them), but we set block_next_start_offset after - so
-        // even if we wrote a lot of open tombstones, we still get a full
-        // block size of new data.
-        auto& rts = _pi_write.tombstone_accumulator->range_tombstones_for_row(
-                clustering_key_prefix::from_range(clustering_key.values()));
-        for (const auto& rt : rts) {
-            auto start = composite::from_clustering_element(*_pi_write.schemap, rt.start);
-            auto end = composite::from_clustering_element(*_pi_write.schemap, rt.end);
-            write_range_tombstone(out,
-                    start, bound_kind_to_start_marker(rt.start_kind),
-                    end, bound_kind_to_end_marker(rt.end_kind),
-                    {}, rt.tomb);
-        }
-        _pi_write.block_next_start_offset = out.offset() + _pi_write.desired_block_size;
-        _pi_write.block_first_colname = colname;
-        _pi_write.block_last_colname = std::move(colname);
-    } else {
-        // Keep track of the last column in the partition - we'll need it to close
-        // the last block in the promoted index, unfortunately.
-        _pi_write.block_last_colname = std::move(colname);
-    }
-}
-
-void write_cell_value(file_writer& out, const abstract_type& type, bytes_view value) {
-    if (!value.empty()) {
-        if (type.is_fixed_length()) {
-            write(sstable_version_types::mc, out, value);
-        } else {
-            write_vint(out, value.size());
-            write(sstable_version_types::mc, out, value);
-        }
-    }
-}
-
-static inline void update_cell_stats(column_stats& c_stats, api::timestamp_type timestamp) {
-    c_stats.update_timestamp(timestamp);
-    c_stats.cells_count++;
-}
-
-template <typename WriteLengthFunc>
-static void write_counter_value(counter_cell_view ccv, file_writer& out, sstable_version_types v, WriteLengthFunc&& write_len_func) {
-    auto shard_count = ccv.shard_count();
-    static constexpr auto header_entry_size = sizeof(int16_t);
-    static constexpr auto counter_shard_size = 32u; // counter_id: 16 + clock: 8 + value: 8
-    auto total_size = sizeof(int16_t) + shard_count * (header_entry_size + counter_shard_size);
-
-    write_len_func(out, uint32_t(total_size));
-    write(v, out, int16_t(shard_count));
-    for (auto i = 0u; i < shard_count; i++) {
-        write<int16_t>(v, out, std::numeric_limits<int16_t>::min() + i);
-    }
-    auto write_shard = [&] (auto&& s) {
-        auto uuid = s.id().to_uuid();
-        write(v, out, int64_t(uuid.get_most_significant_bits()),
-              int64_t(uuid.get_least_significant_bits()),
-              int64_t(s.logical_clock()), int64_t(s.value()));
-    };
-    if (service::get_local_storage_service().cluster_supports_correct_counter_order()) {
-        for (auto&& s : ccv.shards()) {
-            write_shard(s);
-        }
-    } else {
-        for (auto&& s : ccv.shards_compatible_with_1_7_4()) {
-            write_shard(s);
-        }
-    }
-}
-
-// Intended to write all cell components that follow column name.
-void sstable::write_cell(file_writer& out, atomic_cell_view cell, const column_definition& cdef) {
-    api::timestamp_type timestamp = cell.timestamp();
-
-    update_cell_stats(_c_stats, timestamp);
-
-    if (cell.is_dead(_now)) {
-        // tombstone cell
-
-        column_mask mask = column_mask::deletion;
-        uint32_t deletion_time_size = sizeof(uint32_t);
-        uint32_t deletion_time = cell.deletion_time().time_since_epoch().count();
-
-        _c_stats.update_local_deletion_time(deletion_time);
-        _c_stats.tombstone_histogram.update(deletion_time);
-
-        write(_version, out, mask, timestamp, deletion_time_size, deletion_time);
-    } else if (cdef.is_counter()) {
-        // counter cell
-        assert(!cell.is_counter_update());
-
-        column_mask mask = column_mask::counter;
-        write(_version, out, mask, int64_t(0), timestamp);
-
-        counter_cell_view ccv(cell);
-        write_counter_value(ccv, out, _version, [v = _version] (file_writer& out, uint32_t value) {
-            return write(v, out, value);
-        });
-
-        _c_stats.update_local_deletion_time(std::numeric_limits<int>::max());
-    } else if (cell.is_live_and_has_ttl()) {
-        // expiring cell
-
-        column_mask mask = column_mask::expiration;
-        uint32_t ttl = cell.ttl().count();
-        uint32_t expiration = cell.expiry().time_since_epoch().count();
-        disk_string_view<uint32_t> cell_value { cell.value() };
-
-        _c_stats.update_local_deletion_time(expiration);
-        // tombstone histogram is updated with expiration time because if ttl is longer
-        // than gc_grace_seconds for all data, sstable will be considered fully expired
-        // when actually nothing is expired.
-        _c_stats.tombstone_histogram.update(expiration);
-
-        write(_version, out, mask, ttl, expiration, timestamp, cell_value);
-    } else {
-        // regular cell
-
-        column_mask mask = column_mask::none;
-        disk_string_view<uint32_t> cell_value { cell.value() };
-
-        _c_stats.update_local_deletion_time(std::numeric_limits<int>::max());
-
-        write(_version, out, mask, timestamp, cell_value);
-    }
-}
-
-void sstable::maybe_write_row_marker(file_writer& out, const schema& schema, const row_marker& marker, const composite& clustering_key) {
-    if (!schema.is_compound() || schema.is_dense() || marker.is_missing()) {
-        return;
-    }
-    // Write row mark cell to the beginning of clustered row.
-    index_and_write_column_name(out, clustering_key, { bytes_view() });
-    uint64_t timestamp = marker.timestamp();
-    uint32_t value_length = 0;
-
-    update_cell_stats(_c_stats, timestamp);
-
-    if (marker.is_dead(_now)) {
-        column_mask mask = column_mask::deletion;
-        uint32_t deletion_time_size = sizeof(uint32_t);
-        uint32_t deletion_time = marker.deletion_time().time_since_epoch().count();
-
-        _c_stats.tombstone_histogram.update(deletion_time);
-
-        write(_version, out, mask, timestamp, deletion_time_size, deletion_time);
-    } else if (marker.is_expiring()) {
-        column_mask mask = column_mask::expiration;
-        uint32_t ttl = marker.ttl().count();
-        uint32_t expiration = marker.expiry().time_since_epoch().count();
-        write(_version, out, mask, ttl, expiration, timestamp, value_length);
-    } else {
-        column_mask mask = column_mask::none;
-        write(_version, out, mask, timestamp, value_length);
-    }
-}
-
-void sstable::write_deletion_time(file_writer& out, const tombstone t) {
-    uint64_t timestamp = t.timestamp;
-    uint32_t deletion_time = t.deletion_time.time_since_epoch().count();
-
-    update_cell_stats(_c_stats, timestamp);
-    _c_stats.update_local_deletion_time(deletion_time);
-    _c_stats.tombstone_histogram.update(deletion_time);
-
-    write(_version, out, deletion_time, timestamp);
-}
-
-void sstable::index_tombstone(file_writer& out, const composite& key, range_tombstone&& rt, composite::eoc marker) {
-    maybe_flush_pi_block(out, key, {}, marker);
-    // Remember the range tombstone so when we need to open a new promoted
-    // index block, we can figure out which ranges are still open and need
-    // to be repeated in the data file. Note that apply() also drops ranges
-    // already closed by rt.start, so the accumulator doesn't grow boundless.
-    _pi_write.tombstone_accumulator->apply(std::move(rt));
-}
-
-void sstable::maybe_write_row_tombstone(file_writer& out, const composite& key, const clustering_row& clustered_row) {
-    auto t = clustered_row.tomb();
-    if (!t) {
-        return;
-    }
-    auto rt = range_tombstone(clustered_row.key(), bound_kind::incl_start, clustered_row.key(), bound_kind::incl_end, t.tomb());
-    index_tombstone(out, key, std::move(rt), composite::eoc::none);
-    write_range_tombstone(out, key, composite::eoc::start, key, composite::eoc::end, {}, t.regular());
-    if (t.is_shadowable()) {
-        write_range_tombstone(out, key, composite::eoc::start, key, composite::eoc::end, {}, t.shadowable().tomb(), column_mask::shadowable);
-    }
-}
-
-void sstable::write_range_tombstone(file_writer& out,
-        const composite& start,
-        composite::eoc start_marker,
-        const composite& end,
-        composite::eoc end_marker,
-        std::vector<bytes_view> suffix,
-        const tombstone t,
-        column_mask mask) {
-    if (!_schema->is_compound() && (start_marker == composite::eoc::end || end_marker == composite::eoc::start)) {
-        throw std::logic_error(sprint("Cannot represent marker type in range tombstone for non-compound schemas"));
-    }
-    write_range_tombstone_bound(out, *_schema, start, suffix, start_marker);
-    write(_version, out, mask);
-    write_range_tombstone_bound(out, *_schema, end, suffix, end_marker);
-    write_deletion_time(out, t);
-}
-
-void sstable::write_collection(file_writer& out, const composite& clustering_key, const column_definition& cdef, collection_mutation_view collection) {
-    auto t = static_pointer_cast<const collection_type_impl>(cdef.type);
-    auto mview = t->deserialize_mutation_form(collection);
-    const bytes& column_name = cdef.name();
-    if (mview.tomb) {
-        write_range_tombstone(out, clustering_key, composite::eoc::start, clustering_key, composite::eoc::end, { column_name }, mview.tomb);
-    }
-    for (auto& cp: mview.cells) {
-        index_and_write_column_name(out, clustering_key, { column_name, cp.first });
-        write_cell(out, cp.second, cdef);
-    }
-}
-
-// This function is about writing a clustered_row to data file according to SSTables format.
-// clustered_row contains a set of cells sharing the same clustering key.
-void sstable::write_clustered_row(file_writer& out, const schema& schema, const clustering_row& clustered_row) {
-    auto clustering_key = composite::from_clustering_element(schema, clustered_row.key());
-
-    maybe_write_row_marker(out, schema, clustered_row.marker(), clustering_key);
-    maybe_write_row_tombstone(out, clustering_key, clustered_row);
-
-    if (schema.clustering_key_size()) {
-        column_name_helper::min_max_components(schema, _collector.min_column_names(), _collector.max_column_names(),
-            clustered_row.key().components());
-    }
-
-    // Write all cells of a partition's row.
-    clustered_row.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& c) {
-        auto&& column_definition = schema.regular_column_at(id);
-        // non atomic cell isn't supported yet. atomic cell maps to a single trift cell.
-        // non atomic cell maps to multiple trift cell, e.g. collection.
-        if (!column_definition.is_atomic()) {
-            write_collection(out, clustering_key, column_definition, c.as_collection_mutation());
-            return;
-        }
-        assert(column_definition.is_regular());
-        atomic_cell_view cell = c.as_atomic_cell();
-        std::vector<bytes_view> column_name = { column_definition.name() };
-        index_and_write_column_name(out, clustering_key, column_name);
-        write_cell(out, cell, column_definition);
-    });
-}
-
-void sstable::write_static_row(file_writer& out, const schema& schema, const row& static_row) {
-    assert(schema.is_compound());
-    static_row.for_each_cell([&] (column_id id, const atomic_cell_or_collection& c) {
-        auto&& column_definition = schema.static_column_at(id);
-        if (!column_definition.is_atomic()) {
-            auto sp = composite::static_prefix(schema);
-            write_collection(out, sp, column_definition, c.as_collection_mutation());
-            return;
-        }
-        assert(column_definition.is_static());
-        const auto& column_name = column_definition.name();
-        auto sp = composite::static_prefix(schema);
-        index_and_write_column_name(out, sp, { bytes_view(column_name) });
-        atomic_cell_view cell = c.as_atomic_cell();
-        write_cell(out, cell, column_definition);
-    });
-}
-
-void sstable::index_and_write_column_name(file_writer& out,
-         const composite& clustering_element,
-         const std::vector<bytes_view>& column_names,
-         composite::eoc marker) {
-    if (_schema->clustering_key_size()) {
-        bytes_writer_for_column_name w;
-        write_column_name(_version, w, *_schema, clustering_element, column_names, marker);
-        auto&& colname = std::move(w).release();
-        maybe_flush_pi_block(out, clustering_element, colname);
-        write_column_name(_version, out, colname);
-    } else {
-        write_column_name(_version, out, *_schema, clustering_element, column_names, marker);
-    }
-}
-
-static void write_index_header(sstable_version_types v, file_writer& out, disk_string_view<uint16_t>& key, uint64_t pos) {
-    write(v, out, key, pos);
-}
-
-static void write_index_promoted(sstable_version_types v, file_writer& out, bytes_ostream& promoted_index,
-        deletion_time deltime, uint32_t numblocks) {
-    uint32_t promoted_index_size = promoted_index.size();
-    if (promoted_index_size) {
-        promoted_index_size += 16 /* deltime + numblocks */;
-        write(v, out, promoted_index_size, deltime, numblocks, promoted_index);
-    } else {
-        write(v, out, promoted_index_size);
-    }
-}
-
-static void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min_index_interval) {
+void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min_index_interval) {
     assert(expected_partition_count >= 1);
 
     s.header.min_index_interval = min_index_interval;
@@ -1975,18 +1477,13 @@ static void prepare_summary(summary& s, uint64_t expected_partition_count, uint3
     s.header.memory_size = 0;
 }
 
-static void seal_summary(summary& s,
-        std::experimental::optional<key>&& first_key,
-        std::experimental::optional<key>&& last_key,
+future<> seal_summary(summary& s,
+        std::optional<key>&& first_key,
+        std::optional<key>&& last_key,
         const index_sampling_state& state) {
     s.header.size = s.entries.size();
     s.header.size_at_full_sampling = sstable::get_size_at_full_sampling(state.partition_count, s.header.min_index_interval);
 
-    s.header.memory_size = s.header.size * sizeof(uint32_t);
-    for (auto& e: s.entries) {
-        s.positions.push_back(s.header.memory_size);
-        s.header.memory_size += e.key.size() + sizeof(e.position);
-    }
     assert(first_key); // assume non-empty sstable
     s.first_key.value = first_key->get_bytes();
 
@@ -1996,6 +1493,13 @@ static void seal_summary(summary& s,
         // An empty last_mutation indicates we had just one partition
         s.last_key.value = s.first_key.value;
     }
+
+    s.header.memory_size = s.header.size * sizeof(uint32_t);
+    s.positions.reserve(s.entries.size());
+    return do_for_each(s.entries, [&s] (summary_entry& e) {
+        s.positions.push_back(s.header.memory_size);
+        s.header.memory_size += e.key.size() + sizeof(e.position);
+    });
 }
 
 static
@@ -2007,12 +1511,13 @@ populate_statistics_offsets(sstable_version_types v, statistics& s) {
 
     // populate the hash with garbage so we can calculate its size
     for (auto t : types) {
-        s.hash.map[t] = -1;
+        s.offsets.elements.emplace_back(t, -1);
     }
 
-    auto offset = serialized_size(v, s.hash);
+    auto offset = serialized_size(v, s.offsets);
+    s.offsets.elements.clear();
     for (auto t : types) {
-        s.hash.map[t] = offset;
+        s.offsets.elements.emplace_back(t, offset);
         offset += s.contents[t]->serialized_size(v);
     }
 }
@@ -2022,7 +1527,9 @@ sharding_metadata
 create_sharding_metadata(schema_ptr schema, const dht::decorated_key& first_key, const dht::decorated_key& last_key, shard_id shard) {
     auto prange = dht::partition_range::make(dht::ring_position(first_key), dht::ring_position(last_key));
     auto sm = sharding_metadata();
-    for (auto&& range : dht::split_range_to_single_shard(*schema, prange, shard)) {
+    auto&& ranges = dht::split_range_to_single_shard(*schema, prange, shard).get0();
+    sm.token_ranges.elements.reserve(ranges.size());
+    for (auto&& range : std::move(ranges)) {
         if (true) { // keep indentation
             // we know left/right are not infinite
             auto&& left = range.start()->value();
@@ -2032,70 +1539,18 @@ create_sharding_metadata(schema_ptr schema, const dht::decorated_key& first_key,
             auto&& right_token = right.token();
             auto right_exclusive = !right.has_key() && right.bound() == dht::ring_position::token_bound::start;
             sm.token_ranges.elements.push_back(disk_token_range{
-                {left_exclusive, to_bytes(bytes_view(left_token._data))},
-                {right_exclusive, to_bytes(bytes_view(right_token._data))}});
+                {left_exclusive, left_token.data()},
+                {right_exclusive, right_token.data()}});
         }
     }
     return sm;
 }
 
-template <typename T>
-static bytes_array_vint_size to_bytes_array_vint_size(const T& t) {
-    static_assert(sizeof(typename T::value_type) == 1, "Only single-byte char types are allowed");
-    bytes_array_vint_size result;
-    boost::copy(t, std::back_inserter(result.elements));
-    return result;
-}
-
-static sstring pk_type_to_string(const schema& s) {
-    if (s.partition_key_size() == 1) {
-        return s.partition_key_columns().begin()->type->name();
-    } else {
-        sstring type_params = ::join(",", s.partition_key_columns()
-                            | boost::adaptors::transformed(std::mem_fn(&column_definition::type))
-                            | boost::adaptors::transformed(std::mem_fn(&abstract_type::name)));
-        return "org.apache.cassandra.db.marshal.CompositeType(" + type_params + ")";
-    }
-}
-
-static serialization_header make_serialization_header(const schema& s, const encoding_stats& enc_stats) {
-    serialization_header header;
-    header.min_timestamp.value = enc_stats.min_timestamp - encoding_stats::timestamp_epoch;
-    header.min_local_deletion_time.value = enc_stats.min_local_deletion_time - encoding_stats::deletion_time_epoch;
-    header.min_ttl.value = enc_stats.min_ttl - encoding_stats::ttl_epoch;
-
-    header.pk_type_name = to_bytes_array_vint_size(pk_type_to_string(s));
-
-    header.clustering_key_types_names.elements.reserve(s.clustering_key_size());
-    for (const auto& ck_column : s.clustering_key_columns()) {
-        auto ck_type_name = to_bytes_array_vint_size(ck_column.type->name());
-        header.clustering_key_types_names.elements.push_back(std::move(ck_type_name));
-    }
-
-    header.static_columns.elements.reserve(s.static_columns_count());
-    for (const auto& static_column : s.static_columns()) {
-        serialization_header::column_desc cd;
-        cd.name = to_bytes_array_vint_size(static_column.name());
-        cd.type_name = to_bytes_array_vint_size(static_column.type->name());
-        header.static_columns.elements.push_back(std::move(cd));
-    }
-
-    header.regular_columns.elements.reserve(s.regular_columns_count());
-    for (const auto& regular_column : s.regular_columns()) {
-        serialization_header::column_desc cd;
-        cd.name = to_bytes_array_vint_size(regular_column.name());
-        cd.type_name = to_bytes_array_vint_size(regular_column.type->name());
-        header.regular_columns.elements.push_back(std::move(cd));
-    }
-
-    return header;
-}
-
 // In the beginning of the statistics file, there is a disk_hash used to
 // map each metadata type to its correspondent position in the file.
-static void seal_statistics(sstable_version_types v, statistics& s, metadata_collector& collector,
+void seal_statistics(sstable_version_types v, statistics& s, metadata_collector& collector, const std::set<int>& _compaction_ancestors,
         const sstring partitioner, double bloom_filter_fp_chance, schema_ptr schema,
-        const dht::decorated_key& first_key, const dht::decorated_key& last_key, encoding_stats enc_stats = {}) {
+        const dht::decorated_key& first_key, const dht::decorated_key& last_key, const encoding_stats& enc_stats) {
     validation_metadata validation;
     compaction_metadata compaction;
     stats_metadata stats;
@@ -2105,260 +1560,38 @@ static void seal_statistics(sstable_version_types v, statistics& s, metadata_col
     s.contents[metadata_type::Validation] = std::make_unique<validation_metadata>(std::move(validation));
 
     collector.construct_compaction(compaction);
+    if (v < sstable_version_types::mc && !_compaction_ancestors.empty()) {
+        compaction.ancestors.elements = utils::chunked_vector<uint32_t>(_compaction_ancestors.begin(), _compaction_ancestors.end());
+    }
     s.contents[metadata_type::Compaction] = std::make_unique<compaction_metadata>(std::move(compaction));
 
     collector.construct_stats(stats);
     s.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
 
-    if (v == sstable_version_types::mc) {
-        auto header = make_serialization_header(*schema, enc_stats);
-        s.contents[metadata_type::Serialization] = std::make_unique<serialization_header>(std::move(header));
-    }
-
     populate_statistics_offsets(v, s);
 }
 
-void components_writer::maybe_add_summary_entry(summary& s, const dht::token& token, bytes_view key, uint64_t data_offset,
+void maybe_add_summary_entry(summary& s, const dht::token& token, bytes_view key, uint64_t data_offset,
         uint64_t index_offset, index_sampling_state& state) {
     state.partition_count++;
     // generates a summary entry when possible (= keep summary / data size ratio within reasonable limits)
     if (data_offset >= state.next_data_offset_to_write_summary) {
         auto entry_size = 8 + 2 + key.size();  // offset + key_size.size + key.size
         state.next_data_offset_to_write_summary += state.summary_byte_cost * entry_size;
-        auto token_data = s.add_summary_data(bytes_view(token._data));
+        s.add_summary_data(token.data());
         auto key_data = s.add_summary_data(key);
-        s.entries.push_back({ dht::token_view(dht::token::kind::key, token_data), key_data, index_offset });
-    }
-}
-
-void components_writer::maybe_add_summary_entry(const dht::token& token, bytes_view key) {
-    return maybe_add_summary_entry(_sst._components->summary, token, key, get_offset(),
-        _index.offset(), _index_sampling_state);
-}
-
-// Returns offset into data component.
-uint64_t components_writer::get_offset() const {
-    if (_sst.has_component(component_type::CompressionInfo)) {
-        // Variable returned by compressed_file_length() is constantly updated by compressed output stream.
-        return _sst._components->compression.compressed_file_length();
-    } else {
-        return _out.offset();
-    }
-}
-
-file_writer components_writer::index_file_writer(sstable& sst, const io_priority_class& pc) {
-    file_output_stream_options options;
-    options.buffer_size = sst.sstable_buffer_size;
-    options.io_priority_class = pc;
-    options.write_behind = 10;
-    return file_writer(std::move(sst._index_file), std::move(options));
-}
-
-// Get the currently loaded configuration, or the default configuration in
-// case none has been loaded (this happens, for example, in unit tests).
-static const db::config& get_config() {
-    if (service::get_storage_service().local_is_initialized() &&
-            service::get_local_storage_service().db().local_is_initialized()) {
-        return service::get_local_storage_service().db().local().get_config();
-    } else {
-        static db::config default_config;
-        return default_config;
+        s.entries.push_back({ token, key_data, index_offset });
     }
 }
 
 // Returns the cost for writing a byte to summary such that the ratio of summary
 // to data will be 1 to cost by the time sstable is sealed.
-static size_t summary_byte_cost() {
-    auto summary_ratio = get_config().sstable_summary_ratio();
-    return summary_ratio ? (1 / summary_ratio) : components_writer::default_summary_byte_cost;
-}
-
-components_writer::components_writer(sstable& sst, const schema& s, file_writer& out,
-                                     uint64_t estimated_partitions,
-                                     const sstable_writer_config& cfg,
-                                     const io_priority_class& pc)
-    : _sst(sst)
-    , _schema(s)
-    , _out(out)
-    , _index(index_file_writer(sst, pc))
-    , _index_needs_close(true)
-    , _max_sstable_size(cfg.max_sstable_size)
-    , _tombstone_written(false)
-    , _range_tombstones(s)
-    , _large_partition_handler(cfg.large_partition_handler)
-{
-    _sst._components->filter = utils::i_filter::get_filter(estimated_partitions, _schema.bloom_filter_fp_chance(), utils::filter_format::k_l_format);
-    _sst._pi_write.desired_block_size = cfg.promoted_index_block_size.value_or(get_config().column_index_size_in_kb() * 1024);
-    _sst._correctly_serialize_non_compound_range_tombstones = cfg.correctly_serialize_non_compound_range_tombstones;
-    _index_sampling_state.summary_byte_cost = summary_byte_cost();
-
-    prepare_summary(_sst._components->summary, estimated_partitions, _schema.min_index_interval());
-
-    // FIXME: we may need to set repaired_at stats at this point.
-}
-
-void components_writer::consume_new_partition(const dht::decorated_key& dk) {
-    // Set current index of data to later compute row size.
-    _sst._c_stats.start_offset = _out.offset();
-
-    _partition_key = key::from_partition_key(_schema, dk.key());
-
-    maybe_add_summary_entry(dk.token(), bytes_view(*_partition_key));
-    _sst._components->filter->add(bytes_view(*_partition_key));
-    _sst._collector.add_key(bytes_view(*_partition_key));
-
-    auto p_key = disk_string_view<uint16_t>();
-    p_key.value = bytes_view(*_partition_key);
-
-    // Write index file entry for partition key into index file.
-    // Write an index entry minus the "promoted index" (sample of columns)
-    // part. We can only write that after processing the entire partition
-    // and collecting the sample of columns.
-    write_index_header(_sst.get_version(), _index, p_key, _out.offset());
-    _sst._pi_write.data = {};
-    _sst._pi_write.numblocks = 0;
-    _sst._pi_write.deltime.local_deletion_time = std::numeric_limits<int32_t>::max();
-    _sst._pi_write.deltime.marked_for_delete_at = std::numeric_limits<int64_t>::min();
-    _sst._pi_write.block_start_offset = _out.offset();
-    _sst._pi_write.tombstone_accumulator = range_tombstone_accumulator(_schema, false);
-    _sst._pi_write.schemap = &_schema; // sadly we need this
-
-    // Write partition key into data file.
-    write(_sst.get_version(), _out, p_key);
-
-    _tombstone_written = false;
-}
-
-void components_writer::consume(tombstone t) {
-    deletion_time d;
-
-    if (t) {
-        d.local_deletion_time = t.deletion_time.time_since_epoch().count();
-        d.marked_for_delete_at = t.timestamp;
-
-        _sst._c_stats.tombstone_histogram.update(d.local_deletion_time);
-        _sst._c_stats.update_local_deletion_time(d.local_deletion_time);
-        _sst._c_stats.update_timestamp(d.marked_for_delete_at);
-    } else {
-        // Default values for live, undeleted rows.
-        d.local_deletion_time = std::numeric_limits<int32_t>::max();
-        d.marked_for_delete_at = std::numeric_limits<int64_t>::min();
-    }
-    write(_sst.get_version(), _out, d);
-    _tombstone_written = true;
-    // TODO: need to verify we don't do this twice?
-    _sst._pi_write.deltime = d;
-}
-
-stop_iteration components_writer::consume(static_row&& sr) {
-    ensure_tombstone_is_written();
-    _sst.write_static_row(_out, _schema, sr.cells());
-    return stop_iteration::no;
-}
-
-stop_iteration components_writer::consume(clustering_row&& cr) {
-    drain_tombstones(cr.position());
-    _sst.write_clustered_row(_out, _schema, cr);
-    return stop_iteration::no;
-}
-
-void components_writer::drain_tombstones(position_in_partition_view pos) {
-    ensure_tombstone_is_written();
-    while (auto mfo = _range_tombstones.get_next(pos)) {
-        write_tombstone(std::move(mfo->as_mutable_range_tombstone()));
-    }
-}
-
-void components_writer::drain_tombstones() {
-    ensure_tombstone_is_written();
-    while (auto mfo = _range_tombstones.get_next()) {
-        write_tombstone(std::move(mfo->as_mutable_range_tombstone()));
-    }
-}
-
-stop_iteration components_writer::consume(range_tombstone&& rt) {
-    drain_tombstones(rt.position());
-    _range_tombstones.apply(std::move(rt));
-    return stop_iteration::no;
-}
-
-void components_writer::write_tombstone(range_tombstone&& rt) {
-    auto start = composite::from_clustering_element(_schema, rt.start);
-    auto start_marker = bound_kind_to_start_marker(rt.start_kind);
-    auto end = composite::from_clustering_element(_schema, rt.end);
-    auto end_marker = bound_kind_to_end_marker(rt.end_kind);
-    auto tomb = rt.tomb;
-    _sst.index_tombstone(_out, start, std::move(rt), start_marker);
-    _sst.write_range_tombstone(_out, std::move(start), start_marker, std::move(end), end_marker, {}, tomb);
-}
-
-stop_iteration components_writer::consume_end_of_partition() {
-    drain_tombstones();
-
-    // If there is an incomplete block in the promoted index, write it too.
-    // However, if the _promoted_index is still empty, don't add a single
-    // chunk - better not output a promoted index at all in this case.
-    if (!_sst._pi_write.data.empty() && !_sst._pi_write.block_first_colname.empty()) {
-        output_promoted_index_entry(_sst._pi_write.data,
-            _sst._pi_write.block_first_colname,
-            _sst._pi_write.block_last_colname,
-            _sst._pi_write.block_start_offset - _sst._c_stats.start_offset,
-            _out.offset() - _sst._pi_write.block_start_offset);
-        _sst._pi_write.numblocks++;
-    }
-    write_index_promoted(_sst.get_version(), _index, _sst._pi_write.data, _sst._pi_write.deltime,
-            _sst._pi_write.numblocks);
-    _sst._pi_write.data = {};
-    _sst._pi_write.block_first_colname = {};
-
-    int16_t end_of_row = 0;
-    write(_sst.get_version(), _out, end_of_row);
-
-    // compute size of the current row.
-    _sst._c_stats.partition_size = _out.offset() - _sst._c_stats.start_offset;
-
-    _large_partition_handler->maybe_update_large_partitions(_sst, *_partition_key, _sst._c_stats.partition_size);
-
-    // update is about merging column_stats with the data being stored by collector.
-    _sst._collector.update(std::move(_sst._c_stats));
-    _sst._c_stats.reset();
-
-    if (!_first_key) {
-        _first_key = *_partition_key;
-    }
-    _last_key = std::move(*_partition_key);
-
-    return get_offset() < _max_sstable_size ? stop_iteration::no : stop_iteration::yes;
-}
-
-void components_writer::consume_end_of_stream() {
-    // what if there is only one partition? what if it is empty?
-    seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state);
-
-    _index_needs_close = false;
-    _index.close().get();
-
-    if (_sst.has_component(component_type::CompressionInfo)) {
-        _sst._collector.add_compression_ratio(_sst._components->compression.compressed_file_length(), _sst._components->compression.uncompressed_file_length());
-    }
-
-    _sst.set_first_and_last_keys();
-    seal_statistics(_sst.get_version(), _sst._components->statistics, _sst._collector, dht::global_partitioner().name(), _schema.bloom_filter_fp_chance(),
-            _sst._schema, _sst.get_first_decorated_key(), _sst.get_last_decorated_key());
-}
-
-components_writer::~components_writer() {
-    if (_index_needs_close) {
-        try {
-            _index.close().get();
-        } catch (...) {
-            sstlog.error("components_writer failed to close file: {}", std::current_exception());
-        }
-    }
+size_t summary_byte_cost(double summary_ratio) {
+    return summary_ratio ? (1 / summary_ratio) : index_sampling_state::default_summary_byte_cost;
 }
 
 future<>
-sstable::read_scylla_metadata(const io_priority_class& pc) {
+sstable::read_scylla_metadata(const io_priority_class& pc) noexcept {
     if (_components->scylla_metadata) {
         return make_ready_future<>();
     }
@@ -2372,7 +1605,8 @@ sstable::read_scylla_metadata(const io_priority_class& pc) {
 }
 
 void
-sstable::write_scylla_metadata(const io_priority_class& pc, shard_id shard, sstable_enabled_features features) {
+sstable::write_scylla_metadata(const io_priority_class& pc, shard_id shard, sstable_enabled_features features, struct run_identifier identifier,
+        std::optional<scylla_metadata::large_data_stats> ld_stats) {
     auto&& first_key = get_first_decorated_key();
     auto&& last_key = get_last_decorated_key();
     auto sm = create_sharding_metadata(_schema, first_key, last_key, shard);
@@ -2380,7 +1614,7 @@ sstable::write_scylla_metadata(const io_priority_class& pc, shard_id shard, ssta
     // sstable write may fail to generate empty metadata if mutation source has only data from other shard.
     // see https://github.com/scylladb/scylla/issues/2932 for details on how it can happen.
     if (sm.token_ranges.elements.empty()) {
-        throw std::runtime_error(sprint("Failed to generate sharding metadata for %s", get_filename()));
+        throw std::runtime_error(format("Failed to generate sharding metadata for {}", get_filename()));
     }
 
     if (!_components->scylla_metadata) {
@@ -2389,909 +1623,45 @@ sstable::write_scylla_metadata(const io_priority_class& pc, shard_id shard, ssta
 
     _components->scylla_metadata->data.set<scylla_metadata_type::Sharding>(std::move(sm));
     _components->scylla_metadata->data.set<scylla_metadata_type::Features>(std::move(features));
+    _components->scylla_metadata->data.set<scylla_metadata_type::RunIdentifier>(std::move(identifier));
+    if (ld_stats) {
+        _components->scylla_metadata->data.set<scylla_metadata_type::LargeDataStats>(std::move(*ld_stats));
+    }
 
     write_simple<component_type::Scylla>(*_components->scylla_metadata, pc);
 }
 
-struct sstable_writer::writer_impl {
-    virtual void consume_new_partition(const dht::decorated_key& dk) = 0;
-    virtual void consume(tombstone t) = 0;
-    virtual stop_iteration consume(static_row&& sr) = 0;
-    virtual stop_iteration consume(clustering_row&& cr) = 0;
-    virtual stop_iteration consume(range_tombstone&& rt) = 0;
-    virtual stop_iteration consume_end_of_partition() = 0;
-    virtual void consume_end_of_stream() = 0;
-    virtual ~writer_impl() {}
-};
-
-class sstable_writer_k_l : public sstable_writer::writer_impl {
-    sstable& _sst;
-    const schema& _schema;
-    const io_priority_class& _pc;
-    bool _backup;
-    bool _leave_unsealed;
-    bool _compression_enabled;
-    std::unique_ptr<file_writer> _writer;
-    stdx::optional<components_writer> _components_writer;
-    shard_id _shard; // Specifies which shard new sstable will belong to.
-    write_monitor* _monitor;
-    bool _correctly_serialize_non_compound_range_tombstones;
-private:
-    void prepare_file_writer();
-    void finish_file_writer();
-public:
-    sstable_writer_k_l(sstable& sst, const schema& s, uint64_t estimated_partitions,
-            const sstable_writer_config&, const io_priority_class& pc, shard_id shard = engine().cpu_id());
-    ~sstable_writer_k_l();
-    sstable_writer_k_l(sstable_writer_k_l&& o) : _sst(o._sst), _schema(o._schema), _pc(o._pc), _backup(o._backup),
-            _leave_unsealed(o._leave_unsealed), _compression_enabled(o._compression_enabled), _writer(std::move(o._writer)),
-            _components_writer(std::move(o._components_writer)), _shard(o._shard), _monitor(o._monitor),
-            _correctly_serialize_non_compound_range_tombstones(o._correctly_serialize_non_compound_range_tombstones) { }
-    void consume_new_partition(const dht::decorated_key& dk) override { return _components_writer->consume_new_partition(dk); }
-    void consume(tombstone t) override { _components_writer->consume(t); }
-    stop_iteration consume(static_row&& sr) override { return _components_writer->consume(std::move(sr)); }
-    stop_iteration consume(clustering_row&& cr) override { return _components_writer->consume(std::move(cr)); }
-    stop_iteration consume(range_tombstone&& rt) override { return _components_writer->consume(std::move(rt)); }
-    stop_iteration consume_end_of_partition() override { return _components_writer->consume_end_of_partition(); }
-    void consume_end_of_stream() override;
-};
-
-void sstable_writer_k_l::prepare_file_writer()
-{
-    file_output_stream_options options;
-    options.io_priority_class = _pc;
-    options.buffer_size = _sst.sstable_buffer_size;
-    options.write_behind = 10;
-
-    if (!_compression_enabled) {
-        _writer = std::make_unique<adler32_checksummed_file_writer>(std::move(_sst._data_file), std::move(options));
-    } else {
-        _writer = std::make_unique<file_writer>(make_compressed_file_k_l_format_output_stream(
-                std::move(_sst._data_file), std::move(options), &_sst._components->compression, _schema.get_compressor_params()));
-    }
-}
-
-void sstable_writer_k_l::finish_file_writer()
-{
-    auto writer = std::move(_writer);
-    writer->close().get();
-
-    if (!_compression_enabled) {
-        auto chksum_wr = static_cast<adler32_checksummed_file_writer*>(writer.get());
-        write_digest(_sst.get_version(), _sst._write_error_handler, _sst.filename(component_type::Digest), chksum_wr->full_checksum());
-        write_crc(_sst.get_version(), _sst._write_error_handler, _sst.filename(component_type::CRC), chksum_wr->finalize_checksum());
-    } else {
-        write_digest(_sst.get_version(), _sst._write_error_handler, _sst.filename(component_type::Digest), _sst._components->compression.get_full_checksum());
-    }
-}
-
-sstable_writer_k_l::~sstable_writer_k_l() {
-    if (_writer) {
-        try {
-            _writer->close().get();
-        } catch (...) {
-            sstlog.error("sstable_writer failed to close file: {}", std::current_exception());
-        }
-    }
-}
-
-sstable_writer_k_l::sstable_writer_k_l(sstable& sst, const schema& s, uint64_t estimated_partitions,
-                               const sstable_writer_config& cfg, const io_priority_class& pc, shard_id shard)
-    : _sst(sst)
-    , _schema(s)
-    , _pc(pc)
-    , _backup(cfg.backup)
-    , _leave_unsealed(cfg.leave_unsealed)
-    , _shard(shard)
-    , _monitor(cfg.monitor)
-    , _correctly_serialize_non_compound_range_tombstones(cfg.correctly_serialize_non_compound_range_tombstones)
-{
-    _sst.generate_toc(_schema.get_compressor_params().get_compressor(), _schema.bloom_filter_fp_chance());
-    _sst.write_toc(_pc);
-    _sst.create_data().get();
-    _compression_enabled = !_sst.has_component(component_type::CRC);
-    prepare_file_writer();
-
-    _monitor->on_write_started(_writer->offset_tracker());
-    _components_writer.emplace(_sst, _schema, *_writer, estimated_partitions, cfg, _pc);
-    _sst._shards = { shard };
-}
-
-static sstable_enabled_features all_features() {
-    return sstable_enabled_features{(1 << sstable_feature::End) - 1};
-}
-
-void sstable_writer_k_l::consume_end_of_stream()
-{
-    _monitor->on_data_write_completed();
-
-    _components_writer->consume_end_of_stream();
-    _components_writer = stdx::nullopt;
-    finish_file_writer();
-    _sst.write_summary(_pc);
-    _sst.write_filter(_pc);
-    _sst.write_statistics(_pc);
-    _sst.write_compression(_pc);
-    auto features = all_features();
-    if (!_correctly_serialize_non_compound_range_tombstones) {
-        features.disable(sstable_feature::NonCompoundRangeTombstones);
-    }
-    _sst.write_scylla_metadata(_pc, _shard, std::move(features));
-
-    _monitor->on_write_completed();
-
-    if (!_leave_unsealed) {
-        _sst.seal_sstable(_backup).get();
+bool sstable::may_contain_rows(const query::clustering_row_ranges& ranges) const {
+    if (_version < sstables::sstable_version_types::md) {
+        return true;
     }
 
-    _monitor->on_flush_completed();
-}
-
-enum class cell_flags : uint8_t {
-    none = 0x00,
-    is_deleted_mask = 0x01, // Whether the cell is a tombstone or not.
-    is_expiring_mask = 0x02, // Whether the cell is expiring.
-    has_empty_value_mask = 0x04, // Whether the cell has an empty value. This will be the case for a tombstone in particular.
-    use_row_timestamp_mask = 0x08, // Whether the cell has the same timestamp as the row this is a cell of.
-    use_row_ttl_mask = 0x10, // Whether the cell has the same TTL as the row this is a cell of.
-};
-
-inline cell_flags operator& (cell_flags lhs, cell_flags rhs) {
-    return cell_flags(static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs));
-}
-
-inline cell_flags& operator |= (cell_flags& lhs, cell_flags rhs) {
-    lhs = cell_flags(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
-    return lhs;
-}
-
-enum class row_flags : uint8_t {
-    none = 0x00,
-    // Signal the end of the partition. Nothing follows a <flags> field with that flag.
-    end_of_partition = 0x01,
-    // Whether the encoded unfiltered is a marker or a row. All following flags apply only to rows.
-    is_marker = 0x02,
-    // Whether the encoded row has a timestamp (i.e. its liveness_info is not empty).
-    has_timestamp = 0x04,
-    // Whether the encoded row has some expiration info (i.e. if its liveness_info contains TTL and local_deletion).
-    has_ttl = 0x08,
-    // Whether the encoded row has some deletion info.
-    has_deletion = 0x10,
-    // Whether the encoded row has all of the columns from the header present.
-    has_all_columns = 0x20,
-    // Whether the encoded row has some complex deletion for at least one of its complex columns.
-    has_complex_deletion = 0x40,
-    // If present, another byte is read containing the "extended flags" below.
-    extension_flag = 0x80
-};
-
-inline row_flags operator& (row_flags lhs, row_flags rhs) {
-    return row_flags(static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs));
-}
-
-inline row_flags& operator |= (row_flags& lhs, row_flags rhs) {
-    lhs = row_flags(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
-    return lhs;
-}
-
-enum class row_extended_flags : uint8_t {
-    none = 0x00,
-    // Whether the encoded row is a static. If there is no extended flag, the row is assumed not static.
-    is_static = 0x01,
-    // Whether the row deletion is shadowable. If there is no extended flag (or no row deletion)
-    // the deletion is assumed not shadowable.
-    // This flag is deprecated in Origin - see CASSANDRA-11500.
-    has_shadowable_deletion = 0x02,
-};
-
-// Used for writing SSTables in 'mc' format.
-class sstable_writer_m : public sstable_writer::writer_impl {
-private:
-    sstable& _sst;
-    const schema& _schema;
-    const io_priority_class& _pc;
-    sstable_writer_config _cfg;
-    encoding_stats _enc_stats;
-    shard_id _shard; // Specifies which shard the new SStable will belong to.
-    bool _compression_enabled = false;
-    std::unique_ptr<file_writer> _data_writer;
-    std::optional<file_writer> _index_writer;
-    bool _tombstone_written = false;
-    bool _row_deletion_written = false;
-    // The length of partition header (partition key, partition deletion and static row, if present)
-    // as written to the data file
-    // Used for writing promoted index
-    uint64_t _partition_header_length = 0;
-    uint64_t _prev_row_start = 0;
-    std::optional<key> _partition_key;
-    stdx::optional<key> _first_key, _last_key;
-    index_sampling_state _index_sampling_state;
-    struct pi_block {
-        clustering_key_prefix first;
-        clustering_key_prefix last;
-        uint64_t offset;
-        uint64_t width;
-    };
-    // _pi_write_m is used temporarily for building the promoted
-    // index (column sample) of one partition when writing a new sstable.
-    struct {
-        // Unfortunately we cannot output the promoted index directly to the
-        // index file because it needs to be prepended by its size.
-        seastar::circular_buffer<pi_block> promoted_index;
-        tombstone tomb;
-        uint64_t block_start_offset;
-        uint64_t block_next_start_offset;
-        std::optional<clustering_key_prefix> first_clustering;
-        std::optional<clustering_key_prefix> last_clustering;
-        size_t desired_block_size;
-    } _pi_write_m;
-    column_stats _c_stats;
-
-    void init_file_writers();
-    void close_data_writer();
-    void ensure_tombstone_is_written() {
-        if (!_tombstone_written) {
-            consume(tombstone());
+    // Include sstables with tombstones that are not scylla's since
+    // they may contain partition tombstones that are not taken into
+    // account in min/max coloumn names metadata.
+    // We clear min/max metadata for partition tombstones so they
+    // will match as containing the rows we're looking for.
+    if (!has_scylla_component()) {
+        if (get_stats_metadata().estimated_tombstone_drop_time.bin.size()) {
+            return true;
         }
     }
 
-    void maybe_add_summary_entry(const dht::token& token, bytes_view key) {
-        return components_writer::maybe_add_summary_entry(
-            _sst._components->summary, token, key, get_data_offset(),
-            _index_writer->offset(), _index_sampling_state);
-    }
-
-    uint64_t get_data_offset() const {
-        if (_sst.has_component(component_type::CompressionInfo)) {
-            // Variable returned by compressed_file_length() is constantly updated by compressed output stream.
-            return _sst._components->compression.compressed_file_length();
-        } else {
-            return _data_writer->offset();
-        }
-    }
-
-    void write_delta_timestamp(file_writer& writer, api::timestamp_type timestamp) {
-        sstables::write_delta_timestamp(writer, timestamp, _enc_stats);
-    }
-    void write_delta_ttl(file_writer& writer, uint32_t ttl) {
-        sstables::write_delta_ttl(writer, ttl, _enc_stats);
-    }
-    void write_delta_local_deletion_time(file_writer& writer, uint32_t ldt) {
-        sstables::write_delta_local_deletion_time(writer, ldt, _enc_stats);
-    }
-    void write_delta_deletion_time(file_writer& writer, deletion_time dt) {
-        sstables::write_delta_deletion_time(writer, dt, _enc_stats);
-    }
-
-    struct row_time_properties {
-        std::optional<api::timestamp_type> timestamp;
-        std::optional<uint32_t> ttl;
-        std::optional<uint32_t> local_deletion_time;
-    };
-
-    // Writes single atomic cell
-    void write_cell(file_writer& writer, atomic_cell_view cell, const column_definition& cdef,
-                    const row_time_properties& properties, bytes_view cell_path = {});
-
-    // Writes information about row liveness (formerly 'row marker')
-    void write_liveness_info(file_writer& writer, const row_marker& marker);
-
-    // Writes a CQL collection (list, set or map)
-    void write_collection(file_writer& writer, const column_definition& cdef, collection_mutation_view collection,
-                          const row_time_properties& properties, bool has_complex_deletion);
-
-    void write_cells(file_writer& writer, column_kind kind, const row& row_body, const row_time_properties& properties, bool has_complex_deletion = false);
-    void write_row_body(file_writer& writer, const clustering_row& row, bool has_complex_deletion);
-    void write_static_row(const row& static_row);
-    void write_clustered_row(const clustering_row& clustered_row, uint64_t prev_row_size);
-    void write_promoted_index(file_writer& writer);
-public:
-
-    sstable_writer_m(sstable& sst, const schema& s, uint64_t estimated_partitions,
-            const sstable_writer_config& cfg, encoding_stats enc_stats,
-                      const io_priority_class& pc, shard_id shard = engine().cpu_id())
-        : _sst(sst)
-        , _schema(s)
-        , _pc(pc)
-        , _cfg(cfg)
-        , _enc_stats(enc_stats)
-        , _shard(shard)
-    {
-        _sst.generate_toc(_schema.get_compressor_params().get_compressor(), _schema.bloom_filter_fp_chance());
-        _sst.write_toc(_pc);
-        _sst.create_data().get();
-        _compression_enabled = !_sst.has_component(component_type::CRC);
-        init_file_writers();
-        _sst._shards = { shard };
-
-        _cfg.monitor->on_write_started(_data_writer->offset_tracker());
-        _sst._components->filter = utils::i_filter::get_filter(estimated_partitions, _schema.bloom_filter_fp_chance(), utils::filter_format::m_format);
-        _pi_write_m.desired_block_size = cfg.promoted_index_block_size.value_or(get_config().column_index_size_in_kb() * 1024);
-        _sst._correctly_serialize_non_compound_range_tombstones = _cfg.correctly_serialize_non_compound_range_tombstones;
-        _index_sampling_state.summary_byte_cost = summary_byte_cost();
-        prepare_summary(_sst._components->summary, estimated_partitions, _schema.min_index_interval());
-    }
-
-    ~sstable_writer_m();
-    sstable_writer_m(sstable_writer_m&& o) = default;
-    void consume_new_partition(const dht::decorated_key& dk) override;
-    void consume(tombstone t) override;
-    stop_iteration consume(static_row&& sr) override;
-    stop_iteration consume(clustering_row&& cr) override;
-    stop_iteration consume(range_tombstone&& rt) override {
-        throw std::runtime_error("consume(range_tombstone) is not yet implemented for SSTables v3");
-    }
-    stop_iteration consume_end_of_partition();
-    void consume_end_of_stream() override;
-};
-
-sstable_writer_m::~sstable_writer_m() {
-    auto close_writer = [](auto& writer) {
-        if (writer) {
-            try {
-                writer->close().get();
-            } catch (...) {
-                sstlog.error("sstable_writer_m failed to close file: {}", std::current_exception());
-            }
-        }
-    };
-    close_writer(_index_writer);
-    close_writer(_data_writer);
-}
-
-void sstable_writer_m::init_file_writers() {
-    file_output_stream_options options;
-    options.io_priority_class = _pc;
-    options.buffer_size = _sst.sstable_buffer_size;
-    options.write_behind = 10;
-
-    if (!_compression_enabled) {
-        _data_writer = std::make_unique<crc32_checksummed_file_writer>(std::move(_sst._data_file), options);
-    } else {
-        _data_writer = std::make_unique<file_writer>(
-            make_compressed_file_m_format_output_stream(
-                    std::move(_sst._data_file),
-                    options,
-                    &_sst._components->compression,
-                    _schema.get_compressor_params()));
-    }
-    _index_writer.emplace(std::move(_sst._index_file), options);
-}
-
-void sstable_writer_m::close_data_writer() {
-    auto writer = std::move(_data_writer);
-    writer->close().get();
-
-    if (!_compression_enabled) {
-        auto chksum_wr = static_cast<crc32_checksummed_file_writer*>(writer.get());
-        write_digest(_sst.get_version(), _sst._write_error_handler, _sst.filename(component_type::Digest), chksum_wr->full_checksum());
-        write_crc(_sst.get_version(), _sst._write_error_handler, _sst.filename(component_type::CRC), chksum_wr->finalize_checksum());
-    } else {
-        write_digest(
-            _sst.get_version(),
-            _sst._write_error_handler,
-            _sst.filename(component_type::Digest),
-            _sst._components->compression.get_full_checksum());
-    }
-}
-
-void sstable_writer_m::consume_new_partition(const dht::decorated_key& dk) {
-    _c_stats.start_offset = _data_writer->offset();
-    _prev_row_start = 0;
-
-    _partition_key = key::from_partition_key(_schema, dk.key());
-    maybe_add_summary_entry(dk.token(), bytes_view(*_partition_key));
-
-    _sst._components->filter->add(bytes_view(*_partition_key));
-    _sst.get_metadata_collector().add_key(bytes_view(*_partition_key));
-
-    auto p_key = disk_string_view<uint16_t>();
-    p_key.value = bytes_view(*_partition_key);
-
-    // Write index file entry from partition key into index file.
-    // Write an index entry minus the "promoted index" (sample of columns)
-    // part. We can only write that after processing the entire partition
-    // and collecting the sample of columns.
-    write(_sst.get_version(), *_index_writer, p_key);
-    write_vint(*_index_writer, _data_writer->offset());
-
-    _pi_write_m.promoted_index = {};
-    _pi_write_m.tomb = {};
-    _pi_write_m.first_clustering.reset();
-    _pi_write_m.last_clustering.reset();
-
-    write(_sst.get_version(), *_data_writer, p_key);
-    _partition_header_length = _data_writer->offset() - _c_stats.start_offset;
-
-    _tombstone_written = false;
-}
-
-deletion_time to_deletion_time(tombstone t) {
-    deletion_time dt;
-    if (t) {
-        dt.local_deletion_time = t.deletion_time.time_since_epoch().count();
-        dt.marked_for_delete_at = t.timestamp;
-    } else {
-        // Default values for live, non-deleted rows.
-        dt.local_deletion_time = std::numeric_limits<int32_t>::max();
-        dt.marked_for_delete_at = std::numeric_limits<int64_t>::min();
-    }
-    return dt;
-}
-
-void sstable_writer_m::consume(tombstone t) {
-    uint64_t current_pos = _data_writer->offset();
-    auto dt = to_deletion_time(t);
-    write(_sst.get_version(), *_data_writer, dt);
-    _partition_header_length += (_data_writer->offset() - current_pos);
-    if (t) {
-        _c_stats.tombstone_histogram.update(dt.local_deletion_time);
-        _c_stats.update_local_deletion_time(dt.local_deletion_time);
-        _c_stats.update_timestamp(dt.marked_for_delete_at);
-    }
-
-    _pi_write_m.tomb = t;
-    _tombstone_written = true;
-}
-
-void sstable_writer_m::write_cell(file_writer& writer, atomic_cell_view cell, const column_definition& cdef,
-        const row_time_properties& properties, bytes_view cell_path) {
-
-    bool is_deleted = !cell.is_live();
-    bool has_value = !is_deleted && !cell.value().empty();
-    bool use_row_timestamp = (properties.timestamp == cell.timestamp());
-    bool is_row_expiring = properties.ttl.has_value();
-    bool is_cell_expiring = cell.is_live_and_has_ttl();
-    bool is_expiring = is_row_expiring || is_cell_expiring;
-    bool use_row_ttl = is_row_expiring || (is_cell_expiring &&
-                       (properties.ttl == cell.ttl().count()) &&
-                       (properties.local_deletion_time == cell.expiry().time_since_epoch().count()));
-
-    cell_flags flags = cell_flags::none;
-    if (!has_value) {
-        flags |= cell_flags::has_empty_value_mask;
-    }
-    if (is_deleted) {
-        flags |= cell_flags::is_deleted_mask;
-    } else if (is_expiring) {
-        flags |= cell_flags::is_expiring_mask;
-    }
-    if (use_row_timestamp) {
-        flags |= cell_flags::use_row_timestamp_mask;
-    }
-    if (use_row_ttl) {
-        flags |= cell_flags::use_row_ttl_mask;
-    }
-    write(_sst.get_version(), writer, flags);
-
-    if (!use_row_timestamp) {
-        write_delta_timestamp(writer, cell.timestamp());
-    }
-
-    if (!use_row_ttl) {
-        if (is_deleted) {
-            write_delta_local_deletion_time(writer, cell.deletion_time().time_since_epoch().count());
-        } else if (is_cell_expiring) {
-            write_delta_local_deletion_time(writer, cell.expiry().time_since_epoch().count());
-            write_delta_ttl(writer, cell.ttl().count());
-        }
-    }
-
-    if (!cell_path.empty()) {
-        write_vint(writer, cell_path.size());
-        write(_sst.get_version(), writer, cell_path);
-    }
-
-    if (has_value) {
-        if (cdef.is_counter()) {
-            assert(!cell.is_counter_update());
-            counter_cell_view ccv(cell);
-            write_counter_value(ccv, writer, sstable_version_types::mc, [] (file_writer& out, uint32_t value) {
-                return write_vint(out, value);
-            });
-        } else {
-            write_cell_value(writer, *cdef.type, cell.value());
-        }
-    }
-
-    // Collect cell statistics
-    _c_stats.update_timestamp(cell.timestamp());
-    if (is_deleted) {
-        auto ldt = cell.deletion_time().time_since_epoch().count();
-        _c_stats.update_local_deletion_time(ldt);
-        _c_stats.tombstone_histogram.update(ldt);
-    } else if (is_cell_expiring) {
-        auto expiration = cell.expiry().time_since_epoch().count();
-        auto ttl = cell.ttl().count();
-        _c_stats.update_ttl(ttl);
-        _c_stats.update_local_deletion_time(expiration);
-        // tombstone histogram is updated with expiration time because if ttl is longer
-        // than gc_grace_seconds for all data, sstable will be considered fully expired
-        // when actually nothing is expired.
-        _c_stats.tombstone_histogram.update(expiration);
-    } else { // regular live cell
-        _c_stats.update_local_deletion_time(std::numeric_limits<int>::max());
-    }
-}
-
-void sstable_writer_m::write_liveness_info(file_writer& writer, const row_marker& marker) {
-    if (marker.is_missing()) {
-        return;
-    }
-
-    uint64_t timestamp = marker.timestamp();
-    _c_stats.update_timestamp(timestamp);
-    write_delta_timestamp(writer, timestamp);
-    if (marker.is_expiring()) {
-        auto ttl = marker.ttl().count();
-        auto ldt = marker.expiry().time_since_epoch().count();
-        _c_stats.update_ttl(ttl);
-        _c_stats.update_local_deletion_time(ldt);
-        write_delta_ttl(writer, ttl);
-        write_delta_local_deletion_time(writer, ldt);
-    }
-}
-
-void sstable_writer_m::write_collection(file_writer& writer, const column_definition& cdef,
-        collection_mutation_view collection, const row_time_properties& properties, bool has_complex_deletion) {
-    auto& ctype = *static_pointer_cast<const collection_type_impl>(cdef.type);
-    auto mview = ctype.deserialize_mutation_form(collection);
-    if (has_complex_deletion) {
-        auto dt = to_deletion_time(mview.tomb);
-        write_delta_deletion_time(writer, dt);
-        if (mview.tomb) {
-            _c_stats.update_timestamp(dt.marked_for_delete_at);
-            _c_stats.update_local_deletion_time(dt.local_deletion_time);
-        }
-    }
-
-    write_vint(writer, mview.cells.size());
-    if (!mview.cells.empty()) {
-        ++_c_stats.column_count;
-    }
-    for (const auto& [cell_path, cell]: mview.cells) {
-        ++_c_stats.cells_count;
-        write_cell(writer, cell, cdef, properties, cell_path);
-    }
-}
-
-void sstable_writer_m::write_cells(file_writer& writer, column_kind kind, const row& row_body,
-        const row_time_properties& properties, bool has_complex_deletion) {
-    // Note that missing columns are written based on the whole set of regular columns as defined by schema.
-    // This differs from Origin where all updated columns are tracked and the set of filled columns of a row
-    // is compared with the set of all columns filled in the memtable. So our encoding may be less optimal in some cases
-    // but still valid.
-    write_missing_columns(writer, _schema, row_body);
-    row_body.for_each_cell([this, &writer, kind, &properties, has_complex_deletion] (column_id id, const atomic_cell_or_collection& c) {
-        auto&& column_definition = _schema.column_at(kind, id);
-        if (!column_definition.is_atomic()) {
-            write_collection(writer, column_definition, c.as_collection_mutation(), properties, has_complex_deletion);
-            return;
-        }
-        atomic_cell_view cell = c.as_atomic_cell();
-        ++_c_stats.cells_count;
-        ++_c_stats.column_count;
-        write_cell(writer, cell, column_definition, properties);
+    return std::ranges::any_of(ranges, [this] (const query::clustering_range& range) {
+        return _position_range.overlaps(*_schema,
+            position_in_partition_view::for_range_start(range),
+            position_in_partition_view::for_range_end(range));
     });
 }
-
-void sstable_writer_m::write_row_body(file_writer& writer, const clustering_row& row, bool has_complex_deletion) {
-    write_liveness_info(writer, row.marker());
-    if (row.tomb()) {
-        auto dt = to_deletion_time(row.tomb().tomb());
-        _c_stats.update_timestamp(dt.marked_for_delete_at);
-        _c_stats.update_local_deletion_time(dt.local_deletion_time);
-        write_delta_deletion_time(writer, dt);
-    }
-    row_time_properties properties;
-    if (!row.marker().is_missing()) {
-        properties.timestamp = row.marker().timestamp();
-        if (row.marker().is_expiring()) {
-            properties.ttl = row.marker().ttl().count();
-            properties.local_deletion_time = row.marker().deletion_time().time_since_epoch().count();
-        }
-    }
-
-    return write_cells(writer, column_kind::regular_column, row.cells(), properties, has_complex_deletion);
-}
-
-template <typename Func>
-uint64_t calculate_write_size(Func&& func) {
-    uint64_t written_size = 0;
-    {
-        auto counting_writer = file_writer(make_sizing_output_stream(written_size));
-        func(counting_writer);
-        counting_writer.flush().get();
-        counting_writer.close().get();
-    }
-    return written_size;
-}
-
-void sstable_writer_m::write_static_row(const row& static_row) {
-    assert(_schema.is_compound());
-
-    uint64_t current_pos = _data_writer->offset();
-    // Static row flag is stored in extended flags so extension_flag is always set for static rows
-    row_flags flags = row_flags::extension_flag;
-    if (static_row.size() == _schema.static_columns_count()) {
-        flags |= row_flags::has_all_columns;
-    }
-
-    write(_sst.get_version(), *_data_writer, flags);
-    write(_sst.get_version(), *_data_writer, row_extended_flags::is_static);
-
-    // Calculate the size of the row body
-    auto write_row = [this, &static_row] (file_writer& writer) {
-        write_cells(writer, column_kind::static_column, static_row, row_time_properties{});
-    };
-
-    uint64_t row_body_size = calculate_write_size(write_row) + unsigned_vint::serialized_size(0);
-    write_vint(*_data_writer, row_body_size);
-    write_vint(*_data_writer, 0); // as the static row always comes first, the previous row size is always zero
-
-    write_row(*_data_writer);
-
-    _partition_header_length += (_data_writer->offset() - current_pos);
-
-    // Collect statistics
-    ++_c_stats.rows_count;
-}
-
-stop_iteration sstable_writer_m::consume(static_row&& sr) {
-    ensure_tombstone_is_written();
-    write_static_row(sr.cells());
-    return stop_iteration::no;
-}
-
-// Find if any collection in the row contains a collection-wide tombstone
-static bool row_has_complex_deletion(const schema& s, const row& r) {
-    bool result = false;
-    r.for_each_cell_until([&] (column_id id, const atomic_cell_or_collection& c) {
-        auto&& cdef = s.column_at(column_kind::regular_column, id);
-        if (cdef.is_atomic()) {
-            return stop_iteration::no;
-        }
-        auto t = static_pointer_cast<const collection_type_impl>(cdef.type);
-        auto mview = t->deserialize_mutation_form(c.as_collection_mutation());
-        if (mview.tomb) {
-            result = true;
-        }
-        return stop_iteration(static_cast<bool>(mview.tomb));
-    });
-
-    return result;
-}
-
-void sstable_writer_m::write_clustered_row(const clustering_row& clustered_row, uint64_t prev_row_size) {
-    row_flags flags = row_flags::none;
-    row_extended_flags ext_flags = row_extended_flags::none;
-    if (clustered_row.marker().is_live()) {
-        flags |= row_flags::has_timestamp;
-        if (clustered_row.marker().is_expiring()) {
-            flags |= row_flags::has_ttl;
-        }
-    }
-
-    if (clustered_row.tomb().tomb()) {
-        flags |= row_flags::has_deletion;
-        if (clustered_row.tomb().tomb() && clustered_row.tomb().is_shadowable()) {
-            ext_flags = row_extended_flags::has_shadowable_deletion;
-        }
-    }
-
-    if (clustered_row.cells().size() == _schema.regular_columns_count()) {
-        flags |= row_flags::has_all_columns;
-    }
-    bool has_complex_deletion = row_has_complex_deletion(_schema, clustered_row.cells());
-    if (has_complex_deletion) {
-        flags |= row_flags::has_complex_deletion;
-    }
-    write(_sst.get_version(), *_data_writer, flags);
-    if (ext_flags != row_extended_flags::none) {
-        write(_sst.get_version(), *_data_writer, ext_flags);
-    }
-
-    write_clustering_prefix(*_data_writer, _schema, clustered_row.key());
-
-    auto write_row = [this, &clustered_row, has_complex_deletion] (file_writer& writer) {
-        write_row_body(writer, clustered_row, has_complex_deletion);
-    };
-
-    uint64_t row_body_size = calculate_write_size(write_row) + unsigned_vint::serialized_size(prev_row_size);
-
-    write_vint(*_data_writer, row_body_size);
-    write_vint(*_data_writer, prev_row_size);
-
-    write_row(*_data_writer);
-
-    // Collect statistics
-    if (_schema.clustering_key_size()) {
-        column_name_helper::min_max_components(_schema, _sst.get_metadata_collector().min_column_names(),
-            _sst.get_metadata_collector().max_column_names(), clustered_row.key().components());
-    }
-    ++_c_stats.rows_count;
-}
-
-stop_iteration sstable_writer_m::consume(clustering_row&& cr) {
-    ensure_tombstone_is_written();
-    uint64_t pos = _data_writer->offset();
-    if (!_pi_write_m.first_clustering) {
-        _pi_write_m.first_clustering = cr.key();
-        _pi_write_m.block_start_offset = pos;
-        _pi_write_m.block_next_start_offset = pos + _pi_write_m.desired_block_size;
-    }
-    write_clustered_row(cr, pos - _prev_row_start);
-
-    _pi_write_m.last_clustering = cr.key();
-
-    pos = _data_writer->offset();
-    _prev_row_start = pos;
-    if (pos >= _pi_write_m.block_next_start_offset) {
-        _pi_write_m.promoted_index.push_back({
-                *_pi_write_m.first_clustering,
-                *_pi_write_m.last_clustering,
-                _pi_write_m.block_start_offset - _c_stats.start_offset,
-                pos - _pi_write_m.block_start_offset});
-        _pi_write_m.first_clustering.reset();
-        _pi_write_m.block_next_start_offset = pos + _pi_write_m.desired_block_size;
-    }
-    return stop_iteration::no;
-}
-
-// Write clustering prefix along with its bound kind and, if not full, its size
-static void write_clustering_prefix(file_writer& writer, bound_kind kind,
-        const schema& s, const clustering_key_prefix& clustering) {
-    assert(kind != bound_kind::static_clustering);
-    write(sstable_version_types::mc, writer, kind);
-    if (kind != bound_kind::clustering) {
-        write(sstable_version_types::mc, writer, static_cast<uint16_t>(clustering.size(s)));
-    }
-    write_clustering_prefix(writer, s, clustering);
-}
-
-void sstable_writer_m::write_promoted_index(file_writer& writer) {
-    static constexpr size_t width_base = 65536;
-    if (_pi_write_m.promoted_index.empty()) {
-        return;
-    }
-    write_vint(writer, _partition_header_length);
-    write(_sst.get_version(), writer, to_deletion_time(_pi_write_m.tomb));
-    write_vint(writer, _pi_write_m.promoted_index.size());
-    std::vector<uint32_t> offsets;
-    offsets.reserve(_pi_write_m.promoted_index.size());
-    uint64_t start = writer.offset();
-    for (const pi_block& block: _pi_write_m.promoted_index) {
-        offsets.push_back(writer.offset() - start);
-        write_clustering_prefix(writer, bound_kind::clustering, _schema, block.first);
-        write_clustering_prefix(writer, bound_kind::clustering, _schema, block.last);
-        write_vint(writer, block.offset);
-        write_signed_vint(writer, block.width - width_base);
-        // TODO: serialize end open marker here later, for now always write "false"
-        // to indicate there is no end open marker
-        write(_sst.get_version(), writer, (std::byte)0);
-    }
-
-    for (uint32_t offset: offsets) {
-        write(_sst.get_version(), writer, offset);
-    }
-}
-
-stop_iteration sstable_writer_m::consume_end_of_partition() {
-    ensure_tombstone_is_written();
-    if (!_pi_write_m.promoted_index.empty() && _pi_write_m.first_clustering) {
-         _pi_write_m.promoted_index.push_back({
-                *_pi_write_m.first_clustering,
-                *_pi_write_m.last_clustering,
-                _pi_write_m.block_start_offset - _c_stats.start_offset,
-                _data_writer->offset() - _pi_write_m.block_start_offset});
-    }
-
-    auto write_pi = [this] (file_writer& writer) {
-        return write_promoted_index(writer);
-    };
-
-    uint64_t pi_size = calculate_write_size(write_pi);
-    write_vint(*_index_writer, pi_size);
-    write_pi(*_index_writer);
-
-    write(_sst.get_version(), *_data_writer, row_flags::end_of_partition);
-
-    // compute size of the current row.
-    _c_stats.partition_size = _data_writer->offset() - _c_stats.start_offset;
-
-    _cfg.large_partition_handler->maybe_update_large_partitions(_sst, *_partition_key, _c_stats.partition_size).get();
-
-    // update is about merging column_stats with the data being stored by collector.
-    _sst.get_metadata_collector().update(std::move(_c_stats));
-    _c_stats.reset();
-
-    if (!_first_key) {
-        _first_key = *_partition_key;
-    }
-    _last_key = std::move(*_partition_key);
-    return get_data_offset() < _cfg.max_sstable_size ? stop_iteration::no : stop_iteration::yes;
-}
-
-void sstable_writer_m::consume_end_of_stream() {
-    _cfg.monitor->on_data_write_completed();
-
-    seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state);
-
-    if (_sst.has_component(component_type::CompressionInfo)) {
-        _sst.get_metadata_collector().add_compression_ratio(_sst._components->compression.compressed_file_length(), _sst._components->compression.uncompressed_file_length());
-    }
-
-    _index_writer->close().get();
-    _index_writer.reset();
-    _sst.set_first_and_last_keys();
-    seal_statistics(_sst.get_version(), _sst._components->statistics, _sst.get_metadata_collector(),
-            dht::global_partitioner().name(), _schema.bloom_filter_fp_chance(),
-            _sst._schema, _sst.get_first_decorated_key(), _sst.get_last_decorated_key(), _enc_stats);
-    close_data_writer();
-    _sst.write_summary(_pc);
-    _sst.write_filter(_pc);
-    _sst.write_statistics(_pc);
-    _sst.write_compression(_pc);
-    auto features = all_features();
-    if (!_cfg.correctly_serialize_non_compound_range_tombstones) {
-        features.disable(sstable_feature::NonCompoundRangeTombstones);
-    }
-    _sst.write_scylla_metadata(_pc, _shard, std::move(features));
-    _cfg.monitor->on_write_completed();
-    if (!_cfg.leave_unsealed) {
-        _sst.seal_sstable(_cfg.backup).get();
-    }
-    _cfg.monitor->on_flush_completed();
-}
-
-sstable_writer::sstable_writer(sstable& sst, const schema& s, uint64_t estimated_partitions,
-        const sstable_writer_config& cfg, encoding_stats enc_stats, const io_priority_class& pc, shard_id shard) {
-    if (sst.get_version() == sstable_version_types::mc) {
-        _impl = std::make_unique<sstable_writer_m>(sst, s, estimated_partitions, cfg, enc_stats, pc, shard);
-    } else {
-        _impl = std::make_unique<sstable_writer_k_l>(sst, s, estimated_partitions, cfg, pc, shard);
-    }
-}
-
-void sstable_writer::consume_new_partition(const dht::decorated_key& dk) {
-    return _impl->consume_new_partition(dk);
-}
-
-void sstable_writer::consume(tombstone t) {
-    return _impl->consume(t);
-}
-
-stop_iteration sstable_writer::consume(static_row&& sr) {
-    return _impl->consume(std::move(sr));
-}
-
-stop_iteration sstable_writer::consume(clustering_row&& cr) {
-    return _impl->consume(std::move(cr));
-}
-
-stop_iteration sstable_writer::consume(range_tombstone&& rt) {
-    return _impl->consume(std::move(rt));
-}
-
-stop_iteration sstable_writer::consume_end_of_partition() {
-    return _impl->consume_end_of_partition();
-}
-
-void sstable_writer::consume_end_of_stream() {
-    return _impl->consume_end_of_stream();
-}
-
-sstable_writer::sstable_writer(sstable_writer&& o) = default;
-sstable_writer& sstable_writer::operator=(sstable_writer&& o) = default;
-sstable_writer::~sstable_writer() = default;
 
 future<> sstable::seal_sstable(bool backup)
 {
     return seal_sstable().then([this, backup] {
         if (backup) {
             auto dir = get_dir() + "/backups/";
-            return sstable_write_io_check(touch_directory, dir).then([this, dir] {
-                return create_links(dir);
+            auto fut = sstable_touch_directory_io_check(dir);
+            return fut.then([this, dir = std::move(dir)] () mutable {
+                return create_links(std::move(dir));
             });
         }
         return make_ready_future<>();
@@ -3301,7 +1671,30 @@ future<> sstable::seal_sstable(bool backup)
 sstable_writer sstable::get_writer(const schema& s, uint64_t estimated_partitions,
         const sstable_writer_config& cfg, encoding_stats enc_stats, const io_priority_class& pc, shard_id shard)
 {
+    // Mark sstable for implicit deletion if destructed before it is sealed.
+    _marked_for_deletion = mark_for_deletion::implicit;
     return sstable_writer(*this, s, estimated_partitions, cfg, enc_stats, pc, shard);
+}
+
+// Encoding stats for compaction are based on the sstable's stats metadata
+// since, in contract to the mc-format encoding_stats that are evaluated
+// before the sstable data is written, the stats metadata is updated during
+// writing so it provides actual minimum values of the written timestamps.
+encoding_stats sstable::get_encoding_stats_for_compaction() const {
+    encoding_stats enc_stats;
+
+    auto& stats = get_stats_metadata();
+    enc_stats.min_timestamp = stats.min_timestamp;
+    enc_stats.min_local_deletion_time = gc_clock::time_point(gc_clock::duration(stats.min_local_deletion_time));
+    enc_stats.min_ttl = gc_clock::duration(stats.min_ttl);
+
+    return enc_stats;
+}
+
+void sstable::assert_large_data_handler_is_running() {
+    if (!get_large_data_handler().running()) {
+        on_internal_error(sstlog, "The large data handler is not running");
+    }
 }
 
 future<> sstable::write_components(
@@ -3311,12 +1704,14 @@ future<> sstable::write_components(
         const sstable_writer_config& cfg,
         encoding_stats stats,
         const io_priority_class& pc) {
-    if (cfg.replay_position) {
-        _collector.set_replay_position(cfg.replay_position.value());
-    }
+    assert_large_data_handler_is_running();
     return seastar::async([this, mr = std::move(mr), estimated_partitions, schema = std::move(schema), cfg, stats, &pc] () mutable {
         auto wr = get_writer(*schema, estimated_partitions, cfg, stats, pc);
-        mr.consume_in_thread(std::move(wr));
+        auto validator = mutation_fragment_stream_validating_filter(format("sstable writer {}", get_filename()), *schema,
+                cfg.validate_keys);
+        mr.consume_in_thread(std::move(wr), std::move(validator), db::no_timeout);
+    }).finally([this] {
+        assert_large_data_handler_is_running();
     });
 }
 
@@ -3327,20 +1722,21 @@ future<> sstable::generate_summary(const io_priority_class& pc) {
 
     sstlog.info("Summary file {} not found. Generating Summary...", filename(component_type::Summary));
     class summary_generator {
+        const dht::i_partitioner& _partitioner;
         summary& _summary;
         index_sampling_state _state;
     public:
-        std::experimental::optional<key> first_key, last_key;
+        std::optional<key> first_key, last_key;
 
-        summary_generator(summary& s) : _summary(s) {
-            _state.summary_byte_cost = summary_byte_cost();
+        summary_generator(const dht::i_partitioner& p, summary& s, double summary_ratio) : _partitioner(p), _summary(s) {
+            _state.summary_byte_cost = summary_byte_cost(summary_ratio);
         }
         bool should_continue() {
             return true;
         }
         void consume_entry(index_entry&& ie, uint64_t index_offset) {
-            auto token = dht::global_partitioner().get_token(ie.get_key());
-            components_writer::maybe_add_summary_entry(_summary, token, ie.get_key_bytes(), ie.position(), index_offset, _state);
+            auto token = _partitioner.get_token(ie.get_key());
+            maybe_add_summary_entry(_summary, token, ie.get_key_bytes(), ie.position(), index_offset, _state);
             if (!first_key) {
                 first_key = key(to_bytes(ie.get_key_bytes()));
             } else {
@@ -3352,24 +1748,29 @@ future<> sstable::generate_summary(const io_priority_class& pc) {
         }
     };
 
-    return open_checked_file_dma(_read_error_handler, filename(component_type::Index), open_flags::ro).then([this, &pc] (file index_file) {
+    return new_sstable_component_file(_read_error_handler, component_type::Index, open_flags::ro).then([this, &pc] (file index_file) {
         return do_with(std::move(index_file), [this, &pc] (file index_file) {
             return index_file.size().then([this, &pc, index_file] (auto index_size) {
                 // an upper bound. Surely to be less than this.
-                auto estimated_partitions = index_size / sizeof(uint64_t);
+                auto estimated_partitions = std::max<uint64_t>(index_size / sizeof(uint64_t), 1);
                 prepare_summary(_components->summary, estimated_partitions, _schema->min_index_interval());
 
                 file_input_stream_options options;
                 options.buffer_size = sstable_buffer_size;
                 options.io_priority_class = pc;
-                return do_with(summary_generator(_components->summary),
+                return do_with(summary_generator(_schema->get_partitioner(), _components->summary,
+                                _manager.config().sstable_summary_ratio()),
                         [this, &pc, options = std::move(options), index_file, index_size] (summary_generator& s) mutable {
+                    auto sem = std::make_unique<reader_concurrency_semaphore>(reader_concurrency_semaphore::no_limits{});
                     auto ctx = make_lw_shared<index_consume_entry_context<summary_generator>>(
-                            s, trust_promoted_index::yes, *_schema, index_file, std::move(options), 0, index_size);
+                            sem->make_permit(_schema.get(), "generate-summary"), s, trust_promoted_index::yes, *_schema, "", index_file, std::move(options), 0, index_size,
+                            (_version >= sstable_version_types::mc
+                                ? std::make_optional(get_clustering_values_fixed_lengths(get_serialization_header()))
+                                : std::optional<column_values_fixed_lengths>{}));
                     return ctx->consume_input().finally([ctx] {
                         return ctx->close();
-                    }).then([this, ctx, &s] {
-                        seal_summary(_components->summary, std::move(s.first_key), std::move(s.last_key), s.state());
+                    }).then([this, ctx, &s, sem = std::move(sem)] {
+                        return seal_summary(_components->summary, std::move(s.first_key), std::move(s.last_key), s.state());
                     });
                 });
             }).then([index_file] () mutable {
@@ -3380,6 +1781,13 @@ future<> sstable::generate_summary(const io_priority_class& pc) {
             });
         });
     });
+}
+
+bool sstable::is_shared() const {
+    if (_shards.empty()) {
+        on_internal_error(sstlog, format("Shards weren't computed for SSTable: {}", get_filename()));
+    }
+    return _shards.size() > 1;
 }
 
 uint64_t sstable::data_size() const {
@@ -3393,17 +1801,41 @@ uint64_t sstable::ondisk_data_size() const {
     return _data_file_size;
 }
 
-uint64_t sstable::bytes_on_disk() {
+uint64_t sstable::bytes_on_disk() const {
     assert(_bytes_on_disk > 0);
     return _bytes_on_disk;
 }
 
 const bool sstable::has_component(component_type f) const {
-    return _recognized_components.count(f);
+    return _recognized_components.contains(f);
 }
 
-const sstring sstable::filename(component_type f) const {
-    return filename(_dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, f);
+future<> sstable::touch_temp_dir() {
+    if (_temp_dir) {
+        return make_ready_future<>();
+    }
+    auto temp_dir = get_temp_dir();
+    sstlog.debug("Touching temp_dir={}", temp_dir);
+    auto fut = sstable_touch_directory_io_check(temp_dir);
+    return fut.then([this, temp_dir = std::move(temp_dir)] () mutable {
+        _temp_dir = std::move(temp_dir);
+    });
+}
+
+future<> sstable::remove_temp_dir() {
+    if (!_temp_dir) {
+        return make_ready_future<>();
+    }
+    sstlog.debug("Removing temp_dir={}", _temp_dir);
+    return remove_file(*_temp_dir).then_wrapped([this] (future<> f) {
+        if (!f.failed()) {
+            _temp_dir.reset();
+            return make_ready_future<>();
+        }
+        auto ep = f.get_exception();
+        sstlog.error("Could not remove temporary directory: {}", ep);
+        return make_exception_future<>(ep);
+    });
 }
 
 std::vector<sstring> sstable::component_filenames() const {
@@ -3416,39 +1848,41 @@ std::vector<sstring> sstable::component_filenames() const {
     return res;
 }
 
-sstring sstable::toc_filename() const {
-    return filename(component_type::TOC);
+bool sstable::requires_view_building() const {
+    return boost::algorithm::ends_with(_dir, "staging");
 }
 
-const sstring sstable::filename(sstring dir, sstring ks, sstring cf, version_types version, int64_t generation,
-                                format_types format, component_type component) {
-
-    static std::unordered_map<version_types, std::function<sstring (entry_descriptor d)>, enum_hash<version_types>> strmap = {
-        { sstable::version_types::ka, [] (entry_descriptor d) {
-            return d.ks + "-" + d.cf + "-" + _version_string.at(d.version) + "-" + to_sstring(d.generation) + "-"
-                   + sstable_version_constants::get_component_map(d.version).at(d.component); }
-        },
-        { sstable::version_types::la, [] (entry_descriptor d) {
-            return _version_string.at(d.version) + "-" + to_sstring(d.generation) + "-" + _format_string.at(d.format) + "-"
-                   + sstable_version_constants::get_component_map(d.version).at(d.component); }
-        },
-        { sstable::version_types::mc, [] (entry_descriptor d) {
-                return _version_string.at(d.version) + "-" + to_sstring(d.generation) + "-" + _format_string.at(d.format) + "-"
-                       + sstable_version_constants::get_component_map(d.version).at(d.component); }
-        },
-    };
-
-    return dir + "/" + strmap[version](entry_descriptor(ks, cf, version, generation, format, component));
+sstring sstable::component_basename(const sstring& ks, const sstring& cf, version_types version, int64_t generation,
+                                    format_types format, sstring component) {
+    sstring v = _version_string.at(version);
+    sstring g = to_sstring(generation);
+    sstring f = _format_string.at(format);
+    switch (version) {
+    case sstable::version_types::ka:
+        return ks + "-" + cf + "-" + v + "-" + g + "-" + component;
+    case sstable::version_types::la:
+        return v + "-" + g + "-" + f + "-" + component;
+    case sstable::version_types::mc:
+    case sstable::version_types::md:
+        return v + "-" + g + "-" + f + "-" + component;
+    }
+    assert(0 && "invalid version");
 }
 
-const sstring sstable::filename(sstring dir, sstring ks, sstring cf, version_types version, int64_t generation,
-                                format_types format, sstring component) {
-    static std::unordered_map<version_types, const char*, enum_hash<version_types>> fmtmap = {
-        { sstable::version_types::ka, "{0}-{1}-{2}-{3}-{5}" },
-        { sstable::version_types::la, "{2}-{3}-{4}-{5}" }
-    };
+sstring sstable::component_basename(const sstring& ks, const sstring& cf, version_types version, int64_t generation,
+                          format_types format, component_type component) {
+    return component_basename(ks, cf, version, generation, format,
+            sstable_version_constants::get_component_map(version).at(component));
+}
 
-    return dir + "/" + seastar::format(fmtmap[version], ks, cf, _version_string.at(version), to_sstring(generation), _format_string.at(format), component);
+sstring sstable::filename(const sstring& dir, const sstring& ks, const sstring& cf, version_types version, int64_t generation,
+                          format_types format, component_type component) {
+    return dir + "/" + component_basename(ks, cf, version, generation, format, component);
+}
+
+sstring sstable::filename(const sstring& dir, const sstring& ks, const sstring& cf, version_types version, int64_t generation,
+                          format_types format, sstring component) {
+    return dir + "/" + component_basename(ks, cf, version, generation, format, component);
 }
 
 std::vector<std::pair<component_type, sstring>> sstable::all_components() const {
@@ -3463,35 +1897,161 @@ std::vector<std::pair<component_type, sstring>> sstable::all_components() const 
     return all;
 }
 
-future<> sstable::create_links(sstring dir, int64_t generation) const {
-    // TemporaryTOC is always first, TOC is always last
-    auto dst = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, component_type::TemporaryTOC);
-    return sstable_write_io_check(::link_file, filename(component_type::TOC), dst).then([this, dir] {
-        return sstable_write_io_check(sync_directory, dir);
-    }).then([this, dir, generation] {
-        // FIXME: Should clean already-created links if we failed midway.
-        return parallel_for_each(all_components(), [this, dir, generation] (auto p) {
-            if (p.first == component_type::TOC) {
-                return make_ready_future<>();
-            }
-            auto src = sstable::filename(_dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, p.second);
-            auto dst = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, p.second);
-            return this->sstable_write_io_check(::link_file, std::move(src), std::move(dst));
-        });
-    }).then([this, dir] {
-        return sstable_write_io_check(sync_directory, dir);
-    }).then([dir, this, generation] {
-        auto src = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, component_type::TemporaryTOC);
-        auto dst = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, component_type::TOC);
-        return sstable_write_io_check([&] {
-            return engine().rename_file(src, dst);
-        });
-    }).then([this, dir] {
-        return sstable_write_io_check(sync_directory, dir);
+static bool is_same_file(const seastar::stat_data& sd1, const seastar::stat_data& sd2) noexcept {
+    return sd1.device_id == sd2.device_id && sd1.inode_number == sd2.inode_number;
+}
+
+future<bool> same_file(sstring path1, sstring path2) noexcept {
+    return when_all_succeed(file_stat(std::move(path1)), file_stat(std::move(path2))).then_unpack([] (seastar::stat_data sd1, seastar::stat_data sd2) {
+        return is_same_file(sd1, sd2);
     });
 }
 
+// support replay of link by considering link_file EEXIST error as successful when the newpath is hard linked to oldpath.
+future<> idempotent_link_file(sstring oldpath, sstring newpath) noexcept {
+    return do_with(std::move(oldpath), std::move(newpath), [] (const sstring& oldpath, const sstring& newpath) {
+        return link_file(oldpath, newpath).handle_exception([&] (std::exception_ptr eptr) mutable {
+            try {
+                std::rethrow_exception(eptr);
+            } catch (const std::system_error& ex) {
+                if (ex.code().value() != EEXIST) {
+                    throw;
+                }
+            }
+            return same_file(oldpath, newpath).then_wrapped([eptr = std::move(eptr)] (future<bool> fut) mutable {
+                if (!fut.failed()) {
+                    auto same = fut.get0();
+                    if (same) {
+                        return make_ready_future<>();
+                    }
+                }
+                return make_exception_future<>(eptr);
+            });
+        });
+    });
+}
+
+// Check is the operation is replayed, possibly when moving sstables
+// from staging to the base dir, for example, right after create_links completes,
+// and right before deleting the source links.
+// We end up in two valid sstables in this case, so make create_links idempotent.
+future<> sstable::check_create_links_replay(const sstring& dst_dir, int64_t dst_gen,
+        const std::vector<std::pair<sstables::component_type, sstring>>& comps) const {
+    return parallel_for_each(comps, [this, &dst_dir, dst_gen] (const auto& p) mutable {
+        auto comp = p.second;
+        auto src = sstable::filename(_dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, comp);
+        auto dst = sstable::filename(dst_dir, _schema->ks_name(), _schema->cf_name(), _version, dst_gen, _format, comp);
+        return do_with(std::move(src), std::move(dst), [this] (const sstring& src, const sstring& dst) mutable {
+            return file_exists(dst).then([&, this] (bool exists) mutable {
+                if (!exists) {
+                    return make_ready_future<>();
+                }
+                return same_file(src, dst).then_wrapped([&, this] (future<bool> fut) {
+                    if (fut.failed()) {
+                        auto eptr = fut.get_exception();
+                        sstlog.error("Error while linking SSTable: {} to {}: {}", src, dst, eptr);
+                        return make_exception_future<>(eptr);
+                    }
+                    auto same = fut.get0();
+                    if (!same) {
+                        auto msg = format("Error while linking SSTable: {} to {}: File exists", src, dst);
+                        sstlog.error("{}", msg);
+                        throw malformed_sstable_exception(msg, _dir);
+                    }
+                    return make_ready_future<>();
+                });
+            });
+        });
+    });
+}
+
+/// create_links_common links all component files from the sstable directory to
+/// the given destination directory, using the provided generation.
+///
+/// It first checks if this is a replay of a previous
+/// create_links call, by testing if the destination names already
+/// exist, and if so, if they point to the same inodes as the
+/// source names.  Otherwise, we return an error.
+/// This is an indication that something went wrong.
+///
+/// Creating the links is done by:
+/// First, linking the source TOC component to the destination TemporaryTOC,
+/// to mark the destination for rollback, in case we crash mid-way.
+/// Then, all components are linked.
+///
+/// Note that if scylla crashes at this point, the destination SSTable
+/// will have both a TemporaryTOC file and a regular TOC file.
+/// It should be deleted on restart, thus rolling the operation backwards.
+///
+/// Eventually, if \c mark_for_removal is unset, the detination
+/// TemporaryTOC is removed, to "commit" the destination sstable;
+///
+/// Otherwise, if \c mark_for_removal is set, the TemporaryTOC at the destination
+/// is moved to the source directory to mark the source sstable for removal,
+/// thus atomically toggling crash recovery from roll-back to roll-forward.
+///
+/// Similar to the scenario described above, crashing at this point
+/// would leave the source sstable marked for removal, possibly
+/// having both a TemporaryTOC file and a regular TOC file, and
+/// then the source sstable should be deleted on restart, rolling the
+/// operation forward.
+///
+/// Note that idempotent versions of link_file and rename_file
+/// are used.  These versions handle EEXIST errors that may happen
+/// when the respective operations are replayed.
+///
+/// \param dir - the destination directory.
+/// \param generation - the generation of the destination sstable
+/// \param mark_for_removal - mark the sstable for removal after linking it to the destination dir
+future<> sstable::create_links_common(const sstring& dir, int64_t generation, bool mark_for_removal) const {
+    sstlog.trace("create_links: {} -> {} generation={} mark_for_removal={}", get_filename(), dir, generation, mark_for_removal);
+    return do_with(dir, all_components(), [this, generation, mark_for_removal] (const sstring& dir, auto& comps) {
+        return check_create_links_replay(dir, generation, comps).then([this, &dir, generation, &comps, mark_for_removal] {
+            // TemporaryTOC is always first, TOC is always last
+            auto dst = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, component_type::TemporaryTOC);
+            return sstable_write_io_check(idempotent_link_file, filename(component_type::TOC), std::move(dst)).then([this, &dir] {
+                return sstable_write_io_check(sync_directory, dir);
+            }).then([this, &dir, generation, &comps] {
+                return parallel_for_each(comps, [this, &dir, generation] (auto p) {
+                    auto src = sstable::filename(_dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, p.second);
+                    auto dst = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, p.second);
+                    return sstable_write_io_check(idempotent_link_file, std::move(src), std::move(dst));
+                });
+            }).then([this, &dir] {
+                return sstable_write_io_check(sync_directory, dir);
+            });
+        }).then([this, &dir, generation, mark_for_removal] {
+            auto dst_temp_toc = sstable::filename(dir, _schema->ks_name(), _schema->cf_name(), _version, generation, _format, component_type::TemporaryTOC);
+            if (mark_for_removal) {
+                // Now that the source sstable is linked to new_dir, mark the source links for
+                // deletion by leaving a TemporaryTOC file in the source directory.
+                auto src_temp_toc = sstable::filename(_dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, component_type::TemporaryTOC);
+                return sstable_write_io_check(rename_file, std::move(dst_temp_toc), std::move(src_temp_toc)).then([this] {
+                    return sstable_write_io_check(sync_directory, _dir);
+                });
+            } else {
+                // Now that the source sstable is linked to dir, remove
+                // the TemporaryTOC file at the destination.
+                return sstable_write_io_check(remove_file, std::move(dst_temp_toc));
+            }
+        }).then([this, &dir] {
+            return sstable_write_io_check(sync_directory, dir);
+        }).then([this, &dir, generation] {
+            sstlog.trace("create_links: {} -> {} generation={}: done", get_filename(), dir, generation);
+        });
+    });
+}
+
+future<> sstable::create_links(const sstring& dir, int64_t generation) const {
+    return create_links_common(dir, generation, false /* mark_for_removal */);
+}
+
+future<> sstable::create_links_and_mark_for_removal(const sstring& dir, int64_t generation) const {
+    return create_links_common(dir, generation, true /* mark_for_removal */);
+}
+
 future<> sstable::set_generation(int64_t new_generation) {
+    sstlog.debug("Setting generation for {} to generation={}", get_filename(), new_generation);
     return create_links(_dir, new_generation).then([this] {
         return remove_file(filename(component_type::TOC)).then([this] {
             return sstable_write_io_check(sync_directory, _dir);
@@ -3510,11 +2070,32 @@ future<> sstable::set_generation(int64_t new_generation) {
     });
 }
 
+future<> sstable::move_to_new_dir(sstring new_dir, int64_t new_generation, bool do_sync_dirs) {
+    sstring old_dir = get_dir();
+    sstlog.debug("Moving {} old_generation={} to {} new_generation={} do_sync_dirs={}",
+            get_filename(), old_dir, _generation, new_dir, new_generation, do_sync_dirs);
+    return create_links_and_mark_for_removal(new_dir, new_generation).then([this, old_dir, new_dir, new_generation] {
+        _dir = new_dir;
+        int64_t old_generation = std::exchange(_generation, new_generation);
+        return parallel_for_each(all_components(), [this, old_generation, old_dir] (auto p) {
+            return sstable_write_io_check(remove_file, sstable::filename(old_dir, _schema->ks_name(), _schema->cf_name(), _version, old_generation, _format, p.second));
+        }).then([this, old_dir, old_generation] {
+            auto temp_toc = sstable_version_constants::get_component_map(_version).at(component_type::TemporaryTOC);
+            return sstable_write_io_check(remove_file, sstable::filename(old_dir, _schema->ks_name(), _schema->cf_name(), _version, old_generation, _format, temp_toc));
+        });
+    }).then([this, old_dir, new_dir, do_sync_dirs] {
+        if (!do_sync_dirs) {
+            return make_ready_future<>();
+        }
+        return when_all_succeed(sync_directory(old_dir), sync_directory(new_dir)).discard_result();
+    });
+}
+
 entry_descriptor entry_descriptor::make_descriptor(sstring sstdir, sstring fname) {
-    static std::regex la("la-(\\d+)-(\\w+)-(.*)");
+    static std::regex la_mx("(la|m[cd])-(\\d+)-(\\w+)-(.*)");
     static std::regex ka("(\\w+)-(\\w+)-ka-(\\d+)-(.*)");
 
-    static std::regex dir(".*/([^/]*)/(\\w+)-[\\da-fA-F]+(?:/upload)?/?");
+    static std::regex dir(".*/([^/]*)/([^/]+)-[\\da-fA-F]+(?:/staging|/upload|/snapshots/[^/]+)?/?");
 
     std::smatch match;
 
@@ -3528,19 +2109,19 @@ entry_descriptor entry_descriptor::make_descriptor(sstring sstdir, sstring fname
 
     sstlog.debug("Make descriptor sstdir: {}; fname: {}", sstdir, fname);
     std::string s(fname);
-    if (std::regex_match(s, match, la)) {
+    if (std::regex_match(s, match, la_mx)) {
         std::string sdir(sstdir);
         std::smatch dirmatch;
         if (std::regex_match(sdir, dirmatch, dir)) {
             ks = dirmatch[1].str();
             cf = dirmatch[2].str();
         } else {
-            throw malformed_sstable_exception(seastar::sprint("invalid version for file %s with path %s. Path doesn't match known pattern.", fname, sstdir));
+            throw malformed_sstable_exception(seastar::format("invalid version for file {} with path {}. Path doesn't match known pattern.", fname, sstdir));
         }
-        version = sstable::version_types::la;
-        generation = match[1].str();
-        format = sstring(match[2].str());
-        component = sstring(match[3].str());
+        version = from_string(match[1].str());
+        generation = match[2].str();
+        format = sstring(match[3].str());
+        component = sstring(match[4].str());
     } else if (std::regex_match(s, match, ka)) {
         ks = match[1].str();
         cf = match[2].str();
@@ -3549,16 +2130,16 @@ entry_descriptor entry_descriptor::make_descriptor(sstring sstdir, sstring fname
         generation = match[3].str();
         component = sstring(match[4].str());
     } else {
-        throw malformed_sstable_exception(seastar::sprint("invalid version for file %s. Name doesn't match any known version.", fname));
+        throw malformed_sstable_exception(seastar::format("invalid version for file {}. Name doesn't match any known version.", fname));
     }
-    return entry_descriptor(ks, cf, version, boost::lexical_cast<unsigned long>(generation), sstable::format_from_sstring(format), sstable::component_from_sstring(version, component));
+    return entry_descriptor(sstdir, ks, cf, boost::lexical_cast<unsigned long>(generation), version, sstable::format_from_sstring(format), sstable::component_from_sstring(version, component));
 }
 
 sstable::version_types sstable::version_from_sstring(sstring &s) {
     try {
         return reverse_map(s, _version_string);
     } catch (std::out_of_range&) {
-        throw std::out_of_range(seastar::sprint("Unknown sstable version: %s", s.c_str()));
+        throw std::out_of_range(seastar::format("Unknown sstable version: {}", s.c_str()));
     }
 }
 
@@ -3566,7 +2147,7 @@ sstable::format_types sstable::format_from_sstring(sstring &s) {
     try {
         return reverse_map(s, _format_string);
     } catch (std::out_of_range&) {
-        throw std::out_of_range(seastar::sprint("Unknown sstable format: %s", s.c_str()));
+        throw std::out_of_range(seastar::format("Unknown sstable format: {}", s.c_str()));
     }
 }
 
@@ -3578,18 +2159,22 @@ component_type sstable::component_from_sstring(version_types v, sstring &s) {
     }
 }
 
-input_stream<char> sstable::data_stream(uint64_t pos, size_t len, const io_priority_class& pc, reader_resource_tracker resource_tracker, lw_shared_ptr<file_input_stream_history> history) {
+input_stream<char> sstable::data_stream(uint64_t pos, size_t len, const io_priority_class& pc,
+        reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history) {
     file_input_stream_options options;
     options.buffer_size = sstable_buffer_size;
     options.io_priority_class = pc;
     options.read_ahead = 4;
     options.dynamic_adjustments = std::move(history);
 
-    auto f = resource_tracker.track(_data_file);
+    file f = make_tracked_file(_data_file, std::move(permit));
+    if (trace_state) {
+        f = tracing::make_traced_file(std::move(f), std::move(trace_state), format("{}:", get_filename()));
+    }
 
     input_stream<char> stream;
     if (_components->compression) {
-        if (_version == sstable_version_types::mc) {
+        if (_version >= sstable_version_types::mc) {
              return make_compressed_file_m_format_input_stream(f, &_components->compression,
                 pos, len, std::move(options));
         } else {
@@ -3601,8 +2186,8 @@ input_stream<char> sstable::data_stream(uint64_t pos, size_t len, const io_prior
     return make_file_input_stream(f, pos, len, std::move(options));
 }
 
-future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len, const io_priority_class& pc) {
-    return do_with(data_stream(pos, len, pc, no_resource_tracking(), {}), [len] (auto& stream) {
+future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len, const io_priority_class& pc, reader_permit permit) {
+    return do_with(data_stream(pos, len, pc, std::move(permit), tracing::trace_state_ptr(), {}), [len] (auto& stream) {
         return stream.read_exactly(len).finally([&stream] {
             return stream.close();
         });
@@ -3615,10 +2200,10 @@ void sstable::set_first_and_last_keys() {
     }
     auto decorate_key = [this] (const char *m, const bytes& value) {
         if (value.empty()) {
-            throw std::runtime_error(sprint("%s key of summary of %s is empty", m, get_filename()));
+            throw std::runtime_error(format("{} key of summary of {} is empty", m, get_filename()));
         }
         auto pk = key::from_bytes(value).to_partition_key(*_schema);
-        return dht::global_partitioner().decorate_key(*_schema, std::move(pk));
+        return dht::decorate_key(*_schema, std::move(pk));
     };
     _first = decorate_key("first", _components->summary.first_key.value);
     _last = decorate_key("last", _components->summary.last_key.value);
@@ -3634,14 +2219,14 @@ const partition_key& sstable::get_last_partition_key() const {
 
 const dht::decorated_key& sstable::get_first_decorated_key() const {
     if (!_first) {
-        throw std::runtime_error(sprint("first key of %s wasn't set", get_filename()));
+        throw std::runtime_error(format("first key of {} wasn't set", get_filename()));
     }
     return *_first;
 }
 
 const dht::decorated_key& sstable::get_last_decorated_key() const {
     if (!_last) {
-        throw std::runtime_error(sprint("last key of %s wasn't set", get_filename()));
+        throw std::runtime_error(format("last key of {} wasn't set", get_filename()));
     }
     return *_last;
 }
@@ -3656,11 +2241,6 @@ double sstable::get_compression_ratio() const {
     } else {
         return metadata_collector::NO_COMPRESSION_RATIO;
     }
-}
-
-std::unordered_set<uint64_t> sstable::ancestors() const {
-    const compaction_metadata& cm = get_compaction_metadata();
-    return boost::copy_range<std::unordered_set<uint64_t>>(cm.ancestors.elements);
 }
 
 void sstable::set_sstable_level(uint32_t new_level) {
@@ -3716,33 +2296,32 @@ int sstable::compare_by_max_timestamp(const sstable& other) const {
     return (ts1 > ts2 ? 1 : (ts1 == ts2 ? 0 : -1));
 }
 
-future<>
-delete_sstables(std::vector<sstring> tocs);
-
-sstable::~sstable() {
+future<> sstable::close_files() {
+    auto index_closed = make_ready_future<>();
     if (_index_file) {
-        _index_file.close().handle_exception([save = _index_file, op = background_jobs().start()] (auto ep) {
+        index_closed = _index_file.close().handle_exception([me = shared_from_this()] (auto ep) {
             sstlog.warn("sstable close index_file failed: {}", ep);
             general_disk_error();
         });
     }
+    auto data_closed = make_ready_future<>();
     if (_data_file) {
-        _data_file.close().handle_exception([save = _data_file, op = background_jobs().start()] (auto ep) {
+        data_closed = _data_file.close().handle_exception([me = shared_from_this()] (auto ep) {
             sstlog.warn("sstable close data_file failed: {}", ep);
             general_disk_error();
         });
     }
 
-    if (_marked_for_deletion) {
-        // We need to delete the on-disk files for this table. Since this is a
-        // destructor, we can't wait for this to finish, or return any errors,
-        // but just need to do our best. If a deletion fails for some reason we
+    auto unlinked = make_ready_future<>();
+    if (_marked_for_deletion != mark_for_deletion::none) {
+        // If a deletion fails for some reason we
         // log and ignore this failure, because on startup we'll again try to
         // clean up unused sstables, and because we'll never reuse the same
         // generation number anyway.
+        sstlog.debug("Deleting sstable that is {}marked for deletion", _marked_for_deletion == mark_for_deletion::implicit ? "implicitly " : "");
         try {
-            delete_sstables({filename(component_type::TOC)}).handle_exception(
-                        [op = background_jobs().start()] (std::exception_ptr eptr) {
+            unlinked = unlink().handle_exception(
+                        [me = shared_from_this()] (std::exception_ptr eptr) {
                             try {
                                 std::rethrow_exception(eptr);
                             } catch (...) {
@@ -3754,11 +2333,14 @@ sstable::~sstable() {
         }
 
     }
+
+    _on_closed(*this);
+
+    return when_all_succeed(std::move(index_closed), std::move(data_closed), std::move(unlinked)).discard_result();
 }
 
-sstring
-dirname(sstring fname) {
-    return boost::filesystem::canonical(std::string(fname)).parent_path().string();
+static inline sstring dirname(const sstring& fname) {
+    return fs::canonical(fs::path(fname)).parent_path().string();
 }
 
 future<>
@@ -3774,57 +2356,81 @@ fsync_directory(const io_error_handler& error_handler, sstring fname) {
     });
 }
 
-future<>
-remove_by_toc_name(sstring sstable_toc_name, const io_error_handler& error_handler) {
-    return seastar::async([sstable_toc_name, &error_handler] () mutable {
-        sstring prefix = sstable_toc_name.substr(0, sstable_toc_name.size() - sstable_version_constants::TOC_SUFFIX.size());
-        auto new_toc_name = prefix + sstable_version_constants::TEMPORARY_TOC_SUFFIX;
-        sstring dir;
+static future<>
+remove_by_toc_name(std::string_view sstable_toc_strview) noexcept {
+    sstring sstable_toc_name, prefix, new_toc_name, dir;
+    try {
+        sstable_toc_name = sstring(sstable_toc_strview);
+        prefix = sstable_toc_name.substr(0, sstable_toc_name.size() - sstable_version_constants::TOC_SUFFIX.size());
+        new_toc_name = prefix + sstable_version_constants::TEMPORARY_TOC_SUFFIX;
+    } catch (...) {
+        return current_exception_as_future();
+    }
 
-        if (sstable_io_check(error_handler, file_exists, sstable_toc_name).get0()) {
-            dir = dirname(sstable_toc_name);
-            sstable_io_check(error_handler, rename_file, sstable_toc_name, new_toc_name).get();
-            fsync_directory(error_handler, dir).get();
-        } else if (sstable_io_check(error_handler, file_exists, new_toc_name).get0()) {
-            dir = dirname(new_toc_name);
-        } else {
-            sstlog.warn("Unable to delete {} because it doesn't exist.", sstable_toc_name);
-            return;
-        }
-
-        auto toc_file = open_checked_file_dma(error_handler, new_toc_name, open_flags::ro).get0();
-        auto in = make_file_input_stream(toc_file);
-        auto size = toc_file.size().get0();
-        auto text = in.read_exactly(size).get0();
-        in.close().get();
-        std::vector<sstring> components;
-        sstring all(text.begin(), text.end());
-        boost::split(components, all, boost::is_any_of("\n"));
-        parallel_for_each(components, [prefix, &error_handler] (sstring component) mutable {
-            if (component.empty()) {
-                // eof
-                return make_ready_future<>();
+    return do_with(std::move(sstable_toc_name), std::move(prefix), std::move(new_toc_name), sstring(),
+            [] (sstring& sstable_toc_name, sstring& prefix, sstring& new_toc_name, sstring& dir) {
+        sstlog.debug("Removing by TOC name: {}", sstable_toc_name);
+        return sstable_io_check(sstable_write_error_handler, file_exists, sstable_toc_name).then([&] (bool toc_exists) {
+            if (toc_exists) {
+                dir = dirname(sstable_toc_name);
+                // If new_toc_name exists it will be atomically replaced.  See rename(2)
+                return sstable_io_check(sstable_write_error_handler, rename_file, sstable_toc_name, new_toc_name).then([&dir] {
+                    return fsync_directory(sstable_write_error_handler, dir);
+                }).then([] {
+                    return make_ready_future<bool>(true);
+                });
+            } else {
+                return sstable_io_check(sstable_write_error_handler, file_exists, new_toc_name);
             }
-            if (component == sstable_version_constants::TOC_SUFFIX) {
-                // already deleted
+        }).then([&] (bool exists) {
+            if (!exists) {
+                sstlog.warn("Unable to delete {} because it doesn't exist.", sstable_toc_name);
                 return make_ready_future<>();
+            } else {
+                dir = dirname(new_toc_name);
             }
-            auto fname = prefix + component;
-            return sstable_io_check(error_handler, remove_file, prefix + component).then_wrapped([fname = std::move(fname)] (future<> f) {
-                // forgive ENOENT, since the component may not have been written;
-                try {
-                    f.get();
-                } catch (std::system_error& e) {
-                    if (!is_system_error_errno(ENOENT)) {
-                        throw;
-                    }
-                    sstlog.debug("Forgiving ENOENT when deleting file {}", fname);
-                }
-                return make_ready_future<>();
+            return with_file(open_checked_file_dma(sstable_write_error_handler, new_toc_name, open_flags::ro), [&] (file& toc_file) {
+                return toc_file.size().then([&] (size_t size) {
+                    return do_with(make_file_input_stream(toc_file), [&, size] (input_stream<char>& in) {
+                        return in.read_exactly(size).then([&] (temporary_buffer<char> text) {
+                            std::vector<sstring> components;
+                            sstring all(text.begin(), text.end());
+                            boost::split(components, all, boost::is_any_of("\n"));
+                            return parallel_for_each(components, [&prefix] (sstring component) {
+                                if (component.empty()) {
+                                    // eof
+                                    return make_ready_future<>();
+                                }
+                                if (component == sstable_version_constants::TOC_SUFFIX) {
+                                    // already renamed
+                                    return make_ready_future<>();
+                                }
+                                auto fname = prefix + component;
+                                return sstable_io_check(sstable_write_error_handler, remove_file, fname).handle_exception([fname = std::move(fname)] (std::exception_ptr eptr) {
+                                    // forgive ENOENT, since the component may not have been written;
+                                    try {
+                                        std::rethrow_exception(eptr);
+                                    } catch (const std::system_error& e) {
+                                        if (!is_system_error_errno(ENOENT)) {
+                                            return make_exception_future<>(eptr);
+                                        }
+                                        sstlog.debug("Forgiving ENOENT when deleting file {}", fname);
+                                        return make_ready_future<>();
+                                    }
+                                    __builtin_unreachable();
+                                });
+                            }).then([&dir] {
+                                return fsync_directory(sstable_write_error_handler, dir);
+                            }).then([&new_toc_name] {
+                                return sstable_io_check(sstable_write_error_handler, remove_file, new_toc_name);
+                            });
+                        }).finally([&in] () mutable {
+                            return in.close();
+                        });
+                    });
+                });
             });
-        }).get();
-        fsync_directory(error_handler, dir).get();
-        sstable_io_check(error_handler, remove_file, new_toc_name).get();
+        });
     });
 }
 
@@ -3871,33 +2477,24 @@ sstable::remove_sstable_with_temp_toc(sstring ks, sstring cf, sstring dir, int64
     });
 }
 
-future<range<partition_key>>
-sstable::get_sstable_key_range(const schema& s) {
-    auto fut = read_summary(default_priority_class());
-    return std::move(fut).then([this, &s] () mutable {
-        this->set_first_and_last_keys();
-        return make_ready_future<range<partition_key>>(range<partition_key>::make(get_first_partition_key(), get_last_partition_key()));
-    });
-}
-
 /**
  * Returns a pair of positions [p1, p2) in the summary file corresponding to entries
  * covered by the specified range, or a disengaged optional if no such pair exists.
  */
-stdx::optional<std::pair<uint64_t, uint64_t>> sstable::get_sample_indexes_for_range(const dht::token_range& range) {
+std::optional<std::pair<uint64_t, uint64_t>> sstable::get_sample_indexes_for_range(const dht::token_range& range) {
     auto entries_size = _components->summary.entries.size();
     auto search = [this](bool before, const dht::token& token) {
         auto kind = before ? key::kind::before_all_keys : key::kind::after_all_keys;
         key k(kind);
         // Binary search will never returns positive values.
-        return uint64_t((binary_search(_components->summary.entries, k, token) + 1) * -1);
+        return uint64_t((binary_search(_schema->get_partitioner(), _components->summary.entries, k, token) + 1) * -1);
     };
     uint64_t left = 0;
     if (range.start()) {
         left = search(range.start()->is_inclusive(), range.start()->value());
         if (left == entries_size) {
             // left is past the end of the sampling.
-            return stdx::nullopt;
+            return std::nullopt;
         }
     }
     uint64_t right = entries_size;
@@ -3905,13 +2502,63 @@ stdx::optional<std::pair<uint64_t, uint64_t>> sstable::get_sample_indexes_for_ra
         right = search(!range.end()->is_inclusive(), range.end()->value());
         if (right == 0) {
             // The first key is strictly greater than right.
-            return stdx::nullopt;
+            return std::nullopt;
         }
     }
     if (left < right) {
-        return stdx::optional<std::pair<uint64_t, uint64_t>>(stdx::in_place_t(), left, right);
+        return std::optional<std::pair<uint64_t, uint64_t>>(std::in_place_t(), left, right);
     }
-    return stdx::nullopt;
+    return std::nullopt;
+}
+
+/**
+ * Returns a pair of positions [p1, p2) in the summary file corresponding to
+ * pages which may include keys covered by the specified range, or a disengaged
+ * optional if the sstable does not include any keys from the range.
+ */
+std::optional<std::pair<uint64_t, uint64_t>> sstable::get_index_pages_for_range(const dht::token_range& range) {
+    const auto& entries = _components->summary.entries;
+    auto entries_size = entries.size();
+    index_comparator cmp(*_schema);
+    dht::ring_position_comparator rp_cmp(*_schema);
+    uint64_t left = 0;
+    if (range.start()) {
+        dht::ring_position_view pos = range.start()->is_inclusive()
+            ? dht::ring_position_view::starting_at(range.start()->value())
+            : dht::ring_position_view::ending_at(range.start()->value());
+
+        // There is no summary entry for the last key, so in order to determine
+        // if pos overlaps with the sstable or not we have to compare with the
+        // last key.
+        if (rp_cmp(pos, get_last_decorated_key()) > 0) {
+            // left is past the end of the sampling.
+            return std::nullopt;
+        }
+
+        left = std::distance(std::begin(entries),
+            std::lower_bound(entries.begin(), entries.end(), pos, cmp));
+
+        if (left) {
+            --left;
+        }
+    }
+    uint64_t right = entries_size;
+    if (range.end()) {
+        dht::ring_position_view pos = range.end()->is_inclusive()
+                                      ? dht::ring_position_view::ending_at(range.end()->value())
+                                      : dht::ring_position_view::starting_at(range.end()->value());
+
+        right = std::distance(std::begin(entries),
+            std::lower_bound(entries.begin(), entries.end(), pos, cmp));
+        if (right == 0) {
+            // The first key is strictly greater than right.
+            return std::nullopt;
+        }
+    }
+    if (left < right) {
+        return std::optional<std::pair<uint64_t, uint64_t>>(std::in_place_t(), left, right);
+    }
+    return std::nullopt;
 }
 
 std::vector<dht::decorated_key> sstable::get_key_samples(const schema& s, const dht::token_range& range) {
@@ -3920,17 +2567,22 @@ std::vector<dht::decorated_key> sstable::get_key_samples(const schema& s, const 
     if (index_range) {
         for (auto idx = index_range->first; idx < index_range->second; ++idx) {
             auto pkey = _components->summary.entries[idx].get_key().to_partition_key(s);
-            res.push_back(dht::global_partitioner().decorate_key(s, std::move(pkey)));
+            res.push_back(dht::decorate_key(s, std::move(pkey)));
         }
     }
     return res;
 }
 
 uint64_t sstable::estimated_keys_for_range(const dht::token_range& range) {
-    auto sample_index_range = get_sample_indexes_for_range(range);
-    uint64_t sample_key_count = sample_index_range ? sample_index_range->second - sample_index_range->first : 0;
-    // adjust for the current sampling level
-    uint64_t estimated_keys = sample_key_count * ((downsampling::BASE_SAMPLING_LEVEL * _components->summary.header.min_index_interval) / _components->summary.header.sampling_level);
+    auto page_range = get_index_pages_for_range(range);
+    if (!page_range) {
+        return 0;
+    }
+    using uint128_t = unsigned __int128;
+    uint64_t range_pages = page_range->second - page_range->first;
+    auto total_keys = get_estimated_key_count();
+    auto total_pages = _components->summary.entries.size();
+    uint64_t estimated_keys = (uint128_t)range_pages * total_keys / total_pages;
     return std::max(uint64_t(1), estimated_keys);
 }
 
@@ -3947,8 +2599,8 @@ sstable::compute_shards_for_this_sstable() const {
                 dht::ring_position::ending_at(get_last_decorated_key().token())));
     } else {
         auto disk_token_range_to_ring_position_range = [] (const disk_token_range& dtr) {
-            auto t1 = dht::token(dht::token::kind::key, managed_bytes(bytes_view(dtr.left.token)));
-            auto t2 = dht::token(dht::token::kind::key, managed_bytes(bytes_view(dtr.right.token)));
+            auto t1 = dht::token(dht::token::kind::key, bytes_view(dtr.left.token));
+            auto t2 = dht::token(dht::token::kind::key, bytes_view(dtr.right.token));
             return dht::partition_range::make(
                     (dtr.left.exclusive ? dht::ring_position::ending_at : dht::ring_position::starting_at)(std::move(t1)),
                     (dtr.right.exclusive ? dht::ring_position::starting_at : dht::ring_position::ending_at)(std::move(t2)));
@@ -3957,7 +2609,7 @@ sstable::compute_shards_for_this_sstable() const {
                 sm->token_ranges.elements
                 | boost::adaptors::transformed(disk_token_range_to_ring_position_range));
     }
-    auto sharder = dht::ring_position_range_vector_sharder(std::move(token_ranges));
+    auto sharder = dht::ring_position_range_vector_sharder(_schema->get_sharder(), std::move(token_ranges));
     auto rpras = sharder.next(*_schema);
     while (rpras) {
         shards.insert(rpras->shard);
@@ -3966,32 +2618,167 @@ sstable::compute_shards_for_this_sstable() const {
     return boost::copy_range<std::vector<unsigned>>(shards);
 }
 
+future<bool> sstable::has_partition_key(const utils::hashed_key& hk, const dht::decorated_key& dk) {
+    shared_sstable s = shared_from_this();
+    if (!filter_has_key(hk)) {
+        return make_ready_future<bool>(false);
+    }
+    auto sem = std::make_unique<reader_concurrency_semaphore>(reader_concurrency_semaphore::no_limits{});
+    auto lh_index_ptr = std::make_unique<sstables::index_reader>(s, sem->make_permit(_schema.get(), s->get_filename()), default_priority_class(), tracing::trace_state_ptr());
+    auto& lh_index = *lh_index_ptr;
+    return lh_index.advance_lower_and_check_if_present(dk).then([lh_index_ptr = std::move(lh_index_ptr), s, sem = std::move(sem)] (bool present) mutable {
+        lh_index_ptr.reset(); // destroy before the semaphore
+        return make_ready_future<bool>(present);
+    });
+}
+
 utils::hashed_key sstable::make_hashed_key(const schema& s, const partition_key& key) {
     return utils::make_hashed_key(static_cast<bytes_view>(key::from_partition_key(s, key)));
 }
 
 future<>
 delete_sstables(std::vector<sstring> tocs) {
-    // FIXME: this needs to be done atomically (using a log file of sstables we intend to delete)
-    return parallel_for_each(tocs, [] (sstring name) {
+    return parallel_for_each(tocs, [] (const sstring& name) {
         return remove_by_toc_name(name);
     });
 }
 
 future<>
-delete_atomically(std::vector<shared_sstable> ssts, const db::large_partition_handler& large_partition_handler) {
-    // Asynchronously issue delete operations for large partitions, do not handle their outcome.
-    // If any of the operations fail, large_partition_handler should be responsible for logging or otherwise handling it.
-    for (const auto& sst : ssts) {
-        large_partition_handler.maybe_delete_large_partitions_entry(*sst);
-    }
-    auto sstables_to_delete_atomically = boost::copy_range<std::vector<sstring>>(ssts
-            | boost::adaptors::transformed([] (auto&& sst) { return sst->toc_filename(); }));
+sstable::unlink()
+{
+    auto name = toc_filename();
+    auto fut = remove_by_toc_name(name);
+    auto remove_fut = fut.then_wrapped([name = std::move(name)] (future<> f) {
+        if (f.failed()) {
+            // Log and ignore the failure since there is nothing much we can do about it at this point.
+            // a. Compaction will retry deleting the sstable in the next pass, and
+            // b. in the future sstables_manager is planned to handle sstables deletion.
+            // c. Eventually we may want to record these failures in a system table
+            //    and notify the administrator about that for manual handling (rather than aborting).
+            sstlog.warn("Failed to delete {}: {}. Ignoring.", name, f.get_exception());
+        }
+        return make_ready_future<>();
+    });
 
-    return delete_sstables(std::move(sstables_to_delete_atomically));
+    name = get_filename();
+    fut = get_large_data_handler().maybe_delete_large_data_entries(shared_from_this());
+    auto update_large_data_fut = fut.then_wrapped([name = std::move(name)] (future<> f) {
+        if (f.failed()) {
+            // Just log and ignore failures to delete large data entries.
+            // They are not critical to the operation of the database.
+            sstlog.warn("Failed to delete large data entry for {}: {}. Ignoring.", name, f.get_exception());
+        }
+        return make_ready_future<>();
+    });
+
+    return when_all(std::move(remove_fut), std::move(update_large_data_fut)).discard_result();
 }
 
+future<>
+delete_atomically(std::vector<shared_sstable> ssts) {
+    if (ssts.empty()) {
+        return make_ready_future<>();
+    }
+    return seastar::async([ssts = std::move(ssts)] {
+        sstring sstdir;
+        min_max_tracker<int64_t> gen_tracker;
+
+        for (const auto& sst : ssts) {
+            gen_tracker.update(sst->generation());
+
+            if (sstdir.empty()) {
+                sstdir = sst->get_dir();
+            } else {
+                // All sstables are assumed to be in the same column_family, hence
+                // sharing their base directory.
+                assert (sstdir == sst->get_dir());
+            }
+        }
+
+        sstring pending_delete_dir = sstdir + "/" + sstable::pending_delete_dir_basename();
+        sstring pending_delete_log = format("{}/sstables-{}-{}.log", pending_delete_dir, gen_tracker.min(), gen_tracker.max());
+        sstring tmp_pending_delete_log = pending_delete_log + ".tmp";
+        sstlog.trace("Writing {}", tmp_pending_delete_log);
+        try {
+            touch_directory(pending_delete_dir).get();
+            auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
+            // Create temporary pending_delete log file.
+            auto f = open_file_dma(tmp_pending_delete_log, oflags).get0();
+            // Write all toc names into the log file.
+            file_output_stream_options options;
+            options.buffer_size = 4096;
+            auto w = file_writer::make(std::move(f), options, tmp_pending_delete_log).get0();
+
+            for (const auto& sst : ssts) {
+                auto toc = sst->component_basename(component_type::TOC);
+                w.write(toc.c_str(), toc.size());
+                w.write("\n", 1);
+            }
+
+            w.flush();
+            w.close();
+
+            auto dir_f = open_directory(pending_delete_dir).get0();
+            // Once flushed and closed, the temporary log file can be renamed.
+            rename_file(tmp_pending_delete_log, pending_delete_log).get();
+
+            // Guarantee that the changes above reached the disk.
+            dir_f.flush().get();
+            dir_f.close().get();
+            sstlog.debug("{} written successfully.", pending_delete_log);
+        } catch (...) {
+            sstlog.warn("Error while writing {}: {}. Ignoring.", pending_delete_log, std::current_exception());
+        }
+
+        parallel_for_each(ssts, [] (shared_sstable sst) {
+            return sst->unlink();
+        }).get();
+
+        // Once all sstables are deleted, the log file can be removed.
+        // Note: the log file will be removed also if unlink failed to remove
+        // any sstable and ignored the error.
+        try {
+            remove_file(pending_delete_log).get();
+            sstlog.debug("{} removed.", pending_delete_log);
+        } catch (...) {
+            sstlog.warn("Error removing {}: {}. Ignoring.", pending_delete_log, std::current_exception());
+        }
+    });
+}
+
+// FIXME: Go through maybe_delete_large_partitions_entry on recovery
+// since this is an indication we crashed in the middle of delete_atomically
+future<> replay_pending_delete_log(sstring pending_delete_log) {
+    sstlog.debug("Reading pending_deletes log file {}", pending_delete_log);
+    return seastar::async([pending_delete_log = std::move(pending_delete_log)] {
+        sstring pending_delete_dir = dirname(pending_delete_log);
+        assert(sstable::is_pending_delete_dir(fs::path(pending_delete_dir)));
+        try {
+            auto sstdir = dirname(pending_delete_dir);
+            auto f = open_file_dma(pending_delete_log, open_flags::ro).get0();
+            auto size = f.size().get0();
+            auto in = make_file_input_stream(f);
+            auto text = in.read_exactly(size).get0();
+            in.close().get();
+            f.close().get();
+
+            sstring all(text.begin(), text.end());
+            std::vector<sstring> basenames;
+            boost::split(basenames, all, boost::is_any_of("\n"), boost::token_compress_on);
+            auto tocs = boost::copy_range<std::vector<sstring>>(basenames
+                    | boost::adaptors::filtered([] (auto&& basename) { return !basename.empty(); })
+                    | boost::adaptors::transformed([&sstdir] (auto&& basename) { return sstdir + "/" + basename; }));
+            delete_sstables(tocs).get();
+        } catch (...) {
+            sstlog.warn("Error replaying {}: {}. Ignoring.", pending_delete_log, std::current_exception());
+        }
+    });
+}
+
+thread_local sstables_stats::stats sstables_stats::_shard_stats;
 thread_local shared_index_lists::stats shared_index_lists::_shard_stats;
+thread_local cached_file::metrics index_page_cache_metrics;
+thread_local mc::cached_promoted_index::metrics promoted_index_cache_metrics;
 static thread_local seastar::metrics::metric_groups metrics;
 
 future<> init_metrics() {
@@ -4004,16 +2791,81 @@ future<> init_metrics() {
             sm::description("Index page requests which initiated a read from disk")),
         sm::make_derive("index_page_blocks", [] { return shared_index_lists::shard_stats().blocks; },
             sm::description("Index page requests which needed to wait due to page not being loaded yet")),
+
+        sm::make_derive("index_page_cache_hits", [] { return index_page_cache_metrics.page_hits; },
+            sm::description("Index page cache requests which were served from cache")),
+        sm::make_derive("index_page_cache_misses", [] { return index_page_cache_metrics.page_misses; },
+            sm::description("Index page cache requests which had to perform I/O")),
+        sm::make_derive("index_page_cache_evictions", [] { return index_page_cache_metrics.page_evictions; },
+            sm::description("Total number of index page cache pages which have been evicted")),
+        sm::make_derive("index_page_cache_populations", [] { return index_page_cache_metrics.page_populations; },
+            sm::description("Total number of index page cache pages which were inserted into the cache")),
+        sm::make_gauge("index_page_cache_bytes", [] { return index_page_cache_metrics.cached_bytes; },
+            sm::description("Total number of bytes cached in the index page cache")),
+
+        sm::make_derive("pi_cache_hits_l0", [] { return promoted_index_cache_metrics.hits_l0; },
+            sm::description("Number of requests for promoted index block in state l0 which didn't have to go to the page cache")),
+        sm::make_derive("pi_cache_hits_l1", [] { return promoted_index_cache_metrics.hits_l1; },
+            sm::description("Number of requests for promoted index block in state l1 which didn't have to go to the page cache")),
+        sm::make_derive("pi_cache_hits_l2", [] { return promoted_index_cache_metrics.hits_l2; },
+            sm::description("Number of requests for promoted index block in state l2 which didn't have to go to the page cache")),
+        sm::make_derive("pi_cache_misses_l0", [] { return promoted_index_cache_metrics.misses_l0; },
+            sm::description("Number of requests for promoted index block in state l0 which had to go to the page cache")),
+        sm::make_derive("pi_cache_misses_l1", [] { return promoted_index_cache_metrics.misses_l1; },
+            sm::description("Number of requests for promoted index block in state l1 which had to go to the page cache")),
+        sm::make_derive("pi_cache_misses_l2", [] { return promoted_index_cache_metrics.misses_l2; },
+            sm::description("Number of requests for promoted index block in state l2 which had to go to the page cache")),
+        sm::make_derive("pi_cache_populations", [] { return promoted_index_cache_metrics.populations; },
+            sm::description("Number of promoted index blocks which got inserted")),
+        sm::make_derive("pi_cache_evictions", [] { return promoted_index_cache_metrics.evictions; },
+            sm::description("Number of promoted index blocks which got evicted")),
+        sm::make_gauge("pi_cache_bytes", [] { return promoted_index_cache_metrics.used_bytes; },
+            sm::description("Number of bytes currently used by cached promoted index blocks")),
+        sm::make_gauge("pi_cache_block_count", [] { return promoted_index_cache_metrics.block_count; },
+            sm::description("Number of promoted index blocks currently cached")),
+
+        sm::make_derive("partition_writes", [] { return sstables_stats::get_shard_stats().partition_writes; },
+            sm::description("Number of partitions written")),
+        sm::make_derive("static_row_writes", [] { return sstables_stats::get_shard_stats().static_row_writes; },
+            sm::description("Number of static rows written")),
+        sm::make_derive("row_writes", [] { return sstables_stats::get_shard_stats().row_writes; },
+            sm::description("Number of clustering rows written")),
+        sm::make_derive("cell_writes", [] { return sstables_stats::get_shard_stats().cell_writes; },
+            sm::description("Number of cells written")),
+        sm::make_derive("tombstone_writes", [] { return sstables_stats::get_shard_stats().tombstone_writes; },
+            sm::description("Number of tombstones written")),
+        sm::make_derive("range_tombstone_writes", [] { return sstables_stats::get_shard_stats().range_tombstone_writes; },
+            sm::description("Number of range tombstones written")),
+        sm::make_derive("cell_tombstone_writes", [] { return sstables_stats::get_shard_stats().cell_tombstone_writes; },
+            sm::description("Number of cell tombstones written")),
+        sm::make_derive("single_partition_reads", [] { return sstables_stats::get_shard_stats().single_partition_reads; },
+            sm::description("Number of single partition flat mutation reads")),
+        sm::make_derive("range_partition_reads", [] { return sstables_stats::get_shard_stats().range_partition_reads; },
+            sm::description("Number of partition range flat mutation reads")),
+        sm::make_derive("sstable_partition_reads", [] { return sstables_stats::get_shard_stats().sstable_partition_reads; },
+            sm::description("Number of whole sstable flat mutation reads")),
+        sm::make_derive("partition_reads", [] { return sstables_stats::get_shard_stats().partition_reads; },
+            sm::description("Number of partitions read")),
+        sm::make_derive("partition_seeks", [] { return sstables_stats::get_shard_stats().partition_seeks; },
+            sm::description("Number of partitions seeked")),
+        sm::make_derive("row_reads", [] { return sstables_stats::get_shard_stats().row_reads; },
+            sm::description("Number of rows read")),
+
+        sm::make_counter("capped_local_deletion_time", [] { return sstables_stats::get_shard_stats().capped_local_deletion_time; },
+            sm::description("Was local deletion time capped at maximum allowed value in Statistics")),
+        sm::make_counter("capped_tombstone_deletion_time", [] { return sstables_stats::get_shard_stats().capped_tombstone_deletion_time; },
+            sm::description("Was partition tombstone deletion time capped at maximum allowed value")),
     });
   });
 }
 
 mutation_source sstable::as_mutation_source() {
     return mutation_source([sst = shared_from_this()] (schema_ptr s,
+            reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             const io_priority_class& pc,
-            tracing::trace_state_ptr trace_ptr,
+            tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) mutable {
         // CAVEAT: if as_mutation_source() is called on a single partition
@@ -4021,17 +2873,58 @@ mutation_source sstable::as_mutation_source() {
         // consequence, fast_forward_to() will *NOT* work on the result,
         // regardless of what the fwd_mr parameter says.
         if (range.is_singular() && range.start()->value().has_key()) {
-            return sst->read_row_flat(s, range.start()->value(), slice, pc, no_resource_tracking(), fwd);
+            return sst->read_row_flat(s, std::move(permit), range.start()->value(), slice, pc, std::move(trace_state), fwd);
         } else {
-            return sst->read_range_rows_flat(s, range, slice, pc, no_resource_tracking(), fwd, fwd_mr);
+            return sst->read_range_rows_flat(s, std::move(permit), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
         }
     });
 }
 
-bool supports_correct_non_compound_range_tombstones() {
-    return service::get_local_storage_service().cluster_supports_reading_correctly_serialized_range_tombstones();
+sstable::sstable(schema_ptr schema,
+        sstring dir,
+        int64_t generation,
+        version_types v,
+        format_types f,
+        db::large_data_handler& large_data_handler,
+        sstables_manager& manager,
+        gc_clock::time_point now,
+        io_error_handler_gen error_handler_gen,
+        size_t buffer_size)
+    : sstable_buffer_size(buffer_size)
+    , _schema(std::move(schema))
+    , _dir(std::move(dir))
+    , _generation(generation)
+    , _version(v)
+    , _format(f)
+    , _now(now)
+    , _read_error_handler(error_handler_gen(sstable_read_error))
+    , _write_error_handler(error_handler_gen(sstable_write_error))
+    , _large_data_handler(large_data_handler)
+    , _manager(manager)
+{
+    tracker.add(*this);
+    manager.add(this);
 }
 
+void sstable::unused() {
+    if (_active) {
+        _active = false;
+        _manager.deactivate(this);
+    } else {
+        _manager.remove(this);
+    }
+}
+
+future<file_writer> file_writer::make(file f, file_output_stream_options options, sstring filename) noexcept {
+    // note: make_file_output_stream closes the file if the stream creation fails
+    return make_file_output_stream(std::move(f), std::move(options))
+        .then([filename = std::move(filename)] (output_stream<char>&& out) {
+            return file_writer(std::move(out), std::move(filename));
+        });
+}
+
+std::ostream& operator<<(std::ostream& out, const deletion_time& dt) {
+    return out << "{timestamp=" << dt.marked_for_delete_at << ", deletion_time=" << dt.marked_for_delete_at << "}";
 }
 
 std::ostream& operator<<(std::ostream& out, const sstables::component_type& comp_type) {
@@ -4054,11 +2947,28 @@ std::ostream& operator<<(std::ostream& out, const sstables::component_type& comp
     return out;
 }
 
+std::optional<large_data_stats_entry> sstable::get_large_data_stat(large_data_type t) const noexcept {
+    if (_large_data_stats) {
+        auto it = _large_data_stats->map.find(t);
+        if (it != _large_data_stats->map.end()) {
+            return std::make_optional<large_data_stats_entry>(it->second);
+        }
+    }
+    return std::make_optional<large_data_stats_entry>();
+}
+
+}
+
 namespace seastar {
 
 void
 lw_shared_ptr_deleter<sstables::sstable>::dispose(sstables::sstable* s) {
-    delete s;
+    s->unused();
 }
+
+
+template
+sstables::sstable*
+seastar::internal::lw_shared_ptr_accessors<sstables::sstable, void>::to_value(seastar::lw_shared_ptr_counter_base*);
 
 }

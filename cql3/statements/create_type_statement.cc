@@ -39,8 +39,9 @@
 
 #include "cql3/statements/create_type_statement.hh"
 #include "prepared_statement.hh"
-
+#include "database.hh"
 #include "service/migration_manager.hh"
+#include "user_types_metadata.hh"
 
 namespace cql3 {
 
@@ -65,31 +66,38 @@ void create_type_statement::add_definition(::shared_ptr<column_identifier> name,
     _column_types.emplace_back(type);
 }
 
-future<> create_type_statement::check_access(const service::client_state& state)
+future<> create_type_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const
 {
     return state.has_keyspace_access(keyspace(), auth::permission::CREATE);
 }
 
-inline bool create_type_statement::type_exists_in(::keyspace& ks)
+inline bool create_type_statement::type_exists_in(::keyspace& ks) const
 {
-    auto&& keyspace_types = ks.metadata()->user_types()->get_all_types();
-    return keyspace_types.find(_name.get_user_type_name()) != keyspace_types.end();
+    auto&& keyspace_types = ks.metadata()->user_types().get_all_types();
+    return keyspace_types.contains(_name.get_user_type_name());
 }
 
-void create_type_statement::validate(service::storage_proxy& proxy, const service::client_state& state)
+void create_type_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const
 {
     try {
         auto&& ks = proxy.get_db().local().find_keyspace(keyspace());
         if (type_exists_in(ks) && !_if_not_exists) {
-            throw exceptions::invalid_request_exception(sprint("A user type of name %s already exists", _name.to_string()));
+            throw exceptions::invalid_request_exception(format("A user type of name {} already exists", _name.to_string()));
         }
     } catch (no_such_keyspace& e) {
-        throw exceptions::invalid_request_exception(sprint("Cannot add type in unknown keyspace %s", keyspace()));
+        throw exceptions::invalid_request_exception(format("Cannot add type in unknown keyspace {}", keyspace()));
+    }
+
+    if (_column_types.size() > max_udt_fields) {
+        throw exceptions::invalid_request_exception(format("A user type cannot have more than {} fields", max_udt_fields));
     }
 
     for (auto&& type : _column_types) {
         if (type->is_counter()) {
-            throw exceptions::invalid_request_exception(sprint("A user type cannot contain counters"));
+            throw exceptions::invalid_request_exception("A user type cannot contain counters");
+        }
+        if (type->is_user_type() && !type->is_frozen()) {
+            throw exceptions::invalid_request_exception("A user type cannot contain non-frozen user type fields");
         }
     }
 }
@@ -101,7 +109,7 @@ void create_type_statement::check_for_duplicate_names(user_type type)
         for (auto j = i +  1; j < names.cend(); ++j) {
             if (*i == *j) {
                 throw exceptions::invalid_request_exception(
-                        sprint("Duplicate field name %s in type %s", to_hex(*i), type->get_name_as_string()));
+                        format("Duplicate field name {} in type {}", to_hex(*i), type->get_name_as_string()));
             }
         }
     }
@@ -112,7 +120,7 @@ const sstring& create_type_statement::keyspace() const
     return _name.get_keyspace();
 }
 
-inline user_type create_type_statement::create_type(database& db)
+inline user_type create_type_statement::create_type(database& db) const
 {
     std::vector<bytes> field_names;
     std::vector<data_type> field_types;
@@ -122,14 +130,15 @@ inline user_type create_type_statement::create_type(database& db)
     }
 
     for (auto&& column_type : _column_types) {
-        field_types.push_back(column_type->prepare(db, keyspace())->get_type());
+        field_types.push_back(column_type->prepare(db, keyspace()).get_type());
     }
 
+    // When a table is created with a UDT column, the column will be non-frozen (multi cell) by default.
     return user_type_impl::get_instance(keyspace(), _name.get_user_type_name(),
-        std::move(field_names), std::move(field_types));
+        std::move(field_names), std::move(field_types), true /* multi cell */);
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only)
+future<shared_ptr<cql_transport::event::schema_change>> create_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
 {
     auto&& db = proxy.get_db().local();
 
@@ -146,7 +155,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_type_statement::a
     return service::get_local_migration_manager().announce_new_type(type, is_local_only).then([this] {
         using namespace cql_transport;
 
-        return make_shared<event::schema_change>(
+        return ::make_shared<event::schema_change>(
                 event::schema_change::change_type::CREATED,
                 event::schema_change::target_type::TYPE,
                 keyspace(),

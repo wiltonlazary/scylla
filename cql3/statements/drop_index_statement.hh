@@ -46,7 +46,7 @@
 
 #include <seastar/core/distributed.hh>
 #include <seastar/core/shared_ptr.hh>
-
+#include <optional>
 #include <memory>
 
 namespace cql3 {
@@ -55,6 +55,12 @@ namespace statements {
 
 class drop_index_statement : public schema_altering_statement {
     sstring _index_name;
+
+    // A "drop index" statement does not specify the base table's name, just an
+    // index name. Nevertheless, the virtual column_family() method is supposed
+    // to return a reasonable table name. If the index doesn't exist, we return
+    // an empty name (this commonly happens with "if exists").
+    mutable std::optional<sstring> _cf_name;
     bool _if_exists;
     cql_stats* _cql_stats = nullptr;
 public:
@@ -62,15 +68,15 @@ public:
 
     virtual const sstring& column_family() const override;
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    virtual void validate(service::storage_proxy&, const service::client_state& state) override;
+    virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) const override;
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 private:
-    schema_ptr lookup_indexed_table() const;
+    schema_ptr lookup_indexed_table(service::storage_proxy& proxy) const;
 };
 
 }

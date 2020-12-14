@@ -19,6 +19,11 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#pragma once
+
+#include <vector>
+#include <unordered_set>
+
 namespace utils {
 /**
  * This class implements an add-only vector that ensures that the elements are
@@ -32,12 +37,21 @@ struct sequenced_set {
     typedef typename std::vector<T>::iterator iterator;
 
     void push_back(const T& val) {
-        if (_set.find(val) != _set.end()) {
-            return;
-        }
+        insert(val);
+    }
 
-        _set.insert(val);
-        _vec.push_back(val);
+    std::pair<iterator, bool> insert(const T& t) {
+        auto r = _set.insert(t);
+        if (r.second) {
+            try {
+                _vec.push_back(t);
+                return std::make_pair(std::prev(_vec.end()), true);
+            } catch (...) {
+                _set.erase(r.first);
+                throw;
+            }
+        }
+        return std::make_pair(_vec.end(), false);
     }
 
     size_t size() {

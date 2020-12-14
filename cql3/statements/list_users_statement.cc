@@ -45,20 +45,25 @@
 #include "auth/common.hh"
 #include "transport/messages/result_message.hh"
 
-void cql3::statements::list_users_statement::validate(service::storage_proxy& proxy, const service::client_state& state) {
+std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::list_users_statement::prepare(
+                database& db, cql_stats& stats) {
+    return std::make_unique<prepared_statement>(::make_shared<list_users_statement>(*this));
 }
 
-future<> cql3::statements::list_users_statement::check_access(const service::client_state& state) {
+void cql3::statements::list_users_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const {
+}
+
+future<> cql3::statements::list_users_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
     state.ensure_not_anonymous();
     return make_ready_future();
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
-cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) {
+cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const {
     static const sstring virtual_table_name("users");
 
     static const auto make_column_spec = [](const sstring& name, const ::shared_ptr<const abstract_type>& ty) {
-        return ::make_shared<column_specification>(
+        return make_lw_shared<column_specification>(
             auth::meta::AUTH_KS,
             virtual_table_name,
             ::make_shared<column_identifier>(name, true),
@@ -66,7 +71,7 @@ cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, s
     };
 
     static thread_local const auto metadata = ::make_shared<cql3::metadata>(
-        std::vector<::shared_ptr<column_specification>>{
+        std::vector<lw_shared_ptr<column_specification>>{
                 make_column_spec("name", utf8_type),
                 make_column_spec("super", boolean_type)});
 
@@ -85,7 +90,7 @@ cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, s
             return do_for_each(sorted_roles, [&as, &results](const sstring& role) {
                 return when_all_succeed(
                         as.has_superuser(role),
-                        as.underlying_role_manager().can_login(role)).then([&results, &role](bool super, bool login) {
+                        as.underlying_role_manager().can_login(role)).then_unpack([&results, &role](bool super, bool login) {
                     if (login) {
                         results->add_column_value(utf8_type->decompose(role));
                         results->add_column_value(boolean_type->decompose(super));
@@ -93,24 +98,23 @@ cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, s
                 });
             }).then([&results] {
                 return make_ready_future<::shared_ptr<result_message>>(::make_shared<result_message::rows>(
-                        std::move(results)));
+                        result(std::move(results))));
             });
         });
     };
 
     const auto& cs = state.get_client_state();
     const auto& as = *cs.get_auth_service();
-    const auto user = cs.user();
 
-    return auth::has_superuser(as, *user).then([&cs, &as, user](bool has_superuser) {
+    return auth::has_superuser(as, *cs.user()).then([&cs, &as](bool has_superuser) {
         if (has_superuser) {
             return as.underlying_role_manager().query_all().then([&as](std::unordered_set<sstring> roles) {
                 return make_results(as, std::move(roles));
             });
         }
 
-        return auth::get_roles(as, *user).then([&as](std::unordered_set<sstring> granted_roles) {
+        return auth::get_roles(as, *cs.user()).then([&as](std::unordered_set<sstring> granted_roles) {
             return make_results(as, std::move(granted_roles));
         });
-    }).finally([user] {});
+    });
 }

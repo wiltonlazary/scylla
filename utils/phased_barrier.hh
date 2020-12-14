@@ -68,16 +68,22 @@ public:
 
     // Starts a new phase and waits for all operations started in any of the earlier phases.
     // It is fine to start multiple awaits in parallel.
+    // Strong exception guarantees.
     future<> advance_and_await() {
+        auto new_gate = make_lw_shared<gate>();
         ++_phase;
-        auto old_gate = std::move(_gate);
-        _gate = make_lw_shared<gate>();
+        auto old_gate = std::exchange(_gate, std::move(new_gate));
         return old_gate->close().then([old_gate, op = start()] {});
     }
 
     // Returns current phase number. The smallest value returned is 0.
     phase_type phase() const {
         return _phase;
+    }
+
+    // Number of operations in current phase.
+    size_t operations_in_progress() const {
+        return _gate->get_count();
     }
 };
 

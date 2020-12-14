@@ -47,25 +47,26 @@
 #include "exceptions/exceptions.hh"
 #include "cql3/cql3_type.hh"
 #include "constants.hh"
+#include "types/map.hh"
 
 namespace cql3 {
 
-shared_ptr<column_specification>
-maps::key_spec_of(column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
-                ::make_shared<column_identifier>(sprint("key(%s)", *column.name), true),
+lw_shared_ptr<column_specification>
+maps::key_spec_of(const column_specification& column) {
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
+                ::make_shared<column_identifier>(format("key({})", *column.name), true),
                  dynamic_pointer_cast<const map_type_impl>(column.type)->get_keys_type());
 }
 
-shared_ptr<column_specification>
-maps::value_spec_of(column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
-                ::make_shared<column_identifier>(sprint("value(%s)", *column.name), true),
+lw_shared_ptr<column_specification>
+maps::value_spec_of(const column_specification& column) {
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
+                ::make_shared<column_identifier>(format("value({})", *column.name), true),
                  dynamic_pointer_cast<const map_type_impl>(column.type)->get_values_type());
 }
 
 ::shared_ptr<term>
-maps::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) {
+maps::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     validate_assignable_to(db, keyspace, *receiver);
 
     auto key_spec = maps::key_spec_of(*receiver);
@@ -78,7 +79,7 @@ maps::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<colum
         auto v = entry.second->prepare(db, keyspace, value_spec);
 
         if (k->contains_bind_marker() || v->contains_bind_marker()) {
-            throw exceptions::invalid_request_exception(sprint("Invalid map literal for %s: bind variables are not supported inside collection literals", *receiver->name));
+            throw exceptions::invalid_request_exception(format("Invalid map literal for {}: bind variables are not supported inside collection literals", *receiver->name));
         }
 
         if (dynamic_pointer_cast<non_terminal>(k) || dynamic_pointer_cast<non_terminal>(v)) {
@@ -91,43 +92,43 @@ maps::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<colum
     if (all_terminal) {
         return value.bind(query_options::DEFAULT);
     } else {
-        return make_shared(std::move(value));
+        return make_shared<delayed_value>(std::move(value));
     }
 }
 
 void
-maps::literal::validate_assignable_to(database& db, const sstring& keyspace, column_specification& receiver) {
+maps::literal::validate_assignable_to(database& db, const sstring& keyspace, const column_specification& receiver) const {
     if (!dynamic_pointer_cast<const map_type_impl>(receiver.type)) {
-        throw exceptions::invalid_request_exception(sprint("Invalid map literal for %s of type %s", *receiver.name, *receiver.type->as_cql3_type()));
+        throw exceptions::invalid_request_exception(format("Invalid map literal for {} of type {}", *receiver.name, receiver.type->as_cql3_type()));
     }
     auto&& key_spec = maps::key_spec_of(receiver);
     auto&& value_spec = maps::value_spec_of(receiver);
     for (auto&& entry : entries) {
-        if (!is_assignable(entry.first->test_assignment(db, keyspace, key_spec))) {
-            throw exceptions::invalid_request_exception(sprint("Invalid map literal for %s: key %s is not of type %s", *receiver.name, *entry.first, *key_spec->type->as_cql3_type()));
+        if (!is_assignable(entry.first->test_assignment(db, keyspace, *key_spec))) {
+            throw exceptions::invalid_request_exception(format("Invalid map literal for {}: key {} is not of type {}", *receiver.name, *entry.first, key_spec->type->as_cql3_type()));
         }
-        if (!is_assignable(entry.second->test_assignment(db, keyspace, value_spec))) {
-            throw exceptions::invalid_request_exception(sprint("Invalid map literal for %s: value %s is not of type %s", *receiver.name, *entry.second, *value_spec->type->as_cql3_type()));
+        if (!is_assignable(entry.second->test_assignment(db, keyspace, *value_spec))) {
+            throw exceptions::invalid_request_exception(format("Invalid map literal for {}: value {} is not of type {}", *receiver.name, *entry.second, value_spec->type->as_cql3_type()));
         }
     }
 }
 
 assignment_testable::test_result
-maps::literal::test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) {
-    if (!dynamic_pointer_cast<const map_type_impl>(receiver->type)) {
+maps::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!dynamic_pointer_cast<const map_type_impl>(receiver.type)) {
         return assignment_testable::test_result::NOT_ASSIGNABLE;
     }
     // If there is no elements, we can't say it's an exact match (an empty map if fundamentally polymorphic).
     if (entries.empty()) {
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
     }
-    auto key_spec = maps::key_spec_of(*receiver);
-    auto value_spec = maps::value_spec_of(*receiver);
+    auto key_spec = maps::key_spec_of(receiver);
+    auto value_spec = maps::value_spec_of(receiver);
     // It's an exact match if all are exact match, but is not assignable as soon as any is non assignable.
     auto res = assignment_testable::test_result::EXACT_MATCH;
     for (auto entry : entries) {
-        auto t1 = entry.first->test_assignment(db, keyspace, key_spec);
-        auto t2 = entry.second->test_assignment(db, keyspace, value_spec);
+        auto t1 = entry.first->test_assignment(db, keyspace, *key_spec);
+        auto t2 = entry.second->test_assignment(db, keyspace, *value_spec);
         if (t1 == assignment_testable::test_result::NOT_ASSIGNABLE || t2 == assignment_testable::test_result::NOT_ASSIGNABLE)
             return assignment_testable::test_result::NOT_ASSIGNABLE;
         if (t1 != assignment_testable::test_result::EXACT_MATCH || t2 != assignment_testable::test_result::EXACT_MATCH)
@@ -152,18 +153,18 @@ maps::literal::to_string() const {
 }
 
 maps::value
-maps::value::from_serialized(bytes_view value, map_type type, cql_serialization_format sf) {
+maps::value::from_serialized(const fragmented_temporary_buffer::view& fragmented_value, const map_type_impl& type, cql_serialization_format sf) {
     try {
         // Collections have this small hack that validate cannot be called on a serialized object,
         // but compose does the validation (so we're fine).
         // FIXME: deserialize_for_native_protocol?!
-        auto m = value_cast<map_type_impl::native_type>(type->deserialize(value, sf));
-        std::map<bytes, bytes, serialized_compare> map(type->get_keys_type()->as_less_comparator());
+        auto m = value_cast<map_type_impl::native_type>(type.deserialize(fragmented_value, sf));
+        std::map<bytes, bytes, serialized_compare> map(type.get_keys_type()->as_less_comparator());
         for (auto&& e : m) {
-            map.emplace(type->get_keys_type()->decompose(e.first),
-                        type->get_values_type()->decompose(e.second));
+            map.emplace(type.get_keys_type()->decompose(e.first),
+                        type.get_values_type()->decompose(e.second));
         }
-        return { std::move(map) };
+        return maps::value { std::move(map) };
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception(e.what());
     }
@@ -193,12 +194,12 @@ maps::value::get_with_protocol_version(cql_serialization_format sf) {
 }
 
 bool
-maps::value::equals(map_type mt, const value& v) {
+maps::value::equals(const map_type_impl& mt, const value& v) {
     return std::equal(map.begin(), map.end(),
                       v.map.begin(), v.map.end(),
-                      [mt] (auto&& e1, auto&& e2) {
-        return mt->get_keys_type()->compare(e1.first, e2.first) == 0
-                && mt->get_values_type()->compare(e1.second, e2.second) == 0;
+                      [&mt] (auto&& e1, auto&& e2) {
+        return mt.get_keys_type()->compare(e1.first, e2.first) == 0
+                && mt.get_values_type()->compare(e1.second, e2.second) == 0;
     });
 }
 
@@ -215,7 +216,7 @@ maps::delayed_value::contains_bind_marker() const {
 }
 
 void
-maps::delayed_value::collect_marker_specification(shared_ptr<variable_specifications> bound_names) {
+maps::delayed_value::collect_marker_specification(variable_specifications& bound_names) const {
 }
 
 shared_ptr<terminal>
@@ -233,10 +234,10 @@ maps::delayed_value::bind(const query_options& options) {
         if (key_bytes.is_unset_value()) {
             throw exceptions::invalid_request_exception("unset value is not supported inside collections");
         }
-        if (key_bytes->size() > std::numeric_limits<uint16_t>::max()) {
-            throw exceptions::invalid_request_exception(sprint("Map key is too long. Map keys are limited to %d bytes but %d bytes keys provided",
+        if (key_bytes->size_bytes() > std::numeric_limits<uint16_t>::max()) {
+            throw exceptions::invalid_request_exception(format("Map key is too long. Map keys are limited to {:d} bytes but {:d} bytes keys provided",
                                                    std::numeric_limits<uint16_t>::max(),
-                                                   key_bytes->size()));
+                                                   key_bytes->size_bytes()));
         }
         auto value_bytes = value->bind_and_get(options);
         if (value_bytes.is_null()) {
@@ -259,8 +260,13 @@ maps::marker::bind(const query_options& options) {
     if (val.is_unset_value()) {
         return constants::UNSET_VALUE;
     }
-    return ::make_shared<maps::value>(maps::value::from_serialized(*val, static_pointer_cast<const map_type_impl>(_receiver->type),
-                                      options.get_cql_serialization_format()));
+    try {
+        _receiver->type->validate(*val, options.get_cql_serialization_format());
+    } catch (marshal_exception& e) {
+        throw exceptions::invalid_request_exception(
+                format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
+    }
+    return ::make_shared<maps::value>(maps::value::from_serialized(*val, static_cast<const map_type_impl&>(*_receiver->type), options.get_cql_serialization_format()));
 }
 
 void
@@ -275,18 +281,16 @@ maps::setter::execute(mutation& m, const clustering_key_prefix& row_key, const u
         return;
     }
     if (column.type->is_multi_cell()) {
-        // delete + put
-        collection_type_impl::mutation mut;
+        // Delete all cells first, then put new ones
+        collection_mutation_description mut;
         mut.tomb = params.make_tombstone_just_before();
-        auto ctype = static_pointer_cast<const map_type_impl>(column.type);
-        auto col_mut = ctype->serialize_mutation_form(std::move(mut));
-        m.set_cell(row_key, column, std::move(col_mut));
+        m.set_cell(row_key, column, mut.serialize(*column.type));
     }
     do_put(m, row_key, params, value, column);
 }
 
 void
-maps::setter_by_key::collect_marker_specification(shared_ptr<variable_specifications> bound_names) {
+maps::setter_by_key::collect_marker_specification(variable_specifications& bound_names) const {
     operation::collect_marker_specification(bound_names);
     _k->collect_marker_specification(bound_names);
 }
@@ -300,12 +304,12 @@ maps::setter_by_key::execute(mutation& m, const clustering_key_prefix& prefix, c
     if (!key) {
         throw invalid_request_exception("Invalid null map key");
     }
-    auto avalue = value ? params.make_cell(*value) : params.make_dead_cell();
-    map_type_impl::mutation update = { {}, { { std::move(to_bytes(*key)), std::move(avalue) } } };
-    // should have been verified as map earlier?
-    auto ctype = static_pointer_cast<const map_type_impl>(column.type);
-    auto col_mut = ctype->serialize_mutation_form(std::move(update));
-    m.set_cell(prefix, column, std::move(col_mut));
+    auto ctype = static_cast<const map_type_impl*>(column.type.get());
+    auto avalue = value ? params.make_cell(*ctype->get_values_type(), *value, atomic_cell::collection_member::yes) : params.make_dead_cell();
+    collection_mutation_description update;
+    update.cells.emplace_back(std::move(to_bytes(*key)), std::move(avalue));
+
+    m.set_cell(prefix, column, update.serialize(*ctype));
 }
 
 void
@@ -322,18 +326,18 @@ maps::do_put(mutation& m, const clustering_key_prefix& prefix, const update_para
         shared_ptr<term> value, const column_definition& column) {
     auto map_value = dynamic_pointer_cast<maps::value>(value);
     if (column.type->is_multi_cell()) {
-        collection_type_impl::mutation mut;
-
         if (!value) {
             return;
         }
 
+        collection_mutation_description mut;
+
+        auto ctype = static_cast<const map_type_impl*>(column.type.get());
         for (auto&& e : map_value->map) {
-            mut.cells.emplace_back(e.first, params.make_cell(e.second));
+            mut.cells.emplace_back(e.first, params.make_cell(*ctype->get_values_type(), fragmented_temporary_buffer::view(e.second), atomic_cell::collection_member::yes));
         }
-        auto ctype = static_pointer_cast<const map_type_impl>(column.type);
-        auto col_mut = ctype->serialize_mutation_form(std::move(mut));
-        m.set_cell(prefix, column, std::move(col_mut));
+
+        m.set_cell(prefix, column, mut.serialize(*ctype));
     } else {
         // for frozen maps, we're overwriting the whole cell
         if (!value) {
@@ -341,7 +345,7 @@ maps::do_put(mutation& m, const clustering_key_prefix& prefix, const update_para
         } else {
             auto v = map_type_impl::serialize_partially_deserialized_form({map_value->map.begin(), map_value->map.end()},
                     cql_serialization_format::internal());
-            m.set_cell(prefix, column, params.make_cell(std::move(v)));
+            m.set_cell(prefix, column, params.make_cell(*column.type, fragmented_temporary_buffer::view(std::move(v))));
         }
     }
 }
@@ -356,10 +360,10 @@ maps::discarder_by_key::execute(mutation& m, const clustering_key_prefix& prefix
     if (key == constants::UNSET_VALUE) {
         throw exceptions::invalid_request_exception("Invalid unset map key");
     }
-    collection_type_impl::mutation mut;
+    collection_mutation_description mut;
     mut.cells.emplace_back(*key->get(params._options), params.make_dead_cell());
-    auto mtype = static_cast<const map_type_impl*>(column.type.get());
-    m.set_cell(prefix, column, mtype->serialize_mutation_form(mut));
+
+    m.set_cell(prefix, column, mut.serialize(*column.type));
 }
 
 }

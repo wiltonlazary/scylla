@@ -42,13 +42,14 @@
 
 #include <memory>
 
-#include "utils/data_output.hh"
-#include "core/future.hh"
-#include "core/shared_ptr.hh"
-#include "core/stream.hh"
+#include <seastar/core/future.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/stream.hh>
+#include <seastar/core/file.hh>
 #include "replay_position.hh"
 #include "commitlog_entry.hh"
 #include "db/timeout_clock.hh"
+#include "utils/fragmented_temporary_buffer.hh"
 
 namespace seastar { class file; }
 
@@ -102,16 +103,22 @@ public:
     class segment;
 
     friend class rp_handle;
+
+    struct buffer_and_replay_position {
+        fragmented_temporary_buffer buffer;
+        replay_position position;
+    };
 private:
     ::shared_ptr<segment_manager> _segment_manager;
 public:
     enum class sync_mode {
         PERIODIC, BATCH
     };
+    using force_sync = commitlog_entry_writer::force_sync;
     struct config {
         config() = default;
         config(const config&) = default;
-        config(const db::config&);
+        static config from_db_config(const db::config&, size_t shard_available_memory);
 
         sstring commit_log_location;
         sstring metrics_category_name;
@@ -129,20 +136,24 @@ public:
         sync_mode mode = sync_mode::PERIODIC;
         std::string fname_prefix = descriptor::FILENAME_PREFIX;
 
+        bool reuse_segments = true;
+        bool use_o_dsync = false;
+        bool warn_about_segments_left_on_disk_after_shutdown = true;
+
         const db::extensions * extensions = nullptr;
     };
 
     struct descriptor {
     private:
-        descriptor(std::pair<uint64_t, uint32_t> p, const std::string& fname_prefix);
+        sstring _filename;
     public:
         static const std::string SEPARATOR;
         static const std::string FILENAME_PREFIX;
         static const std::string FILENAME_EXTENSION;
 
-        descriptor(descriptor&&) = default;
+        descriptor(descriptor&&) noexcept = default;
         descriptor(const descriptor&) = default;
-        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = 1);
+        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = 1, sstring = {});
         descriptor(replay_position p, const std::string& fname_prefix = FILENAME_PREFIX);
         descriptor(const sstring& filename, const std::string& fname_prefix = FILENAME_PREFIX);
 
@@ -176,7 +187,7 @@ public:
      * of data to be written. (See add).
      * Don't write less, absolutely don't write more...
      */
-    using output = data_output;
+    using output = fragmented_temporary_buffer::ostream;
     using serializer_func = std::function<void(output&)>;
 
     /**
@@ -186,7 +197,7 @@ public:
      *
      * @param mutation_func a function that writes 'size' bytes to the log, representing the mutation.
      */
-    future<rp_handle> add(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, serializer_func mutation_func);
+    future<rp_handle> add(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, force_sync sync, serializer_func mutation_func);
 
     /**
      * Template version of add.
@@ -194,8 +205,8 @@ public:
      * @param mu an invokable op that generates the serialized data. (Of size bytes)
      */
     template<typename _MutationOp>
-    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, _MutationOp&& mu) {
-        return add(id, size, timeout, [mu = std::forward<_MutationOp>(mu)](output& out) {
+    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, force_sync sync, _MutationOp&& mu) {
+        return add(id, size, timeout, sync, [mu = std::forward<_MutationOp>(mu)](output& out) {
             mu(out);
         });
     }
@@ -205,8 +216,8 @@ public:
      * @param mu an invokable op that generates the serialized data. (Of size bytes)
      */
     template<typename _MutationOp>
-    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, _MutationOp&& mu) {
-        return add_mutation(id, size, db::timeout_clock::time_point::max(), std::forward<_MutationOp>(mu));
+    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, force_sync sync, _MutationOp&& mu) {
+        return add_mutation(id, size, db::timeout_clock::time_point::max(), sync, std::forward<_MutationOp>(mu));
     }
 
     /**
@@ -341,26 +352,50 @@ public:
     future<std::vector<sstring>> list_existing_segments() const;
     future<std::vector<sstring>> list_existing_segments(const sstring& dir) const;
 
-    typedef std::function<future<>(temporary_buffer<char>, replay_position)> commit_load_reader_func;
+    typedef std::function<future<>(buffer_and_replay_position)> commit_load_reader_func;
 
-    class segment_data_corruption_error: public std::runtime_error {
+    class segment_error : public std::exception {};
+
+    class segment_data_corruption_error: public segment_error {
+        std::string _msg;
     public:
         segment_data_corruption_error(std::string msg, uint64_t s)
-                : std::runtime_error(msg), _bytes(s) {
+                : _msg(std::move(msg)), _bytes(s) {
         }
         uint64_t bytes() const {
             return _bytes;
+        }
+        virtual const char* what() const noexcept {
+            return _msg.c_str();
         }
     private:
         uint64_t _bytes;
     };
 
-    static future<std::unique_ptr<subscription<temporary_buffer<char>, replay_position>>> read_log_file(
-            const sstring&, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
+    class invalid_segment_format : public segment_error {
+        static constexpr const char* _msg = "Not a scylla format commitlog file";
+    public:
+        virtual const char* what() const noexcept {
+            return _msg;
+        }
+    };
+
+    class header_checksum_error : public segment_error {
+        static constexpr const char* _msg = "Checksum error in file header";
+    public:
+        virtual const char* what() const noexcept {
+            return _msg;
+        }
+    };
+
+    static future<> read_log_file(
+            const sstring&, const sstring&, seastar::io_priority_class read_io_prio_class, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
 private:
     commitlog(config);
 
     struct entry_writer {
+        force_sync sync;
+        explicit entry_writer(force_sync sync_) : sync(sync_) {}
         virtual size_t size(segment&) = 0;
         // Returns segment-independent size of the entry. Must be <= than segment-dependant size.
         virtual size_t size() = 0;

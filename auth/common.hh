@@ -22,14 +22,15 @@
 #pragma once
 
 #include <chrono>
-#include <experimental/string_view>
+#include <string_view>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/util/noncopyable_function.hh>
-#include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/core/resource.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/core/smp.hh>
 
 #include "log.hh"
 #include "seastarx.hh"
@@ -38,6 +39,7 @@
 using namespace std::chrono_literals;
 
 class database;
+class timeout_config;
 
 namespace service {
 class migration_manager;
@@ -51,16 +53,16 @@ namespace auth {
 
 namespace meta {
 
-extern const sstring DEFAULT_SUPERUSER_NAME;
-extern const sstring AUTH_KS;
-extern const sstring USERS_CF;
-extern const sstring AUTH_PACKAGE_NAME;
+constexpr std::string_view DEFAULT_SUPERUSER_NAME("cassandra");
+extern const std::string_view AUTH_KS;
+extern const std::string_view USERS_CF;
+extern const std::string_view AUTH_PACKAGE_NAME;
 
 }
 
 template <class Task>
 future<> once_among_shards(Task&& f) {
-    if (engine().cpu_id() == 0u) {
+    if (this_shard_id() == 0u) {
         return f();
     }
 
@@ -75,11 +77,16 @@ inline future<> delay_until_system_ready(seastar::abort_source& as) {
 future<> do_after_system_ready(seastar::abort_source& as, seastar::noncopyable_function<future<>()> func);
 
 future<> create_metadata_table_if_missing(
-        stdx::string_view table_name,
+        std::string_view table_name,
         cql3::query_processor&,
-        stdx::string_view cql,
-        ::service::migration_manager&);
+        std::string_view cql,
+        ::service::migration_manager&) noexcept;
 
-future<> wait_for_schema_agreement(::service::migration_manager&, const database&);
+future<> wait_for_schema_agreement(::service::migration_manager&, const database&, seastar::abort_source&);
+
+///
+/// Time-outs for internal, non-local CQL queries.
+///
+const timeout_config& internal_distributed_timeout_config() noexcept;
 
 }

@@ -31,7 +31,6 @@
 #include <boost/iterator/transform_iterator.hpp>
 #include <boost/lambda/bind.hpp>
 #include "seastarx.hh"
-#include "stdx.hh"
 
 namespace bi = boost::intrusive;
 
@@ -54,12 +53,12 @@ template<typename Key,
          typename EqualPred = std::equal_to<Key>,
          typename Stats = do_nothing_loading_shared_values_stats,
          size_t InitialBucketsCount = 16>
-GCC6_CONCEPT( requires requires () {
+requires requires () {
     Stats::inc_hits();
     Stats::inc_misses();
     Stats::inc_blocks();
     Stats::inc_evictions();
-})
+}
 class loading_shared_values {
 public:
     using key_type = Key;
@@ -71,7 +70,7 @@ private:
     private:
         loading_shared_values& _parent;
         key_type _key;
-        stdx::optional<value_type> _val;
+        std::optional<value_type> _val;
         shared_promise<> _loaded;
 
     public:
@@ -107,16 +106,6 @@ private:
             return bool(_val);
         }
 
-        struct key_eq {
-           bool operator()(const key_type& k, const entry& c) const {
-               return EqualPred()(k, c.key());
-           }
-
-           bool operator()(const entry& c, const key_type& k) const {
-               return EqualPred()(c.key(), k);
-           }
-        };
-
         entry(loading_shared_values& parent, key_type k)
                 : _parent(parent), _key(std::move(k)) {}
 
@@ -131,6 +120,17 @@ private:
 
         friend std::size_t hash_value(const entry& v) {
             return Hash()(v.key());
+        }
+    };
+
+    template<typename KeyType, typename KeyEqual>
+    struct key_eq {
+        bool operator()(const KeyType& k, const entry& c) const {
+           return KeyEqual()(k, c.key());
+        }
+
+        bool operator()(const entry& c, const KeyType& k) const {
+           return KeyEqual()(c.key(), k);
         }
     };
 
@@ -216,13 +216,14 @@ public:
     future<entry_ptr> get_or_load(const key_type& key, Loader&& loader) noexcept {
         static_assert(std::is_same<future<value_type>, typename futurize<std::result_of_t<Loader(const key_type&)>>::type>::value, "Bad Loader signature");
         try {
-            auto i = _set.find(key, Hash(), typename entry::key_eq());
+            auto i = _set.find(key, Hash(), key_eq<key_type, EqualPred>());
             lw_shared_ptr<entry> e;
             future<> f = make_ready_future<>();
             if (i != _set.end()) {
                 e = i->shared_from_this();
                 // take a short cut if the value is ready
                 if (e->ready()) {
+                    Stats::inc_hits();
                     return make_ready_future<entry_ptr>(entry_ptr(std::move(e)));
                 }
                 f = e->loaded().get_shared_future();
@@ -233,7 +234,8 @@ public:
                 _set.insert(*e);
                 // get_shared_future() may throw, so make sure to call it before invoking the loader(key)
                 f = e->loaded().get_shared_future();
-                futurize_apply([&] { return loader(key); }).then_wrapped([e](future<value_type>&& val_fut) mutable {
+                // Future indirectly forwarded to `e`.
+                (void)futurize_invoke([&] { return loader(key); }).then_wrapped([e](future<value_type>&& val_fut) mutable {
                     if (val_fut.failed()) {
                         e->loaded().set_exception(val_fut.get_exception());
                     } else {
@@ -280,12 +282,19 @@ public:
         return boost::make_transform_iterator(_set.begin(), _value_extractor_fn);
     }
 
-    iterator find(const key_type& key) noexcept {
-        set_iterator it = _set.find(key, Hash(), typename entry::key_eq());
+    template<typename KeyType, typename KeyHasher, typename KeyEqual>
+    iterator find(const KeyType& key, KeyHasher key_hasher_func, KeyEqual key_equal_func) noexcept {
+        set_iterator it = _set.find(key, std::move(key_hasher_func), key_eq<KeyType, KeyEqual>());
         if (it == _set.end() || !it->ready()) {
             return end();
         }
         return boost::make_transform_iterator(it, _value_extractor_fn);
+    };
+
+    // keep the default non-templated overloads to ease on the compiler for specifications
+    // that do not require the templated find().
+    iterator find(const key_type& key) noexcept {
+        return find(key, Hash(), EqualPred());
     }
 
 private:

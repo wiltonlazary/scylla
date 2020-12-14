@@ -23,7 +23,9 @@
 
 #include <memory>
 #include <seastar/core/memory.hh>
-#include <seastar/core/reactor.hh>
+#include <seastar/core/idle_cpu_handler.hh>
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/gate.hh>
@@ -197,7 +199,7 @@ class region_group {
         Func func;
     public:
         void allocate() override {
-            futurator::apply(func).forward_to(std::move(pr));
+            futurator::invoke(func).forward_to(std::move(pr));
         }
         void fail(std::exception_ptr e) override {
             pr.set_exception(e);
@@ -208,7 +210,20 @@ class region_group {
         }
     };
 
-    struct on_request_expiry {
+    class on_request_expiry {
+        class blocked_requests_timed_out_error : public timed_out_error {
+            const sstring _msg;
+        public:
+            explicit blocked_requests_timed_out_error(sstring name)
+                : _msg(std::move(name) + ": timed out") {}
+            virtual const char* what() const noexcept override {
+                return _msg.c_str();
+            }
+        };
+
+        sstring _name;
+    public:
+        explicit on_request_expiry(sstring name) : _name(std::move(name)) {}
         void operator()(std::unique_ptr<allocating_function>&) noexcept;
     };
 
@@ -236,14 +251,14 @@ class region_group {
     // there are region_groups waiting on us, we broadcast these messages to the waiters and they
     // will then decide whether they can now run or if they have to wait on us again (or potentially
     // a different ancestor)
-    std::experimental::optional<shared_promise<>> _descendant_blocked_requests = {};
+    std::optional<shared_promise<>> _descendant_blocked_requests = {};
 
     condition_variable _relief;
     future<> _releaser;
     bool _shutdown_requested = false;
 
     bool reclaimer_can_block() const;
-    future<> start_releaser();
+    future<> start_releaser(scheduling_group deferered_work_sg);
     void notify_relief();
     friend void region_group_binomial_group_sanity_check(const region_group::region_heap& bh);
 public:
@@ -252,8 +267,16 @@ public:
     // method run_when_memory_available(), to make sure that a given function is only executed when
     // the total memory for the region group (and all of its parents) is lower or equal to the
     // region_group's throttle_treshold (and respectively for its parents).
-    region_group(region_group_reclaimer& reclaimer = no_reclaimer) : region_group(nullptr, reclaimer) {}
-    region_group(region_group* parent, region_group_reclaimer& reclaimer = no_reclaimer);
+    //
+    // The deferred_work_sg parameter specifies a scheduling group in which to run allocations
+    // (given to run_when_memory_available()) when they must be deferred due to lack of memory
+    // at the time the call to run_when_memory_available() was made.
+    region_group(sstring name = "(unnamed region_group)",
+            region_group_reclaimer& reclaimer = no_reclaimer,
+            scheduling_group deferred_work_sg = default_scheduling_group())
+        : region_group(name, nullptr, reclaimer, deferred_work_sg) {}
+    region_group(sstring name, region_group* parent, region_group_reclaimer& reclaimer = no_reclaimer,
+            scheduling_group deferred_work_sg = default_scheduling_group());
     region_group(region_group&& o) = delete;
     region_group(const region_group&) = delete;
     ~region_group() {
@@ -288,8 +311,12 @@ public:
         update(delta);
     }
 
-    void decrease_usage(region_heap::handle_type& r_handle, ssize_t delta) {
+    void decrease_evictable_usage(region_heap::handle_type& r_handle) {
         _regions.decrease(r_handle);
+    }
+
+    void decrease_usage(region_heap::handle_type& r_handle, ssize_t delta) {
+        decrease_evictable_usage(r_handle);
         update(delta);
     }
 
@@ -310,18 +337,17 @@ public:
     //
     // When timeout is reached first, the returned future is resolved with timed_out_error exception.
     template <typename Func>
-    futurize_t<std::result_of_t<Func()>> run_when_memory_available(Func&& func, db::timeout_clock::time_point timeout = db::no_timeout) {
+    futurize_t<std::result_of_t<Func()>> run_when_memory_available(Func&& func, db::timeout_clock::time_point timeout) {
         // We disallow future-returning functions here, because otherwise memory may be available
         // when we start executing it, but no longer available in the middle of the execution.
         static_assert(!is_future<std::result_of_t<Func()>>::value, "future-returning functions are not permitted.");
-        using futurator = futurize<std::result_of_t<Func()>>;
 
         auto blocked_at = do_for_each_parent(this, [] (auto rg) {
             return (rg->_blocked_requests.empty() && !rg->under_pressure()) ? stop_iteration::no : stop_iteration::yes;
         });
 
         if (!blocked_at) {
-            return futurator::apply(func);
+            return futurize_invoke(func);
         }
 
         auto fn = std::make_unique<concrete_allocating_function<Func>>(std::forward<Func>(func));
@@ -418,12 +444,22 @@ private:
 class tracker {
 public:
     class impl;
+
+    struct config {
+        bool defragment_on_idle;
+        bool abort_on_lsa_bad_alloc;
+        size_t lsa_reclamation_step;
+    };
+
+    void configure(const config& cfg);
+
 private:
     std::unique_ptr<impl> _impl;
     memory::reclaimer _reclaimer;
     friend class region;
     friend class region_impl;
-    memory::reclaiming_result reclaim();
+    memory::reclaiming_result reclaim(seastar::memory::reclaimer::request);
+
 public:
     tracker();
     ~tracker();
@@ -437,10 +473,6 @@ public:
     // Invalidates references to objects in all compactible and evictable regions.
     //
     size_t reclaim(size_t bytes);
-
-    // Compacts one segment at a time from sparsest segment to least sparse until work_waiting_on_reactor returns true
-    // or there are no more segments to compact.
-    reactor::idle_cpu_handler_result compact_on_idle(reactor::work_waiting_on_reactor);
 
     // Compacts as much as possible. Very expensive, mainly for testing.
     // Guarantees that every live object from reclaimable regions will be moved.
@@ -460,14 +492,8 @@ public:
 
     impl& get_impl() { return *_impl; }
 
-    // Set the minimum number of segments reclaimed during single reclamation cycle.
-    void set_reclamation_step(size_t step_in_segments);
-
     // Returns the minimum number of segments reclaimed during single reclamation cycle.
     size_t reclamation_step() const;
-
-    // Abort on allocation failure from LSA
-    void enable_abort_on_bad_alloc();
 
     bool should_abort_on_bad_alloc();
 };
@@ -530,14 +556,20 @@ public:
         return _total_space ? float(used_space()) / total_space() : 0;
     }
 
+    explicit operator bool() const {
+        return _total_space > 0;
+    }
+
     friend std::ostream& operator<<(std::ostream&, const occupancy_stats&);
 };
 
 class basic_region_impl : public allocation_strategy {
 protected:
     bool _reclaiming_enabled = true;
+    seastar::shard_id _cpu = this_shard_id();
 public:
     void set_reclaiming_enabled(bool enabled) {
+        assert(this_shard_id() == _cpu);
         _reclaiming_enabled = enabled;
     }
 
@@ -579,10 +611,10 @@ public:
 
     occupancy_stats occupancy() const;
 
-    allocation_strategy& allocator() {
+    allocation_strategy& allocator() noexcept {
         return *_impl;
     }
-    const allocation_strategy& allocator() const {
+    const allocation_strategy& allocator() const noexcept {
         return *_impl;
     }
 
@@ -613,6 +645,13 @@ public:
     uint64_t reclaim_counter() const {
         return allocator().invalidate_counter();
     }
+
+    // Will cause subsequent calls to evictable_occupancy() to report empty occupancy.
+    void ground_evictable_occupancy();
+
+    // Follows region's occupancy in the parent region group. Less fine-grained than occupancy().
+    // After ground_evictable_occupancy() is called returns 0.
+    occupancy_stats evictable_occupancy();
 
     // Makes this region an evictable region. Supplied function will be called
     // when data from this region needs to be evicted in order to reclaim space.
@@ -646,9 +685,16 @@ struct reclaim_lock {
 // also allocate LSA memory. The object learns from failures how much it
 // should reserve up front in order to not cause allocation failures.
 class allocating_section {
-    size_t _lsa_reserve = 10; // in segments
-    size_t _std_reserve = 1024; // in bytes
+    // Do not decay below these minimal values
+    static constexpr size_t s_min_lsa_reserve = 10;
+    static constexpr size_t s_min_std_reserve = 1024;
+    static constexpr uint64_t s_bytes_per_decay = 10'000'000'000;
+    static constexpr unsigned s_segments_per_decay = 100'000;
+    size_t _lsa_reserve = s_min_lsa_reserve; // in segments
+    size_t _std_reserve = s_min_std_reserve; // in bytes
     size_t _minimum_lsa_emergency_reserve = 0;
+    int64_t _remaining_std_bytes_until_decay = s_bytes_per_decay;
+    int _remaining_lsa_segments_until_decay = s_segments_per_decay;
 private:
     struct guard {
         size_t _prev;
@@ -656,6 +702,7 @@ private:
         ~guard();
     };
     void reserve();
+    void maybe_decay_reserve();
     void on_alloc_failure(logalloc::region&);
 public:
 
@@ -700,9 +747,11 @@ public:
     template<typename Func>
     decltype(auto) with_reclaiming_disabled(logalloc::region& r, Func&& fn) {
         assert(r.reclaiming_enabled());
+        maybe_decay_reserve();
         while (true) {
             try {
                 logalloc::reclaim_lock _(r);
+                memory::disable_abort_on_alloc_failure_temporarily dfg;
                 return fn();
             } catch (const std::bad_alloc&) {
                 on_alloc_failure(r);
@@ -730,11 +779,11 @@ public:
     }
 };
 
-// for tests, make sure a new test is started with a primed segment pool (all segments
-// allocated so segregated allocation can work)
-void prime_segment_pool();
+future<> prime_segment_pool(size_t available_memory, size_t min_free_memory);
 
 uint64_t memory_allocated();
 uint64_t memory_compacted();
+
+occupancy_stats lsa_global_occupancy_stats();
 
 }

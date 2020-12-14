@@ -43,7 +43,8 @@
 
 #include "types.hh"
 #include "native_function.hh"
-#include "core/shared_ptr.hh"
+#include "aggregate_function.hh"
+#include <seastar/core/shared_ptr.hh>
 
 namespace cql3 {
 namespace functions {
@@ -59,7 +60,7 @@ protected:
     }
 
 public:
-    virtual bool is_aggregate() override final {
+    virtual bool is_aggregate() const override final {
         return true;
     }
 };

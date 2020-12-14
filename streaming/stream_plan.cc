@@ -52,6 +52,7 @@ stream_plan& stream_plan::request_ranges(inet_address from, sstring keyspace, dh
     _range_added = true;
     auto session = _coordinator->get_or_create_session(from);
     session->add_stream_request(keyspace, std::move(ranges), std::move(column_families));
+    session->set_reason(_reason);
     return *this;
 }
 
@@ -63,6 +64,7 @@ stream_plan& stream_plan::transfer_ranges(inet_address to, sstring keyspace, dht
     _range_added = true;
     auto session = _coordinator->get_or_create_session(to);
     session->add_transfer_ranges(keyspace, std::move(ranges), std::move(column_families));
+    session->set_reason(_reason);
     return *this;
 }
 
@@ -73,7 +75,7 @@ future<stream_state> stream_plan::execute() {
         return make_ready_future<stream_state>(std::move(state));
     }
     if (_aborted) {
-        throw std::runtime_error(sprint("steam_plan %s is aborted", _plan_id));
+        throw std::runtime_error(format("steam_plan {} is aborted", _plan_id));
     }
     return stream_result_future::init_sending_side(_plan_id, _description, _handlers, _coordinator);
 }
@@ -83,9 +85,23 @@ stream_plan& stream_plan::listeners(std::vector<stream_event_handler*> handlers)
     return *this;
 }
 
-void stream_plan::abort() {
+void stream_plan::do_abort() {
     _aborted = true;
     _coordinator->abort_all_stream_sessions();
+}
+
+void stream_plan::abort() noexcept {
+    try {
+        // FIXME: do_abort() can throw, because its underlying implementation
+        // allocates a vector and calls vector::push_back(). Let's make it noexcept too
+        do_abort();
+    } catch (...) {
+        try {
+            sslog.error("Failed to abort stream plan: {}", std::current_exception());
+        } catch (...) {
+            // Nothing else we can do.
+        }
+    }
 }
 
 }

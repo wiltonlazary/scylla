@@ -32,14 +32,14 @@ mutation::data::data(dht::decorated_key&& key, schema_ptr&& schema)
 
 mutation::data::data(partition_key&& key_, schema_ptr&& schema)
     : _schema(std::move(schema))
-    , _dk(dht::global_partitioner().decorate_key(*_schema, std::move(key_)))
+    , _dk(dht::decorate_key(*_schema, std::move(key_)))
     , _p(_schema)
 { }
 
 mutation::data::data(schema_ptr&& schema, dht::decorated_key&& key, const mutation_partition& mp)
-    : _schema(std::move(schema))
+    : _schema(schema)
     , _dk(std::move(key))
-    , _p(mp)
+    , _p(*schema, mp)
 { }
 
 mutation::data::data(schema_ptr&& schema, dht::decorated_key&& key, mutation_partition&& mp)
@@ -55,21 +55,21 @@ void mutation::set_static_cell(const column_definition& def, atomic_cell_or_coll
 void mutation::set_static_cell(const bytes& name, const data_value& value, api::timestamp_type timestamp, ttl_opt ttl) {
     auto column_def = schema()->get_column_definition(name);
     if (!column_def) {
-        throw std::runtime_error(sprint("no column definition found for '%s'", name));
+        throw std::runtime_error(format("no column definition found for '{}'", name));
     }
     if (!column_def->is_static()) {
-        throw std::runtime_error(sprint("column '%s' is not static", name));
+        throw std::runtime_error(format("column '{}' is not static", name));
     }
-    partition().static_row().apply(*column_def, atomic_cell::make_live(timestamp, column_def->type->decompose(value), ttl));
+    partition().static_row().apply(*column_def, atomic_cell::make_live(*column_def->type, timestamp, column_def->type->decompose(value), ttl));
 }
 
 void mutation::set_clustered_cell(const clustering_key& key, const bytes& name, const data_value& value,
         api::timestamp_type timestamp, ttl_opt ttl) {
     auto column_def = schema()->get_column_definition(name);
     if (!column_def) {
-        throw std::runtime_error(sprint("no column definition found for '%s'", name));
+        throw std::runtime_error(format("no column definition found for '{}'", name));
     }
-    return set_clustered_cell(key, *column_def, atomic_cell::make_live(timestamp, column_def->type->decompose(value), ttl));
+    return set_clustered_cell(key, *column_def, atomic_cell::make_live(*column_def->type, timestamp, column_def->type->decompose(value), ttl));
 }
 
 void mutation::set_clustered_cell(const clustering_key& key, const column_definition& def, atomic_cell_or_collection&& value) {
@@ -81,9 +81,9 @@ void mutation::set_cell(const clustering_key_prefix& prefix, const bytes& name, 
         api::timestamp_type timestamp, ttl_opt ttl) {
     auto column_def = schema()->get_column_definition(name);
     if (!column_def) {
-        throw std::runtime_error(sprint("no column definition found for '%s'", name));
+        throw std::runtime_error(format("no column definition found for '{}'", name));
     }
-    return set_cell(prefix, *column_def, atomic_cell::make_live(timestamp, column_def->type->decompose(value), ttl));
+    return set_cell(prefix, *column_def, atomic_cell::make_live(*column_def->type, timestamp, column_def->type->decompose(value), ttl));
 }
 
 void mutation::set_cell(const clustering_key_prefix& prefix, const column_definition& def, atomic_cell_or_collection&& value) {
@@ -109,35 +109,38 @@ void
 mutation::query(query::result::builder& builder,
     const query::partition_slice& slice,
     gc_clock::time_point now,
-    uint32_t row_limit) &&
+    uint64_t row_limit) &&
 {
     auto pb = builder.add_partition(*schema(), key());
     auto is_reversed = slice.options.contains<query::partition_slice::option::reversed>();
+    auto always_return_static_content = slice.options.contains<query::partition_slice::option::always_return_static_content>();
     mutation_partition& p = partition();
     auto limit = std::min(row_limit, slice.partition_row_limit());
-    p.compact_for_query(*schema(), now, slice.row_ranges(*schema(), key()), is_reversed, limit);
+    p.compact_for_query(*schema(), now, slice.row_ranges(*schema(), key()), always_return_static_content, is_reversed, limit);
     p.query_compacted(pb, *schema(), limit);
 }
 
 query::result
 mutation::query(const query::partition_slice& slice,
+    query::result_memory_accounter&& accounter,
     query::result_options opts,
-    gc_clock::time_point now, uint32_t row_limit) &&
+    gc_clock::time_point now, uint64_t row_limit) &&
 {
-    query::result::builder builder(slice, opts, { });
+    query::result::builder builder(slice, opts, std::move(accounter));
     std::move(*this).query(builder, slice, now, row_limit);
     return builder.build();
 }
 
 query::result
 mutation::query(const query::partition_slice& slice,
+    query::result_memory_accounter&& accounter,
     query::result_options opts,
-    gc_clock::time_point now, uint32_t row_limit) const&
+    gc_clock::time_point now, uint64_t row_limit) const&
 {
-    return mutation(*this).query(slice, opts, now, row_limit);
+    return mutation(*this).query(slice, std::move(accounter), opts, now, row_limit);
 }
 
-size_t
+uint64_t
 mutation::live_row_count(gc_clock::time_point query_time) const {
     return partition().live_row_count(*schema(), query_time);
 }
@@ -181,11 +184,13 @@ mutation::upgrade(const schema_ptr& new_schema) {
 }
 
 void mutation::apply(mutation&& m) {
-    partition().apply(*schema(), std::move(m.partition()), *m.schema());
+    mutation_application_stats app_stats;
+    partition().apply(*schema(), std::move(m.partition()), *m.schema(), app_stats);
 }
 
 void mutation::apply(const mutation& m) {
-    partition().apply(*schema(), m.partition(), *m.schema());
+    mutation_application_stats app_stats;
+    partition().apply(*schema(), m.partition(), *m.schema(), app_stats);
 }
 
 void mutation::apply(const mutation_fragment& mf) {
@@ -216,22 +221,23 @@ mutation mutation::sliced(const query::clustering_row_ranges& ranges) const {
     return mutation(schema(), decorated_key(), partition().sliced(*schema(), ranges));
 }
 
-future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reader& r) {
+future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reader& r, db::timeout_clock::time_point timeout) {
     if (r.is_buffer_empty()) {
         if (r.is_end_of_stream()) {
             return make_ready_future<mutation_opt>();
         }
-        return r.fill_buffer().then([&r] {
-            return read_mutation_from_flat_mutation_reader(r);
+        return r.fill_buffer(timeout).then([&r, timeout] {
+            return read_mutation_from_flat_mutation_reader(r, timeout);
         });
     }
     // r.is_buffer_empty() is always false at this point
     struct adapter {
         schema_ptr _s;
-        stdx::optional<mutation_rebuilder> _builder;
+        std::optional<mutation_rebuilder> _builder;
         adapter(schema_ptr s) : _s(std::move(s)) { }
 
         void consume_new_partition(const dht::decorated_key& dk) {
+            assert(!_builder);
             _builder = mutation_rebuilder(dk, std::move(_s));
         }
 
@@ -267,12 +273,25 @@ future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reade
             return _builder->consume_end_of_stream();
         }
     };
-    return r.consume(adapter(r.schema()));
+    return r.consume(adapter(r.schema()), timeout);
 }
 
 std::ostream& operator<<(std::ostream& os, const mutation& m) {
     const ::schema& s = *m.schema();
-    fprint(os, "{%s.%s %s ", s.ks_name(), s.cf_name(), m.decorated_key());
-    os << m.partition() << "}";
+    const auto& dk = m.decorated_key();
+
+    fmt_print(os, "{{table: '{}.{}', key: {{", s.ks_name(), s.cf_name());
+
+    auto type_iterator = dk._key.get_compound_type(s)->types().begin();
+    auto column_iterator = s.partition_key_columns().begin();
+
+    for (auto&& e : dk._key.components(s)) {
+        os << "'" << column_iterator->name_as_text() << "': " << (*type_iterator)->to_string(to_bytes(e)) << ", ";
+        ++type_iterator;
+        ++column_iterator;
+    }
+
+    fmt_print(os, "token: {}}}, ", dk._token);
+    os << mutation_partition::printer(s, m.partition()) << "\n}";
     return os;
 }

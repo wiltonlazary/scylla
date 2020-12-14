@@ -41,9 +41,11 @@
 #pragma once
 
 #include "exceptions/exceptions.hh"
-#include "core/print.hh"
+#include <seastar/core/print.hh>
 
 #include <boost/range/algorithm/count_if.hpp>
+
+#include <set>
 
 namespace cql3 {
 namespace statements {

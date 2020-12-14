@@ -36,7 +36,7 @@ namespace meta {
 
 namespace roles_table {
 
-stdx::string_view creation_query() {
+std::string_view creation_query() {
     static const sstring instance = sprint(
             "CREATE TABLE %s ("
             "  %s text PRIMARY KEY,"
@@ -45,16 +45,13 @@ stdx::string_view creation_query() {
             "  member_of set<text>,"
             "  salted_hash text"
             ")",
-            qualified_name(),
+            qualified_name,
             role_col_name);
 
     return instance;
 }
 
-stdx::string_view qualified_name() noexcept {
-    static const sstring instance = AUTH_KS + "." + sstring(name);
-    return instance;
-}
+constexpr std::string_view qualified_name("system_auth.roles");
 
 }
 
@@ -63,21 +60,22 @@ stdx::string_view qualified_name() noexcept {
 future<bool> default_role_row_satisfies(
         cql3::query_processor& qp,
         std::function<bool(const cql3::untyped_result_set_row&)> p) {
-    static const sstring query = sprint(
-            "SELECT * FROM %s WHERE %s = ?",
-            meta::roles_table::qualified_name(),
+    static const sstring query = format("SELECT * FROM {} WHERE {} = ?",
+            meta::roles_table::qualified_name,
             meta::roles_table::role_col_name);
 
     return do_with(std::move(p), [&qp](const auto& p) {
-        return qp.process(
+        return qp.execute_internal(
                 query,
                 db::consistency_level::ONE,
+                infinite_timeout_config,
                 {meta::DEFAULT_SUPERUSER_NAME},
                 true).then([&qp, &p](::shared_ptr<cql3::untyped_result_set> results) {
             if (results->empty()) {
-                return qp.process(
+                return qp.execute_internal(
                         query,
                         db::consistency_level::QUORUM,
+                        internal_distributed_timeout_config(),
                         {meta::DEFAULT_SUPERUSER_NAME},
                         true).then([&p](::shared_ptr<cql3::untyped_result_set> results) {
                     if (results->empty()) {
@@ -96,12 +94,13 @@ future<bool> default_role_row_satisfies(
 future<bool> any_nondefault_role_row_satisfies(
         cql3::query_processor& qp,
         std::function<bool(const cql3::untyped_result_set_row&)> p) {
-    static const sstring query = sprint("SELECT * FROM %s", meta::roles_table::qualified_name());
+    static const sstring query = format("SELECT * FROM {}", meta::roles_table::qualified_name);
 
     return do_with(std::move(p), [&qp](const auto& p) {
-        return qp.process(
+        return qp.execute_internal(
                 query,
-                db::consistency_level::QUORUM).then([&p](::shared_ptr<cql3::untyped_result_set> results) {
+                db::consistency_level::QUORUM,
+                internal_distributed_timeout_config()).then([&p](::shared_ptr<cql3::untyped_result_set> results) {
             if (results->empty()) {
                 return false;
             }

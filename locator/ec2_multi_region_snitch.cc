@@ -41,6 +41,12 @@
 #include "gms/gossiper.hh"
 #include "service/storage_service.hh"
 
+static constexpr const char* PUBLIC_IP_QUERY_REQ  = "/latest/meta-data/public-ipv4";
+static constexpr const char* PRIVATE_IP_QUERY_REQ = "/latest/meta-data/local-ipv4";
+
+static constexpr const char* PUBLIC_IPV6_QUERY_REQ  = "/latest/meta-data/network/interfaces/macs/{}/ipv6s";
+static constexpr const char* PRIVATE_MAC_QUERY = "/latest/meta-data/network/interfaces/macs";
+
 namespace locator {
 ec2_multi_region_snitch::ec2_multi_region_snitch(const sstring& fname, unsigned io_cpu_id)
     : ec2_snitch(fname, io_cpu_id) {}
@@ -48,46 +54,66 @@ ec2_multi_region_snitch::ec2_multi_region_snitch(const sstring& fname, unsigned 
 future<> ec2_multi_region_snitch::start() {
     _state = snitch_state::initializing;
 
-    return ec2_snitch::load_config().then([this] {
-        if (engine().cpu_id() == io_cpu_id()) {
-            return aws_api_call(AWS_QUERY_SERVER_ADDR, PUBLIC_IP_QUERY_REQ).then([this](sstring pub_addr){
-                inet_address local_public_address = inet_address(pub_addr);
-                logger().info("Ec2MultiRegionSnitch using publicIP as identifier: {}", local_public_address);
+    return seastar::async([this] {
+        ec2_snitch::load_config().get();
+        if (this_shard_id() == io_cpu_id()) {
+            inet_address local_public_address;
 
-                //
-                // Use the Public IP to broadcast Address to other nodes.
-                //
-                // Cassandra 2.1 manual explicitly instructs to set broadcast_address
-                // value to a public address in cassandra.yaml.
-                //
-                utils::fb_utilities::set_broadcast_address(local_public_address);
-                utils::fb_utilities::set_broadcast_rpc_address(local_public_address);
-
-                return aws_api_call(AWS_QUERY_SERVER_ADDR, PRIVATE_IP_QUERY_REQ).then(
-                        [this] (sstring priv_addr) {
-                    _local_private_address = priv_addr;
-                });
-            }).then([this] {
-                //
-                // Gossiper main instance is currently running on CPU0 -
-                // therefore we need to make sure the _local_private_address is
-                // set on the shard0 so that it may be used when Gossiper is
-                // going to invoke gossiper_starting() method.
-                //
-                return _my_distributed->invoke_on(0,
-                    [this] (snitch_ptr& local_s) {
-
-                    if (engine().cpu_id() != io_cpu_id()) {
-                        local_s->set_local_private_addr(_local_private_address);
+            try {
+                auto broadcast = utils::fb_utilities::get_broadcast_address();
+                if (broadcast.addr().is_ipv6()) {
+                    auto macs = aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, PRIVATE_MAC_QUERY).get0();
+                    // we should just get a single line, ending in '/'. If there are more than one mac, we should
+                    // maybe try to loop the addresses and exclude local/link-local etc, but these addresses typically 
+                    // are already filtered by aws, so probably does not help. For now, just warn and pick first address.
+                    auto i = macs.find('/');
+                    auto mac = macs.substr(0, i);
+                    if (i != std::string::npos && ++i != macs.size()) {
+                        logger().warn("Ec2MultiRegionSnitch (ipv6): more than one MAC address listed ({}). Will use first.", macs);
                     }
-                });
-            }).then([this] {
-                set_snitch_ready();
-            });
+                    auto ipv6 = aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, format(PUBLIC_IPV6_QUERY_REQ, mac)).get0();
+                    local_public_address = inet_address(ipv6);
+                    _local_private_address = ipv6;
+                } else {
+                    auto pub_addr = aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, PUBLIC_IP_QUERY_REQ).get0();
+                    local_public_address = inet_address(pub_addr);
+                }
+            } catch (...) {
+                std::throw_with_nested(exceptions::configuration_exception("Failed to get a Public IP. Public IP is a requirement for Ec2MultiRegionSnitch. Consider using a different snitch if your instance doesn't have it"));
+            }
+            logger().info("Ec2MultiRegionSnitch using publicIP as identifier: {}", local_public_address);
+
+            //
+            // Use the Public IP to broadcast Address to other nodes.
+            //
+            // Cassandra 2.1 manual explicitly instructs to set broadcast_address
+            // value to a public address in cassandra.yaml.
+            //
+            utils::fb_utilities::set_broadcast_address(local_public_address);
+            utils::fb_utilities::set_broadcast_rpc_address(local_public_address);
+
+            if (!local_public_address.addr().is_ipv6()) {
+                sstring priv_addr = aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, PRIVATE_IP_QUERY_REQ).get0();
+                _local_private_address = priv_addr;
+            }
+
+            //
+            // Gossiper main instance is currently running on CPU0 -
+            // therefore we need to make sure the _local_private_address is
+            // set on the shard0 so that it may be used when Gossiper is
+            // going to invoke gossiper_starting() method.
+            //
+            _my_distributed->invoke_on(0, [this] (snitch_ptr& local_s) {
+                if (this_shard_id() != io_cpu_id()) {
+                    local_s->set_local_private_addr(_local_private_address);
+                }
+            }).get();
+
+            set_snitch_ready();
+            return;
         }
 
         set_snitch_ready();
-        return make_ready_future<>();
     });
 }
 
@@ -100,16 +126,14 @@ future<> ec2_multi_region_snitch::gossiper_starting() {
     // Note: currently gossiper "main" instance always runs on CPU0 therefore
     // this function will be executed on CPU0 only.
     //
-    ec2_snitch::gossiper_starting();
 
     using namespace gms;
     auto& g = get_local_gossiper();
-    auto& ss = service::get_local_storage_service();
 
     return g.add_local_application_state(application_state::INTERNAL_IP,
-        ss.value_factory.internal_ip(_local_private_address)).then([this] {
+        versioned_value::internal_ip(_local_private_address)).then([this] {
         if (!_gossip_started) {
-            gms::get_local_gossiper().register_(make_shared<reconnectable_snitch_helper>(_my_dc));
+            gms::get_local_gossiper().register_(::make_shared<reconnectable_snitch_helper>(_my_dc));
             _gossip_started = true;
         }
     });

@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import shutil
+
+import run   # run.py in this directory
+
+def find_cassandra():
+    # By default, we assume 'cassandra' is in the user's path. A specific
+    # cassandra script can be chosen by setting the CASSANDRA variable.
+    cassandra = os.getenv('CASSANDRA', 'cassandra')
+    cassandra_path = shutil.which(cassandra)
+    if cassandra_path is None:
+        print("Error: Can't find {}. Please set the CASSANDRA environment variable to the path of the Cassandra startup script.".format(cassandra))
+        exit(1)
+    return cassandra_path
+
+cassandra = find_cassandra()
+
+def run_cassandra_cmd(pid, dir):
+    global cassandra
+    ip = run.pid_to_ip(pid)
+    # Unfortunately, Cassandra doesn't take command-line parameters. We need
+    # to write a configuration file, and feed it to Cassandra using
+    # environment variables. Some of the parameters we did not deliberately
+    # want to override - they just don't have a default and we must set them.
+    confdir = os.path.join(dir, 'conf')
+    os.mkdir(confdir)
+    with open(os.path.join(confdir, 'cassandra.yaml'), 'w') as f:
+        print('hints_directory: ' + dir + '/hints\n' +
+              'data_file_directories:\n    - ' + dir + '/data\n' +
+              'commitlog_directory: ' + dir + '/commitlog\n' +
+              'saved_caches_directory: ' + dir + '/data/saved_caches\n' +
+              'commitlog_sync: periodic\n' +
+              'commitlog_sync_period_in_ms: 10000\n' +
+              'partitioner: org.apache.cassandra.dht.Murmur3Partitioner\n' +
+              'endpoint_snitch: SimpleSnitch\n' +
+              'seed_provider:\n    - class_name: org.apache.cassandra.locator.SimpleSeedProvider\n      parameters:\n          - seeds: "' + ip + '"\n' +
+              'listen_address: ' + ip + '\n' +
+              'auto_snapshot: false\n' +
+              'enable_materialized_views: true\n', file=f)
+    print('Booting Cassandra on ' + ip + ' in ' + dir + '...')
+    logsdir = os.path.join(dir, 'logs')
+    os.mkdir(logsdir)
+    # Cassandra creates some subdirectories on its own, but one it doesn't...
+    os.mkdir(os.path.join(dir, 'hints'))
+    env = { 'CASSANDRA_CONF': confdir,
+            'CASSANDRA_LOG_DIR': logsdir,
+            'CASSANDRA_INCLUDE': '' }
+    return ([cassandra, '-f'], env)
+
+print('Cassandra is: ' + cassandra + '.')
+
+pid = run.run_with_temporary_dir(run_cassandra_cmd)
+ip = run.pid_to_ip(pid)
+
+run.wait_for_cql(pid, ip)
+success = run.run_cql_pytest(ip, sys.argv[1:])
+
+run.summary = 'Cassandra tests pass' if success else 'Cassandra tests failure'
+
+exit(0 if success else 1)
+
+# Note that the run.cleanup_all() function runs now, just like on any exit
+# for any reason in this script. It will delete the temporary files and
+# announce the failure or success of the test (printing run.summary).

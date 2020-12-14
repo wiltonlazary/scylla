@@ -50,26 +50,19 @@ namespace cql3 {
 
 namespace statements {
 
-class authentication_statement : public raw::parsed_statement, public cql_statement_no_metadata, public ::enable_shared_from_this<authentication_statement> {
+class authentication_statement : public raw::parsed_statement, public cql_statement_no_metadata {
 public:
     authentication_statement() : cql_statement_no_metadata(&timeout_config::other_timeout) {}
 
-    uint32_t get_bound_terms() override;
-
-    std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
-
-    bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
+    uint32_t get_bound_terms() const override;
 
     bool depends_on_keyspace(const sstring& ks_name) const override;
 
     bool depends_on_column_family(const sstring& cf_name) const override;
 
-    future<> check_access(const service::client_state& state) override;
+    future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    void validate(service::storage_proxy&, const service::client_state& state) override;
-
-    future<::shared_ptr<cql_transport::messages::result_message>>
-    execute_internal(service::storage_proxy& proxy, service::query_state& state, const query_options& options) override;
+    void validate(service::storage_proxy&, const service::client_state& state) const override;
 };
 
 }

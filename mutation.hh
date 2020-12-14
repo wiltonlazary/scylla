@@ -25,7 +25,7 @@
 
 #include "mutation_partition.hh"
 #include "keys.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "dht/i_partitioner.hh"
 #include "hashing.hh"
 #include "mutation_fragment.hh"
@@ -108,25 +108,27 @@ public:
 public:
     // The supplied partition_slice must be governed by this mutation's schema
     query::result query(const query::partition_slice&,
+        query::result_memory_accounter&& accounter,
         query::result_options opts = query::result_options::only_result(),
         gc_clock::time_point now = gc_clock::now(),
-        uint32_t row_limit = query::max_rows) &&;
+        uint64_t row_limit = query::max_rows) &&;
 
     // The supplied partition_slice must be governed by this mutation's schema
     // FIXME: Slower than the r-value version
     query::result query(const query::partition_slice&,
+        query::result_memory_accounter&& accounter,
         query::result_options opts = query::result_options::only_result(),
         gc_clock::time_point now = gc_clock::now(),
-        uint32_t row_limit = query::max_rows) const&;
+        uint64_t row_limit = query::max_rows) const&;
 
     // The supplied partition_slice must be governed by this mutation's schema
     void query(query::result::builder& builder,
         const query::partition_slice& slice,
         gc_clock::time_point now = gc_clock::now(),
-        uint32_t row_limit = query::max_rows) &&;
+        uint64_t row_limit = query::max_rows) &&;
 
     // See mutation_partition::live_row_count()
-    size_t live_row_count(gc_clock::time_point query_time = gc_clock::time_point::min()) const;
+    uint64_t live_row_count(gc_clock::time_point query_time = gc_clock::time_point::min()) const;
 
     void apply(mutation&&);
     void apply(const mutation&);
@@ -141,6 +143,20 @@ public:
     mutation sliced(const query::clustering_row_ranges&) const;
 private:
     friend std::ostream& operator<<(std::ostream& os, const mutation& m);
+};
+
+struct mutation_equals_by_key {
+    bool operator()(const mutation& m1, const mutation& m2) const {
+        return m1.schema() == m2.schema()
+                && m1.decorated_key().equal(*m1.schema(), m2.decorated_key());
+    }
+};
+
+struct mutation_hash_by_key {
+    size_t operator()(const mutation& m) const {
+        auto dk_hash = std::hash<dht::decorated_key>();
+        return dk_hash(m.decorated_key());
+    }
 };
 
 struct mutation_decorated_key_less_comparator {
@@ -188,4 +204,4 @@ boost::iterator_range<std::vector<mutation>::const_iterator> slice(
 class flat_mutation_reader;
 
 // Reads a single partition from a reader. Returns empty optional if there are no more partitions to be read.
-future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reader&);
+future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reader& reader, db::timeout_clock::time_point timeout);

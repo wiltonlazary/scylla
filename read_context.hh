@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "query-request.hh"
 #include "mutation_fragment.hh"
 #include "partition_version.hh"
@@ -37,17 +37,17 @@ namespace cache {
 class autoupdating_underlying_reader final {
     row_cache& _cache;
     read_context& _read_context;
-    stdx::optional<flat_mutation_reader> _reader;
-    utils::phased_barrier::phase_type _reader_creation_phase;
+    std::optional<flat_mutation_reader> _reader;
+    utils::phased_barrier::phase_type _reader_creation_phase = 0;
     dht::partition_range _range = { };
-    stdx::optional<dht::decorated_key> _last_key;
-    stdx::optional<dht::decorated_key> _new_last_key;
+    std::optional<dht::decorated_key> _last_key;
+    std::optional<dht::decorated_key> _new_last_key;
 public:
     autoupdating_underlying_reader(row_cache& cache, read_context& context)
         : _cache(cache)
         , _read_context(context)
     { }
-    future<mutation_fragment_opt> move_to_next_partition() {
+    future<mutation_fragment_opt> move_to_next_partition(db::timeout_clock::time_point timeout) {
         _last_key = std::move(_new_last_key);
         auto start = population_range_start();
         auto phase = _cache.phase_of(start);
@@ -75,7 +75,7 @@ public:
         if (_reader->is_end_of_stream() && _reader->is_buffer_empty()) {
             return make_ready_future<mutation_fragment_opt>();
         }
-        return (*_reader)().then([this] (auto&& mfopt) {
+        return (*_reader)(timeout).then([this] (auto&& mfopt) {
             if (mfopt) {
                 assert(mfopt->is_partition_start());
                 _new_last_key = mfopt->as_partition_start().key();
@@ -105,7 +105,6 @@ public:
         return make_ready_future<>();
     }
     utils::phased_barrier::phase_type creation_phase() const {
-        assert(_reader);
         return _reader_creation_phase;
     }
     const dht::partition_range& range() const {
@@ -121,11 +120,11 @@ public:
 class read_context final : public enable_lw_shared_from_this<read_context> {
     row_cache& _cache;
     schema_ptr _schema;
+    reader_permit _permit;
     const dht::partition_range& _range;
     const query::partition_slice& _slice;
     const io_priority_class& _pc;
     tracing::trace_state_ptr _trace_state;
-    streamed_mutation::forwarding _fwd;
     mutation_reader::forwarding _fwd_mr;
     bool _range_query;
     // When reader enters a partition, it must be set up for reading that
@@ -141,24 +140,24 @@ class read_context final : public enable_lw_shared_from_this<read_context> {
 
     mutation_source_opt _underlying_snapshot;
     dht::partition_range _sm_range;
-    stdx::optional<dht::decorated_key> _key;
+    std::optional<dht::decorated_key> _key;
     row_cache::phase_type _phase;
 public:
     read_context(row_cache& cache,
             schema_ptr schema,
+            reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             const io_priority_class& pc,
             tracing::trace_state_ptr trace_state,
-            streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr)
         : _cache(cache)
         , _schema(std::move(schema))
+        , _permit(std::move(permit))
         , _range(range)
         , _slice(slice)
         , _pc(pc)
         , _trace_state(std::move(trace_state))
-        , _fwd(fwd)
         , _fwd_mr(fwd_mr)
         , _range_query(!range.is_singular() || !range.start()->value().has_key())
         , _underlying(_cache, *this)
@@ -180,11 +179,11 @@ public:
     read_context(const read_context&) = delete;
     row_cache& cache() { return _cache; }
     const schema_ptr& schema() const { return _schema; }
+    reader_permit permit() const { return _permit; }
     const dht::partition_range& range() const { return _range; }
     const query::partition_slice& slice() const { return _slice; }
     const io_priority_class& pc() const { return _pc; }
     tracing::trace_state_ptr trace_state() const { return _trace_state; }
-    streamed_mutation::forwarding fwd() const { return _fwd; }
     mutation_reader::forwarding fwd_mr() const { return _fwd_mr; }
     bool is_range_query() const { return _range_query; }
     autoupdating_underlying_reader& underlying() { return _underlying; }
@@ -192,7 +191,7 @@ public:
     const dht::decorated_key& key() const { return *_key; }
     void on_underlying_created() { ++_underlying_created; }
     bool digest_requested() const { return _slice.options.contains<query::partition_slice::option::with_digest>(); }
-private:
+public:
     future<> ensure_underlying(db::timeout_clock::time_point timeout) {
         if (_underlying_snapshot) {
             return create_underlying(true, timeout);
@@ -210,18 +209,6 @@ public:
         _phase = phase;
         _underlying_snapshot = {};
         _key = dk;
-    }
-    // Fast forwards the underlying streamed_mutation to given range.
-    future<> fast_forward_to(position_range range, db::timeout_clock::time_point timeout) {
-        return ensure_underlying(timeout).then([this, range = std::move(range), timeout] {
-            return _underlying.underlying().fast_forward_to(std::move(range), timeout);
-        });
-    }
-    // Gets the next fragment from the underlying reader
-    future<mutation_fragment_opt> get_next_fragment(db::timeout_clock::time_point timeout) {
-        return ensure_underlying(timeout).then([this] {
-            return _underlying.underlying()();
-        });
     }
 };
 

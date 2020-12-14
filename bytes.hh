@@ -22,18 +22,26 @@
 #pragma once
 
 #include "seastarx.hh"
-#include "core/sstring.hh"
+#include <seastar/core/sstring.hh>
 #include "hashing.hh"
-#include <experimental/optional>
+#include <optional>
 #include <iosfwd>
 #include <functional>
 #include "utils/mutable_view.hh"
 
 using bytes = basic_sstring<int8_t, uint32_t, 31, false>;
-using bytes_view = std::experimental::basic_string_view<int8_t>;
+using bytes_view = std::basic_string_view<int8_t>;
 using bytes_mutable_view = basic_mutable_view<bytes_view::value_type>;
-using bytes_opt = std::experimental::optional<bytes>;
-using sstring_view = std::experimental::string_view;
+using bytes_opt = std::optional<bytes>;
+using sstring_view = std::string_view;
+
+inline sstring_view to_sstring_view(bytes_view view) {
+    return {reinterpret_cast<const char*>(view.data()), view.size()};
+}
+
+inline bytes_view to_bytes_view(sstring_view view) {
+    return {reinterpret_cast<const int8_t*>(view.data()), view.size()};
+}
 
 namespace std {
 
@@ -45,6 +53,13 @@ struct hash<bytes_view> {
 };
 
 }
+
+struct fmt_hex {
+    bytes_view& v;
+    fmt_hex(bytes_view& v) noexcept : v(v) {}
+};
+
+std::ostream& operator<<(std::ostream& os, const fmt_hex& hex);
 
 bytes from_hex(sstring_view s);
 sstring to_hex(bytes_view b);
@@ -80,9 +95,12 @@ struct appending_hash<bytes_view> {
 };
 
 inline int32_t compare_unsigned(bytes_view v1, bytes_view v2) {
-    auto n = memcmp(v1.begin(), v2.begin(), std::min(v1.size(), v2.size()));
+  auto size = std::min(v1.size(), v2.size());
+  if (size) {
+    auto n = memcmp(v1.begin(), v2.begin(), size);
     if (n) {
         return n;
     }
+  }
     return (int32_t) (v1.size() - v2.size());
 }

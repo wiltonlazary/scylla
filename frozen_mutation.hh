@@ -26,9 +26,9 @@
 #include "database_fwd.hh"
 #include "mutation_partition_view.hh"
 #include "mutation_fragment.hh"
-#include "flat_mutation_reader.hh"
 
 class mutation;
+class flat_mutation_reader;
 
 namespace ser {
 class mutation_view;
@@ -52,7 +52,7 @@ private:
     partition_key deserialize_key() const;
     ser::mutation_view mutation_view() const;
 public:
-    frozen_mutation(const mutation& m);
+    explicit frozen_mutation(const mutation& m);
     explicit frozen_mutation(bytes_ostream&& b);
     frozen_mutation(bytes_ostream&& b, partition_key key);
     frozen_mutation(frozen_mutation&& m) = default;
@@ -62,10 +62,16 @@ public:
     const bytes_ostream& representation() const { return _bytes; }
     utils::UUID column_family_id() const;
     utils::UUID schema_version() const; // FIXME: Should replace column_family_id()
-    partition_key_view key(const schema& s) const;
+    partition_key_view key() const;
     dht::decorated_key decorated_key(const schema& s) const;
     mutation_partition_view partition() const;
+    // The supplied schema must be of the same version as the schema of
+    // the mutation which was used to create this instance.
+    // throws schema_mismatch_error otherwise.
     mutation unfreeze(schema_ptr s) const;
+
+    // Automatically upgrades the stored mutation to the supplied schema with custom column mapping.
+    mutation unfreeze_upgrading(schema_ptr schema, const column_mapping& cm) const;
 
     struct printer {
         const frozen_mutation& self;
@@ -73,10 +79,16 @@ public:
         friend std::ostream& operator<<(std::ostream&, const printer&);
     };
 
+    // Same requirements about the schema as unfreeze().
     printer pretty_printer(schema_ptr) const;
 };
 
 frozen_mutation freeze(const mutation& m);
+
+struct frozen_mutation_and_schema {
+    frozen_mutation fm;
+    schema_ptr s;
+};
 
 // Can receive streamed_mutation in reversed order.
 class streamed_mutation_freezer {
@@ -85,7 +97,7 @@ class streamed_mutation_freezer {
     bool _reversed;
 
     tombstone _partition_tombstone;
-    stdx::optional<static_row> _sr;
+    std::optional<static_row> _sr;
     std::deque<clustering_row> _crs;
     range_tombstone_list _rts;
 public:
@@ -107,4 +119,17 @@ static constexpr size_t default_frozen_fragment_size = 128 * 1024;
 using frozen_mutation_consumer_fn = std::function<future<stop_iteration>(frozen_mutation, bool)>;
 future<> fragment_and_freeze(flat_mutation_reader mr, frozen_mutation_consumer_fn c,
                              size_t fragment_size = default_frozen_fragment_size);
+
+class reader_permit;
+
+class frozen_mutation_fragment {
+    bytes_ostream _bytes;
+public:
+    explicit frozen_mutation_fragment(bytes_ostream bytes) : _bytes(std::move(bytes)) { }
+    const bytes_ostream& representation() const { return _bytes; }
+
+    mutation_fragment unfreeze(const schema& s, reader_permit permit);
+};
+
+frozen_mutation_fragment freeze(const schema& s, const mutation_fragment& mf);
 

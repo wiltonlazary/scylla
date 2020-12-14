@@ -41,25 +41,20 @@
 
 #pragma once
 
-#include <vector>
-#include "to_string.hh"
-#include "schema.hh"
-#include "cql3/restrictions/restrictions.hh"
-#include "cql3/restrictions/primary_key_restrictions.hh"
-#include "cql3/restrictions/single_column_restrictions.hh"
-#include "cql3/relation.hh"
-#include "cql3/variable_specifications.hh"
+#include <ostream>
 
 namespace cql3 {
 
 namespace statements {
 
 class statement_type final {
-    enum class type {
-        insert,
+    enum class type : size_t {
+        insert = 0,
         update,
         del,
-        select
+        select,
+
+        last  // Keep me as last entry
     };
     const type _type;
 
@@ -86,6 +81,12 @@ public:
     static const statement_type DELETE;
     static const statement_type SELECT;
 
+    static constexpr size_t MAX_VALUE = size_t(type::last) - 1;
+
+    explicit operator size_t() const {
+        return size_t(_type);
+    }
+
     bool operator==(const statement_type& other) const {
         return _type == other._type;
     }
@@ -100,6 +101,8 @@ public:
         case type::update: return os << "UPDATE";
         case type::del: return os << "DELETE";
         case type::select : return os << "SELECT";
+
+        case type::last : return os << "LAST";
         }
         return os;
     }

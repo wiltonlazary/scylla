@@ -21,20 +21,22 @@
 
 #pragma once
 
-#include "cql3/statements/select_statement.hh"
 #include "dht/i_partitioner.hh"
 #include "query-request.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
+#include "db/view/view.hh"
+
+namespace cql3::statements {
+class select_statement;
+}
 
 class view_info final {
     const schema& _schema;
     raw_view_info _raw;
     // The following fields are used to select base table rows.
     mutable shared_ptr<cql3::statements::select_statement> _select_statement;
-    mutable stdx::optional<query::partition_slice> _partition_slice;
-    mutable stdx::optional<dht::partition_range_vector> _partition_ranges;
-    // Id of a regular base table column included in the view's PK, if any.
-    mutable stdx::optional<column_id> _base_non_pk_column_in_view_pk;
+    mutable std::optional<query::partition_slice> _partition_slice;
+    db::view::base_info_ptr _base_info;
 public:
     view_info(const schema& schema, const raw_view_info& raw_view_info);
 
@@ -60,11 +62,24 @@ public:
 
     cql3::statements::select_statement& select_statement() const;
     const query::partition_slice& partition_slice() const;
-    const dht::partition_range_vector& partition_ranges() const;
     const column_definition* view_column(const schema& base, column_id base_id) const;
     const column_definition* view_column(const column_definition& base_def) const;
-    stdx::optional<column_id> base_non_pk_column_in_view_pk() const;
-    void initialize_base_dependent_fields(const schema& base);
+    bool has_base_non_pk_columns_in_view_pk() const;
+
+    /// Returns a pointer to the base_dependent_view_info which matches the current
+    /// schema of the base table.
+    ///
+    /// base_dependent_view_info lives separately from the view schema.
+    /// It can change without the view schema changing its value.
+    /// This pointer is updated on base table schema changes as long as this view_info
+    /// corresponds to the current schema of the view. After that the pointer stops tracking
+    /// the base table schema.
+    ///
+    /// The snapshot of both the view schema and base_dependent_view_info is represented
+    /// by view_and_base. See with_base_info_snapshot().
+    const db::view::base_info_ptr& base_info() const { return _base_info; }
+    void set_base_info(db::view::base_info_ptr);
+    db::view::base_info_ptr make_base_dependent_view_info(const schema& base_schema) const;
 
     friend bool operator==(const view_info& x, const view_info& y) {
         return x._raw == y._raw;

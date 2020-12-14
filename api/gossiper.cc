@@ -21,7 +21,7 @@
 
 #include "gossiper.hh"
 #include "api/api-doc/gossiper.json.hh"
-#include <gms/gossiper.hh>
+#include "gms/gossiper.hh"
 
 namespace api {
 using namespace json;
@@ -63,6 +63,13 @@ void set_gossiper(http_context& ctx, routes& r) {
             });
         }
         return gms::get_local_gossiper().unsafe_assassinate_endpoint(req->param["addr"]).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    httpd::gossiper_json::force_remove_endpoint.set(r, [](std::unique_ptr<request> req) {
+        gms::inet_address ep(req->param["addr"]);
+        return gms::get_local_gossiper().force_remove_endpoint(ep).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
     });

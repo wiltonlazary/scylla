@@ -21,35 +21,38 @@
 
 #pragma once
 
-#include <experimental/optional>
+#include <optional>
 
 #include "frozen_mutation.hh"
-#include "schema.hh"
-#include "utils/data_output.hh"
-#include "stdx.hh"
+#include "schema_fwd.hh"
 
 class commitlog_entry {
-    stdx::optional<column_mapping> _mapping;
+    std::optional<column_mapping> _mapping;
     frozen_mutation _mutation;
 public:
-    commitlog_entry(stdx::optional<column_mapping> mapping, frozen_mutation&& mutation)
+    commitlog_entry(std::optional<column_mapping> mapping, frozen_mutation&& mutation)
         : _mapping(std::move(mapping)), _mutation(std::move(mutation)) { }
-    const stdx::optional<column_mapping>& mapping() const { return _mapping; }
-    const frozen_mutation& mutation() const { return _mutation; }
+    const std::optional<column_mapping>& mapping() const { return _mapping; }
+    const frozen_mutation& mutation() const & { return _mutation; }
+    frozen_mutation&& mutation() && { return std::move(_mutation); }
 };
 
 class commitlog_entry_writer {
+public:
+    using force_sync = bool_class<class force_sync_tag>;
+private:
     schema_ptr _schema;
     const frozen_mutation& _mutation;
     bool _with_schema = true;
     size_t _size = std::numeric_limits<size_t>::max();
+    force_sync _sync;
 private:
     template<typename Output>
     void serialize(Output&) const;
     void compute_size();
 public:
-    commitlog_entry_writer(schema_ptr s, const frozen_mutation& fm)
-        : _schema(std::move(s)), _mutation(fm)
+    commitlog_entry_writer(schema_ptr s, const frozen_mutation& fm, force_sync sync)
+        : _schema(std::move(s)), _mutation(fm), _sync(sync)
     {}
 
     void set_with_schema(bool value) {
@@ -71,15 +74,18 @@ public:
     size_t mutation_size() const {
         return _mutation.representation().size();
     }
-
-    void write(data_output& out) const;
+    force_sync sync() const {
+        return _sync;
+    }
+    void write(typename seastar::memory_output_stream<std::vector<temporary_buffer<char>>::iterator>& out) const;
 };
 
 class commitlog_entry_reader {
     commitlog_entry _ce;
 public:
-    commitlog_entry_reader(const temporary_buffer<char>& buffer);
+    commitlog_entry_reader(const fragmented_temporary_buffer& buffer);
 
-    const stdx::optional<column_mapping>& get_column_mapping() const { return _ce.mapping(); }
-    const frozen_mutation& mutation() const { return _ce.mutation(); }
+    const std::optional<column_mapping>& get_column_mapping() const { return _ce.mapping(); }
+    const frozen_mutation& mutation() const & { return _ce.mutation(); }
+    frozen_mutation&& mutation() && { return std::move(_ce).mutation(); }
 };

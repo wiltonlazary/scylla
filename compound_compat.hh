@@ -27,6 +27,9 @@
 #include "schema.hh"
 #include "sstables/version.hh"
 
+//FIXME: de-inline methods and define this as static in a .cc file.
+extern logging::logger compound_logger;
+
 //
 // This header provides adaptors between the representation used by our compound_type<>
 // and representation used by Origin.
@@ -58,7 +61,14 @@ public:
         , _packed(packed)
     { }
 
-    class iterator : public std::iterator<std::input_iterator_tag, bytes::value_type> {
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = bytes::value_type;
+        using difference_type = std::ptrdiff_t;
+        using pointer = bytes::value_type*;
+        using reference = bytes::value_type&;
+    private:
         bool _singular;
         // Offset within virtual output space of a component.
         //
@@ -145,8 +155,8 @@ public:
                 _type.begin(k1), _type.end(k1),
                 _type.begin(k2), _type.end(k2),
                 [] (const bytes_view& c1, const bytes_view& c2) -> int {
-                    if (c1.size() != c2.size()) {
-                        return c1.size() < c2.size() ? -1 : 1;
+                    if (c1.size() != c2.size() || !c1.size()) {
+                        return c1.size() < c2.size() ? -1 : c1.size() ? 1 : 0;
                     }
                     return memcmp(c1.begin(), c2.begin(), c1.size());
                 });
@@ -210,6 +220,8 @@ public:
             , _is_compound(true)
     { }
 
+    explicit composite(const composite_view& v);
+
     composite()
             : _bytes()
             , _is_compound(true)
@@ -248,15 +260,16 @@ private:
     static size_t size(const data_value& val) {
         return val.serialized_size();
     }
-    template<typename Value, typename = std::enable_if_t<!std::is_same<data_value, std::decay_t<Value>>::value>>
-    static void write_value(Value&& val, bytes::iterator& out) {
+    template<typename Value, typename CharOutputIterator, typename = std::enable_if_t<!std::is_same<data_value, std::decay_t<Value>>::value>>
+    static void write_value(Value&& val, CharOutputIterator& out) {
         out = std::copy(val.begin(), val.end(), out);
     }
-    static void write_value(const data_value& val, bytes::iterator& out) {
+    template <typename CharOutputIterator>
+    static void write_value(const data_value& val, CharOutputIterator& out) {
         val.serialize(out);
     }
-    template<typename RangeOfSerializedComponents>
-    static void serialize_value(RangeOfSerializedComponents&& values, bytes::iterator& out, bool is_compound) {
+    template<typename RangeOfSerializedComponents, typename CharOutputIterator>
+    static void serialize_value(RangeOfSerializedComponents&& values, CharOutputIterator& out, bool is_compound) {
         if (!is_compound) {
             auto it = values.begin();
             write_value(std::forward<decltype(*it)>(*it), out);
@@ -284,7 +297,7 @@ private:
             // bytes is the static prefix or not).
             auto value_size = size(*it);
             if (value_size > static_cast<size_type>(std::numeric_limits<size_type>::max() - uint8_t(is_compound))) {
-                throw std::runtime_error(sprint("First component size too large: %d > %d", value_size, std::numeric_limits<size_type>::max() - is_compound));
+                throw std::runtime_error(format("First component size too large: {:d} > {:d}", value_size, std::numeric_limits<size_type>::max() - is_compound));
             }
             if (!is_compound) {
                 return value_size;
@@ -295,7 +308,7 @@ private:
         for ( ; it != values.end(); ++it) {
             auto value_size = size(*it);
             if (value_size > std::numeric_limits<size_type>::max()) {
-                throw std::runtime_error(sprint("Component size too large: %d > %d", value_size, std::numeric_limits<size_type>::max()));
+                throw std::runtime_error(format("Component size too large: {:d} > {:d}", value_size, std::numeric_limits<size_type>::max()));
             }
             len += sizeof(size_type) + value_size + sizeof(eoc_type);
         }
@@ -333,11 +346,19 @@ public:
         return eoc_byte == 0 ? eoc::none : (eoc_byte < 0 ? eoc::start : eoc::end);
     }
 
-    class iterator : public std::iterator<std::input_iterator_tag, const component_view> {
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = const component_view;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const component_view*;
+        using reference = const component_view&;
+    private:
         bytes_view _v;
         component_view _current;
+        bool _strict_mode = true;
     private:
-        void read_current() {
+        void do_read_current() {
             size_type len;
             {
                 if (_v.empty()) {
@@ -346,18 +367,30 @@ public:
                 }
                 len = read_simple<size_type>(_v);
                 if (_v.size() < len) {
-                    throw_with_backtrace<marshal_exception>(sprint("composite iterator - not enough bytes, expected %d, got %d", len, _v.size()));
+                    throw_with_backtrace<marshal_exception>(format("composite iterator - not enough bytes, expected {:d}, got {:d}", len, _v.size()));
                 }
             }
             auto value = bytes_view(_v.begin(), len);
             _v.remove_prefix(len);
             _current = component_view(std::move(value), to_eoc(read_simple<eoc_type>(_v)));
         }
-    public:
+        void read_current() {
+            try {
+                do_read_current();
+            } catch (marshal_exception&) {
+                if (_strict_mode) {
+                    on_internal_error(compound_logger, std::current_exception());
+                } else {
+                    throw;
+                }
+            }
+        }
+
         struct end_iterator_tag {};
 
-        iterator(const bytes_view& v, bool is_compound, bool is_static)
-                : _v(v) {
+        // In strict-mode de-serialization errors will invoke `on_internal_error()`.
+        iterator(const bytes_view& v, bool is_compound, bool is_static, bool strict_mode = true)
+                : _v(v), _strict_mode(strict_mode) {
             if (is_static) {
                 _v.remove_prefix(2);
             }
@@ -371,6 +404,8 @@ public:
 
         iterator(end_iterator_tag) : _v(nullptr, 0) {}
 
+    public:
+        iterator() : iterator(end_iterator_tag()) {}
         iterator& operator++() {
             read_current();
             return *this;
@@ -386,6 +421,9 @@ public:
         const value_type* operator->() const { return &_current; }
         bool operator!=(const iterator& i) const { return _v.begin() != i._v.begin(); }
         bool operator==(const iterator& i) const { return _v.begin() == i._v.begin(); }
+
+        friend class composite;
+        friend class composite_view;
     };
 
     iterator begin() const {
@@ -468,7 +506,7 @@ public:
 
     template <typename Component>
     friend inline std::ostream& operator<<(std::ostream& os, const std::pair<Component, eoc>& c) {
-        return os << "{value=" << c.first << "; eoc=" << sprint("0x%02x", eoc_type(c.second) & 0xff) << "}";
+        return os << "{value=" << c.first << "; eoc=" << format("0x{:02x}", eoc_type(c.second) & 0xff) << "}";
     }
 
     friend std::ostream& operator<<(std::ostream& os, const composite& v);
@@ -482,6 +520,7 @@ public:
 };
 
 class composite_view final {
+    friend class composite;
     bytes_view _bytes;
     bool _is_compound;
 public:
@@ -511,7 +550,7 @@ public:
             auto marker = it->second;
             ++it;
             if (it != e && marker != composite::eoc::none) {
-                throw runtime_exception(sprint("non-zero component divider found (%d) mid", sprint("0x%02x", composite::eoc_type(marker) & 0xff)));
+                throw runtime_exception(format("non-zero component divider found ({:d}) mid", format("0x{:02x}", composite::eoc_type(marker) & 0xff)));
             }
         }
         return ret;
@@ -554,6 +593,21 @@ public:
         return composite::is_static(_bytes, _is_compound);
     }
 
+    bool is_valid() const {
+        try {
+            auto it = composite::iterator(_bytes, _is_compound, is_static(), false);
+            const auto end = composite::iterator(composite::iterator::end_iterator_tag());
+            size_t s = 0;
+            for (; it != end; ++it) {
+                auto& c = *it;
+                s += c.first.size() + sizeof(composite::size_type) + sizeof(composite::eoc_type);
+            }
+            return s == _bytes.size();
+        } catch (marshal_exception&) {
+            return false;
+        }
+    }
+
     explicit operator bytes_view() const {
         return _bytes;
     }
@@ -565,6 +619,11 @@ public:
         return os << "{" << ::join(", ", v.components()) << ", compound=" << v._is_compound << ", static=" << v.is_static() << "}";
     }
 };
+
+inline
+composite::composite(const composite_view& v)
+    : composite(bytes(v._bytes), v._is_compound)
+{ }
 
 inline
 std::ostream& operator<<(std::ostream& os, const composite& v) {

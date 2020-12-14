@@ -26,20 +26,50 @@
 #include "cql3_type.hh"
 #include "cql3/util.hh"
 #include "ut_name.hh"
+#include "database.hh"
+#include "user_types_metadata.hh"
+#include "types/map.hh"
+#include "types/set.hh"
+#include "types/list.hh"
+#include "concrete_types.hh"
 
 namespace cql3 {
 
-sstring cql3_type::to_string() const {
-    if (_type->is_user_type()) {
-        return "frozen<" + util::maybe_quote(_name) + ">";
-    }
-    if (_type->is_tuple()) {
-        return "frozen<" + _name + ">";
-    }
-    return _name;
+static cql3_type::kind get_cql3_kind(const abstract_type& t) {
+    struct visitor {
+        cql3_type::kind operator()(const ascii_type_impl&) { return cql3_type::kind::ASCII; }
+        cql3_type::kind operator()(const byte_type_impl&) { return cql3_type::kind::TINYINT; }
+        cql3_type::kind operator()(const bytes_type_impl&) { return cql3_type::kind::BLOB; }
+        cql3_type::kind operator()(const boolean_type_impl&) { return cql3_type::kind::BOOLEAN; }
+        cql3_type::kind operator()(const counter_type_impl&) { return cql3_type::kind::COUNTER; }
+        cql3_type::kind operator()(const decimal_type_impl&) { return cql3_type::kind::DECIMAL; }
+        cql3_type::kind operator()(const double_type_impl&) { return cql3_type::kind::DOUBLE; }
+        cql3_type::kind operator()(const duration_type_impl&) { return cql3_type::kind::DURATION; }
+        cql3_type::kind operator()(const empty_type_impl&) { return cql3_type::kind::EMPTY; }
+        cql3_type::kind operator()(const float_type_impl&) { return cql3_type::kind::FLOAT; }
+        cql3_type::kind operator()(const inet_addr_type_impl&) { return cql3_type::kind::INET; }
+        cql3_type::kind operator()(const int32_type_impl&) { return cql3_type::kind::INT; }
+        cql3_type::kind operator()(const long_type_impl&) { return cql3_type::kind::BIGINT; }
+        cql3_type::kind operator()(const short_type_impl&) { return cql3_type::kind::SMALLINT; }
+        cql3_type::kind operator()(const simple_date_type_impl&) { return cql3_type::kind::DATE; }
+        cql3_type::kind operator()(const utf8_type_impl&) { return cql3_type::kind::TEXT; }
+        cql3_type::kind operator()(const time_type_impl&) { return cql3_type::kind::TIME; }
+        cql3_type::kind operator()(const timestamp_date_base_class&) { return cql3_type::kind::TIMESTAMP; }
+        cql3_type::kind operator()(const timeuuid_type_impl&) { return cql3_type::kind::TIMEUUID; }
+        cql3_type::kind operator()(const uuid_type_impl&) { return cql3_type::kind::UUID; }
+        cql3_type::kind operator()(const varint_type_impl&) { return cql3_type::kind::VARINT; }
+        cql3_type::kind operator()(const reversed_type_impl& r) { return get_cql3_kind(*r.underlying_type()); }
+        cql3_type::kind operator()(const tuple_type_impl&) { assert(0 && "no kind for this type"); }
+        cql3_type::kind operator()(const collection_type_impl&) { assert(0 && "no kind for this type"); }
+    };
+    return visit(t, visitor{});
 }
 
-shared_ptr<cql3_type> cql3_type::raw::prepare(database& db, const sstring& keyspace) {
+cql3_type::kind_enum_set::prepared cql3_type::get_kind() const {
+    return kind_enum_set::prepare(get_cql3_kind(*_type));
+}
+
+cql3_type cql3_type::raw::prepare(database& db, const sstring& keyspace) {
     try {
         auto&& ks = db.find_keyspace(keyspace);
         return prepare_internal(keyspace, ks.metadata()->user_types());
@@ -58,16 +88,20 @@ bool cql3_type::raw::references_user_type(const sstring& name) const {
 
 class cql3_type::raw_type : public raw {
 private:
-    shared_ptr<cql3_type> _type;
+    cql3_type _type;
+
+    virtual sstring to_string() const override {
+        return _type.to_string();
+    }
 public:
-    raw_type(shared_ptr<cql3_type> type)
+    raw_type(cql3_type type)
         : _type{type}
     { }
 public:
-    virtual shared_ptr<cql3_type> prepare(database& db, const sstring& keyspace) {
+    virtual cql3_type prepare(database& db, const sstring& keyspace) {
         return _type;
     }
-    shared_ptr<cql3_type> prepare_internal(const sstring&, lw_shared_ptr<user_types_metadata>) override {
+    cql3_type prepare_internal(const sstring&, const user_types_metadata&) override {
         return _type;
     }
 
@@ -76,24 +110,33 @@ public:
     }
 
     virtual bool is_counter() const {
-        return _type->is_counter();
-    }
-
-    virtual sstring to_string() const {
-        return _type->to_string();
+        return _type.is_counter();
     }
 
     virtual bool is_duration() const override {
-        return _type->get_type()->equals(duration_type);
+        return _type.get_type() == duration_type;
     }
 };
 
 class cql3_type::raw_collection : public raw {
-    const collection_type_impl::kind* _kind;
+    const abstract_type::kind _kind;
     shared_ptr<raw> _keys;
     shared_ptr<raw> _values;
+
+    virtual sstring to_string() const override {
+        sstring start = is_frozen() ? "frozen<" : "";
+        sstring end = is_frozen() ? ">" : "";
+        if (_kind == abstract_type::kind::list) {
+            return format("{}list<{}>{}", start, _values, end);
+        } else if (_kind == abstract_type::kind::set) {
+            return format("{}set<{}>{}", start, _values, end);
+        } else if (_kind == abstract_type::kind::map) {
+            return format("{}map<{}, {}>{}", start, _keys, _values, end);
+        }
+        abort();
+    }
 public:
-    raw_collection(const collection_type_impl::kind* kind, shared_ptr<raw> keys, shared_ptr<raw> values)
+    raw_collection(const abstract_type::kind kind, shared_ptr<raw> keys, shared_ptr<raw> values)
             : _kind(kind), _keys(std::move(keys)), _values(std::move(values)) {
     }
 
@@ -115,35 +158,37 @@ public:
         return true;
     }
 
-    virtual shared_ptr<cql3_type> prepare_internal(const sstring& keyspace, lw_shared_ptr<user_types_metadata> user_types) override {
+    virtual cql3_type prepare_internal(const sstring& keyspace, const user_types_metadata& user_types) override {
         assert(_values); // "Got null values type for a collection";
 
-        if (!_frozen && _values->supports_freezing() && !_values->_frozen) {
-            throw exceptions::invalid_request_exception(sprint("Non-frozen collections are not allowed inside collections: %s", *this));
+        if (!is_frozen() && _values->supports_freezing() && !_values->is_frozen()) {
+            throw exceptions::invalid_request_exception(
+                    format("Non-frozen user types or collections are not allowed inside collections: {}", *this));
         }
         if (_values->is_counter()) {
-            throw exceptions::invalid_request_exception(sprint("Counters are not allowed inside collections: %s", *this));
+            throw exceptions::invalid_request_exception(format("Counters are not allowed inside collections: {}", *this));
         }
 
         if (_keys) {
-            if (!_frozen && _keys->supports_freezing() && !_keys->_frozen) {
-                throw exceptions::invalid_request_exception(sprint("Non-frozen collections are not allowed inside collections: %s", *this));
+            if (!is_frozen() && _keys->supports_freezing() && !_keys->is_frozen()) {
+                throw exceptions::invalid_request_exception(
+                        format("Non-frozen user types or collections are not allowed inside collections: {}", *this));
             }
         }
 
-        if (_kind == &collection_type_impl::kind::list) {
-            return make_shared(cql3_type(to_string(), list_type_impl::get_instance(_values->prepare_internal(keyspace, user_types)->get_type(), !_frozen), false));
-        } else if (_kind == &collection_type_impl::kind::set) {
+        if (_kind == abstract_type::kind::list) {
+            return cql3_type(list_type_impl::get_instance(_values->prepare_internal(keyspace, user_types).get_type(), !is_frozen()));
+        } else if (_kind == abstract_type::kind::set) {
             if (_values->is_duration()) {
-                throw exceptions::invalid_request_exception(sprint("Durations are not allowed inside sets: %s", *this));
+                throw exceptions::invalid_request_exception(format("Durations are not allowed inside sets: {}", *this));
             }
-            return make_shared(cql3_type(to_string(), set_type_impl::get_instance(_values->prepare_internal(keyspace, user_types)->get_type(), !_frozen), false));
-        } else if (_kind == &collection_type_impl::kind::map) {
+            return cql3_type(set_type_impl::get_instance(_values->prepare_internal(keyspace, user_types).get_type(), !is_frozen()));
+        } else if (_kind == abstract_type::kind::map) {
             assert(_keys); // "Got null keys type for a collection";
             if (_keys->is_duration()) {
-                throw exceptions::invalid_request_exception(sprint("Durations are not allowed as map keys: %s", *this));
+                throw exceptions::invalid_request_exception(format("Durations are not allowed as map keys: {}", *this));
             }
-            return make_shared(cql3_type(to_string(), map_type_impl::get_instance(_keys->prepare_internal(keyspace, user_types)->get_type(), _values->prepare_internal(keyspace, user_types)->get_type(), !_frozen), false));
+            return cql3_type(map_type_impl::get_instance(_keys->prepare_internal(keyspace, user_types).get_type(), _values->prepare_internal(keyspace, user_types).get_type(), !is_frozen()));
         }
         abort();
     }
@@ -155,29 +200,24 @@ public:
     bool is_duration() const override {
         return false;
     }
-
-    virtual sstring to_string() const override {
-        sstring start = _frozen ? "frozen<" : "";
-        sstring end = _frozen ? ">" : "";
-        if (_kind == &collection_type_impl::kind::list) {
-            return sprint("%slist<%s>%s", start, _values, end);
-        } else if (_kind == &collection_type_impl::kind::set) {
-            return sprint("%sset<%s>%s", start, _values, end);
-        } else if (_kind == &collection_type_impl::kind::map) {
-            return sprint("%smap<%s, %s>%s", start, _keys, _values, end);
-        }
-        abort();
-    }
 };
 
 class cql3_type::raw_ut : public raw {
     ut_name _name;
+
+    virtual sstring to_string() const override {
+        if (is_frozen()) {
+            return format("frozen<{}>", _name.to_string());
+        }
+
+        return _name.to_string();
+    }
 public:
     raw_ut(ut_name name)
             : _name(std::move(name)) {
     }
 
-    virtual std::experimental::optional<sstring> keyspace() const override {
+    virtual std::optional<sstring> keyspace() const override {
         return _name.get_keyspace();
     }
 
@@ -185,7 +225,7 @@ public:
         _frozen = true;
     }
 
-    virtual shared_ptr<cql3_type> prepare_internal(const sstring& keyspace, lw_shared_ptr<user_types_metadata> user_types) override {
+    virtual cql3_type prepare_internal(const sstring& keyspace, const user_types_metadata& user_types) override {
         if (_name.has_keyspace()) {
             // The provided keyspace is the one of the current statement this is part of. If it's different from the keyspace of
             // the UTName, we reject since we want to limit user types to their own keyspace (see #6643)
@@ -197,18 +237,14 @@ public:
         } else {
             _name.set_keyspace(keyspace);
         }
-        if (!user_types) {
-            // bootstrap mode.
-            throw exceptions::invalid_request_exception(sprint("Unknown type %s", _name));
-        }
         try {
-            auto&& type = user_types->get_type(_name.get_user_type_name());
-            if (!_frozen) {
-                throw exceptions::invalid_request_exception("Non-frozen User-Defined types are not supported, please use frozen<>");
+            data_type type = user_types.get_type(_name.get_user_type_name());
+            if (is_frozen()) {
+                type = type->freeze();
             }
-            return make_shared<cql3_type>(_name.to_string(), std::move(type));
+            return cql3_type(std::move(type));
         } catch (std::out_of_range& e) {
-            throw exceptions::invalid_request_exception(sprint("Unknown type %s", _name));
+            throw exceptions::invalid_request_exception(format("Unknown type {}", _name));
         }
     }
     bool references_user_type(const sstring& name) const override {
@@ -218,14 +254,18 @@ public:
         return true;
     }
 
-    virtual sstring to_string() const override {
-        return _name.to_string();
+    virtual bool is_user_type() const override {
+        return true;
     }
 };
 
 
 class cql3_type::raw_tuple : public raw {
     std::vector<shared_ptr<raw>> _types;
+
+    virtual sstring to_string() const override {
+        return format("tuple<{}>", join(", ", _types));
+    }
 public:
     raw_tuple(std::vector<shared_ptr<raw>> types)
             : _types(std::move(types)) {
@@ -244,8 +284,8 @@ public:
         }
         _frozen = true;
     }
-    virtual shared_ptr<cql3_type> prepare_internal(const sstring& keyspace, lw_shared_ptr<user_types_metadata> user_types) override {
-        if (!_frozen) {
+    virtual cql3_type prepare_internal(const sstring& keyspace, const user_types_metadata& user_types) override {
+        if (!is_frozen()) {
             freeze();
         }
         std::vector<data_type> ts;
@@ -253,19 +293,15 @@ public:
             if (t->is_counter()) {
                 throw exceptions::invalid_request_exception("Counters are not allowed inside tuples");
             }
-            ts.push_back(t->prepare_internal(keyspace, user_types)->get_type());
+            ts.push_back(t->prepare_internal(keyspace, user_types).get_type());
         }
-        return make_cql3_tuple_type(tuple_type_impl::get_instance(std::move(ts)));
+        return tuple_type_impl::get_instance(std::move(ts))->as_cql3_type();
     }
 
     bool references_user_type(const sstring& name) const override {
         return std::any_of(_types.begin(), _types.end(), [&name](auto t) {
             return t->references_user_type(name);
         });
-    }
-
-    virtual sstring to_string() const override {
-        return sprint("tuple<%s>", join(", ", _types));
     }
 };
 
@@ -279,19 +315,29 @@ cql3_type::raw::is_counter() const {
     return false;
 }
 
-std::experimental::optional<sstring>
+bool
+cql3_type::raw::is_user_type() const {
+    return false;
+}
+
+bool
+cql3_type::raw::is_frozen() const {
+    return _frozen;
+}
+
+std::optional<sstring>
 cql3_type::raw::keyspace() const {
-    return std::experimental::nullopt;
+    return std::nullopt;
 }
 
 void
 cql3_type::raw::freeze() {
-    sstring message = sprint("frozen<> is only allowed on collections, tuples, and user-defined types (got %s)", to_string());
+    sstring message = format("frozen<> is only allowed on collections, tuples, and user-defined types (got {})", to_string());
     throw exceptions::invalid_request_exception(message);
 }
 
 shared_ptr<cql3_type::raw>
-cql3_type::raw::from(shared_ptr<cql3_type> type) {
+cql3_type::raw::from(cql3_type type) {
     return ::make_shared<raw_type>(type);
 }
 
@@ -302,22 +348,22 @@ cql3_type::raw::user_type(ut_name name) {
 
 shared_ptr<cql3_type::raw>
 cql3_type::raw::map(shared_ptr<raw> t1, shared_ptr<raw> t2) {
-    return make_shared(raw_collection(&collection_type_impl::kind::map, std::move(t1), std::move(t2)));
+    return ::make_shared<raw_collection>(abstract_type::kind::map, std::move(t1), std::move(t2));
 }
 
 shared_ptr<cql3_type::raw>
 cql3_type::raw::list(shared_ptr<raw> t) {
-    return make_shared(raw_collection(&collection_type_impl::kind::list, {}, std::move(t)));
+    return ::make_shared<raw_collection>(abstract_type::kind::list, nullptr, std::move(t));
 }
 
 shared_ptr<cql3_type::raw>
 cql3_type::raw::set(shared_ptr<raw> t) {
-    return make_shared(raw_collection(&collection_type_impl::kind::set, {}, std::move(t)));
+    return ::make_shared<raw_collection>(abstract_type::kind::set, nullptr, std::move(t));
 }
 
 shared_ptr<cql3_type::raw>
 cql3_type::raw::tuple(std::vector<shared_ptr<raw>> ts) {
-    return make_shared(raw_tuple(std::move(ts)));
+    return ::make_shared<raw_tuple>(std::move(ts));
 }
 
 shared_ptr<cql3_type::raw>
@@ -326,32 +372,31 @@ cql3_type::raw::frozen(shared_ptr<raw> t) {
     return t;
 }
 
-thread_local shared_ptr<cql3_type> cql3_type::ascii = make("ascii", ascii_type, cql3_type::kind::ASCII);
-thread_local shared_ptr<cql3_type> cql3_type::bigint = make("bigint", long_type, cql3_type::kind::BIGINT);
-thread_local shared_ptr<cql3_type> cql3_type::blob = make("blob", bytes_type, cql3_type::kind::BLOB);
-thread_local shared_ptr<cql3_type> cql3_type::boolean = make("boolean", boolean_type, cql3_type::kind::BOOLEAN);
-thread_local shared_ptr<cql3_type> cql3_type::double_ = make("double", double_type, cql3_type::kind::DOUBLE);
-thread_local shared_ptr<cql3_type> cql3_type::empty = make("empty", empty_type, cql3_type::kind::EMPTY);
-thread_local shared_ptr<cql3_type> cql3_type::float_ = make("float", float_type, cql3_type::kind::FLOAT);
-thread_local shared_ptr<cql3_type> cql3_type::int_ = make("int", int32_type, cql3_type::kind::INT);
-thread_local shared_ptr<cql3_type> cql3_type::smallint = make("smallint", short_type, cql3_type::kind::SMALLINT);
-thread_local shared_ptr<cql3_type> cql3_type::text = make("text", utf8_type, cql3_type::kind::TEXT);
-thread_local shared_ptr<cql3_type> cql3_type::timestamp = make("timestamp", timestamp_type, cql3_type::kind::TIMESTAMP);
-thread_local shared_ptr<cql3_type> cql3_type::tinyint = make("tinyint", byte_type, cql3_type::kind::TINYINT);
-thread_local shared_ptr<cql3_type> cql3_type::uuid = make("uuid", uuid_type, cql3_type::kind::UUID);
-thread_local shared_ptr<cql3_type> cql3_type::varchar = make("varchar", utf8_type, cql3_type::kind::TEXT);
-thread_local shared_ptr<cql3_type> cql3_type::timeuuid = make("timeuuid", timeuuid_type, cql3_type::kind::TIMEUUID);
-thread_local shared_ptr<cql3_type> cql3_type::date = make("date", simple_date_type, cql3_type::kind::DATE);
-thread_local shared_ptr<cql3_type> cql3_type::time = make("time", time_type, cql3_type::kind::TIME);
-thread_local shared_ptr<cql3_type> cql3_type::inet = make("inet", inet_addr_type, cql3_type::kind::INET);
-thread_local shared_ptr<cql3_type> cql3_type::varint = make("varint", varint_type, cql3_type::kind::VARINT);
-thread_local shared_ptr<cql3_type> cql3_type::decimal = make("decimal", decimal_type, cql3_type::kind::DECIMAL);
-thread_local shared_ptr<cql3_type> cql3_type::counter = make("counter", counter_type, cql3_type::kind::COUNTER);
-thread_local shared_ptr<cql3_type> cql3_type::duration = make("duration", duration_type, cql3_type::kind::DURATION);
+thread_local cql3_type cql3_type::ascii{ascii_type};
+thread_local cql3_type cql3_type::bigint{long_type};
+thread_local cql3_type cql3_type::blob{bytes_type};
+thread_local cql3_type cql3_type::boolean{boolean_type};
+thread_local cql3_type cql3_type::double_{double_type};
+thread_local cql3_type cql3_type::empty{empty_type};
+thread_local cql3_type cql3_type::float_{float_type};
+thread_local cql3_type cql3_type::int_{int32_type};
+thread_local cql3_type cql3_type::smallint{short_type};
+thread_local cql3_type cql3_type::text{utf8_type};
+thread_local cql3_type cql3_type::timestamp{timestamp_type};
+thread_local cql3_type cql3_type::tinyint{byte_type};
+thread_local cql3_type cql3_type::uuid{uuid_type};
+thread_local cql3_type cql3_type::timeuuid{timeuuid_type};
+thread_local cql3_type cql3_type::date{simple_date_type};
+thread_local cql3_type cql3_type::time{time_type};
+thread_local cql3_type cql3_type::inet{inet_addr_type};
+thread_local cql3_type cql3_type::varint{varint_type};
+thread_local cql3_type cql3_type::decimal{decimal_type};
+thread_local cql3_type cql3_type::counter{counter_type};
+thread_local cql3_type cql3_type::duration{duration_type};
 
-const std::vector<shared_ptr<cql3_type>>&
+const std::vector<cql3_type>&
 cql3_type::values() {
-    static thread_local std::vector<shared_ptr<cql3_type>> v = {
+    static thread_local std::vector<cql3_type> v = {
         cql3_type::ascii,
         cql3_type::bigint,
         cql3_type::blob,
@@ -368,7 +413,6 @@ cql3_type::values() {
         cql3_type::timestamp,
         cql3_type::tinyint,
         cql3_type::uuid,
-        cql3_type::varchar,
         cql3_type::varint,
         cql3_type::timeuuid,
         cql3_type::date,
@@ -378,16 +422,6 @@ cql3_type::values() {
     return v;
 }
 
-shared_ptr<cql3_type>
-make_cql3_tuple_type(tuple_type t) {
-    auto name = sprint("tuple<%s>",
-                       ::join(", ",
-                            t->all_types()
-                            | boost::adaptors::transformed(std::mem_fn(&abstract_type::as_cql3_type))));
-    return ::make_shared<cql3_type>(std::move(name), std::move(t), false);
-}
-
-
 std::ostream&
 operator<<(std::ostream& os, const cql3_type::raw& r) {
     return os << r.to_string();
@@ -396,14 +430,36 @@ operator<<(std::ostream& os, const cql3_type::raw& r) {
 namespace util {
 
 sstring maybe_quote(const sstring& identifier) {
-    static const std::regex unquoted_identifier_re("[a-z][a-z0-9_]*");
-    if (std::regex_match(identifier.begin(), identifier.end(), unquoted_identifier_re)) {
+    // quote empty string
+    if (identifier.empty()) {
+        return "\"\"";
+    }
+
+    // string needs no quoting if it matches [a-z][a-z0-9_]*
+    // quotes ('"') in the string are doubled
+    auto c = identifier[0];
+    bool need_quotes = !('a' <= c && c <= 'z');
+    size_t num_quotes = 0;
+    for (char c : identifier) {
+        if (!(('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || (c == '_'))) {
+            need_quotes = true;
+            num_quotes += (c == '"');
+        }
+    }
+
+    if (!need_quotes) {
         return identifier;
     }
+    if (num_quotes == 0) {
+        return make_sstring("\"", identifier, "\"");
+    }
     static const std::regex double_quote_re("\"");
-    std::string result = identifier;
-    std::regex_replace(result, double_quote_re, "\"\"");
-    return '"' + result + '"';
+    std::string result;
+    result.reserve(2 + identifier.size() + num_quotes);
+    result.push_back('"');
+    std::regex_replace(std::back_inserter(result), identifier.begin(), identifier.end(), double_quote_re, "\"\"");
+    result.push_back('"');
+    return result;
 }
 
 }

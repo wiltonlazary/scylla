@@ -40,10 +40,11 @@
 
 #pragma once
 
+#include "cql3/abstract_marker.hh"
 #include "column_specification.hh"
 #include "term.hh"
 #include "column_identifier.hh"
-#include "constants.hh"
+#include "operation.hh"
 #include "to_string.hh"
 
 namespace cql3 {
@@ -54,7 +55,7 @@ namespace cql3 {
 class user_types {
     user_types() = delete;
 public:
-    static shared_ptr<column_specification> field_spec_of(shared_ptr<column_specification> column, size_t field);
+    static lw_shared_ptr<column_specification> field_spec_of(const column_specification& column, size_t field);
 
     class literal : public term::raw {
     public:
@@ -62,12 +63,25 @@ public:
         elements_map_type _entries;
 
         literal(elements_map_type entries);
-        virtual shared_ptr<term> prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) override;
+        virtual shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
-        void validate_assignable_to(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver);
+        void validate_assignable_to(database& db, const sstring& keyspace, const column_specification& receiver) const;
     public:
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) override;
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override;
         virtual sstring assignment_testable_source_context() const override;
+        virtual sstring to_string() const override;
+    };
+
+    class value : public multi_item_terminal {
+        std::vector<bytes_opt> _elements;
+    public:
+        explicit value(std::vector<bytes_opt>);
+        explicit value(std::vector<bytes_view_opt>);
+
+        static value from_serialized(const fragmented_temporary_buffer::view&, const user_type_impl&);
+
+        virtual cql3::raw_value get(const query_options&) override;
+        virtual const std::vector<bytes_opt>& get_elements() const override;
         virtual sstring to_string() const override;
     };
 
@@ -77,14 +91,52 @@ public:
         std::vector<shared_ptr<term>> _values;
     public:
         delayed_value(user_type type, std::vector<shared_ptr<term>> values);
-        virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
         virtual bool contains_bind_marker() const override;
-        virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names);
+        virtual void collect_marker_specification(variable_specifications& bound_names) const;
     private:
-        std::vector<cql3::raw_value> bind_internal(const query_options& options);
+        std::vector<bytes_opt> bind_internal(const query_options& options);
     public:
         virtual shared_ptr<terminal> bind(const query_options& options) override;
         virtual cql3::raw_value_view bind_and_get(const query_options& options) override;
+    };
+
+    class marker : public abstract_marker {
+    public:
+        marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
+            : abstract_marker{bind_index, std::move(receiver)}
+        {
+            assert(_receiver->type->is_user_type());
+        }
+
+        virtual shared_ptr<terminal> bind(const query_options& options) override;
+    };
+
+    class setter : public operation {
+    public:
+        using operation::operation;
+
+        virtual void execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) override;
+        static void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const column_definition& column, ::shared_ptr<terminal> value);
+    };
+
+    class setter_by_field : public operation {
+        size_t _field_idx;
+    public:
+        setter_by_field(const column_definition& column, size_t field_idx, shared_ptr<term> t)
+            : operation(column, std::move(t)), _field_idx(field_idx) {
+        }
+
+        virtual void execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) override;
+    };
+
+    class deleter_by_field : public operation {
+        size_t _field_idx;
+    public:
+        deleter_by_field(const column_definition& column, size_t field_idx)
+            : operation(column, nullptr), _field_idx(field_idx) {
+        }
+
+        virtual void execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) override;
     };
 };
 

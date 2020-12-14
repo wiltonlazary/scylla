@@ -1,0 +1,22 @@
+type: boost
+# A list of long tests, which should be started early
+run_first:
+    - index_with_paging_test
+    - schema_changes_test
+    - sstable_conforms_to_mutation_source_test
+    - secondary_index_test
+    - cql_query_test
+    - mutation_reader_test
+    - view_schema_test
+# Custom command line arguments for some of the tests
+custom_args:
+    mutation_reader_test:
+        - '-c3 -m2G'
+    sstable_test:
+        - '-c1 -m2G'
+    sstable_datafile_test:
+        - '-c1 -m2G'
+    sstable_3_x_test:
+        - '-c1 -m2G'
+    cql_query_test:
+        - '-c2 -m2G --fail-on-abandoned-failed-futures=true'

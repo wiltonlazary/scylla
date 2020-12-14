@@ -26,7 +26,7 @@
 #include "clustering_bounds_comparator.hh"
 #include "query-request.hh"
 
-#include <boost/icl/interval_set.hpp>
+#include <optional>
 
 inline
 lexicographical_relation relation_for_lower_bound(composite_view v) {
@@ -53,25 +53,26 @@ lexicographical_relation relation_for_upper_bound(composite_view v) {
     abort();
 }
 
+enum class bound_weight : int8_t {
+    before_all_prefixed = -1,
+    equal = 0,
+    after_all_prefixed = 1,
+};
+
 inline
-int position_weight(bound_kind k) {
-    switch(k) {
+bound_weight position_weight(bound_kind k) {
+    switch (k) {
     case bound_kind::excl_end:
     case bound_kind::incl_start:
-    case bound_kind::excl_end_incl_start:
-        return -1;
+        return bound_weight::before_all_prefixed;
     case bound_kind::incl_end:
     case bound_kind::excl_start:
-    case bound_kind::incl_end_excl_start:
-        return 1;
-    case bound_kind::clustering:
-    case bound_kind::static_clustering:
-        return 0;
+        return bound_weight::after_all_prefixed;
     }
     abort();
 }
 
-enum class partition_region {
+enum class partition_region : uint8_t {
     partition_start,
     static_row,
     clustered,
@@ -82,19 +83,19 @@ class position_in_partition_view {
     friend class position_in_partition;
 
     partition_region _type;
-    int _bound_weight = 0;
+    bound_weight _bound_weight = bound_weight::equal;
     const clustering_key_prefix* _ck; // nullptr when _type != clustered
 public:
-    position_in_partition_view(partition_region type, int bound_weight, const clustering_key_prefix* ck)
+    position_in_partition_view(partition_region type, bound_weight weight, const clustering_key_prefix* ck)
         : _type(type)
-        , _bound_weight(bound_weight)
+        , _bound_weight(weight)
         , _ck(ck)
     { }
     bool is_before_key() const {
-        return _bound_weight < 0;
+        return _bound_weight == bound_weight::before_all_prefixed;
     }
     bool is_after_key() const {
-        return _bound_weight > 0;
+        return _bound_weight == bound_weight::after_all_prefixed;
     }
 private:
     // Returns placement of this position_in_partition relative to *_ck,
@@ -104,10 +105,10 @@ private:
         // includes just the prefix key or a range start which excludes just a prefix key.
         // In both cases we should return lexicographical_relation::before_all_strictly_prefixed here.
         // Refs #1446.
-        if (_bound_weight <= 0) {
-            return lexicographical_relation::before_all_prefixed;
-        } else {
+        if (_bound_weight == bound_weight::after_all_prefixed) {
             return lexicographical_relation::after_all_prefixed;
+        } else {
+            return lexicographical_relation::before_all_prefixed;
         }
     }
 public:
@@ -126,7 +127,9 @@ public:
     position_in_partition_view(const clustering_key_prefix& ck)
         : _type(partition_region::clustered), _ck(&ck) { }
     position_in_partition_view(range_tag_t, bound_view bv)
-        : _type(partition_region::clustered), _bound_weight(position_weight(bv.kind)), _ck(&bv.prefix) { }
+        : _type(partition_region::clustered), _bound_weight(position_weight(bv.kind())), _ck(&bv.prefix()) { }
+    position_in_partition_view(const clustering_key_prefix& ck, bound_weight w)
+        : _type(partition_region::clustered), _bound_weight(w), _ck(&ck) { }
 
     static position_in_partition_view for_range_start(const query::clustering_range& r) {
         return {position_in_partition_view::range_tag_t(), bound_view::from_range_start(r)};
@@ -153,24 +156,35 @@ public:
     }
 
     static position_in_partition_view after_key(const clustering_key& ck) {
-        return {partition_region::clustered, 1, &ck};
+        return {partition_region::clustered, bound_weight::after_all_prefixed, &ck};
     }
 
+    static position_in_partition_view before_key(const clustering_key& ck) {
+        return {partition_region::clustered, bound_weight::before_all_prefixed, &ck};
+    }
+
+    // Returns a view to before_key(pos._ck) if pos.is_clustering_row() else returns pos as-is.
+    static position_in_partition_view before_key(position_in_partition_view pos) {
+        return {partition_region::clustered, pos._bound_weight == bound_weight::equal ? bound_weight::before_all_prefixed : pos._bound_weight, pos._ck};
+    }
+
+    partition_region region() const { return _type; }
+    bound_weight get_bound_weight() const { return _bound_weight; }
     bool is_partition_start() const { return _type == partition_region::partition_start; }
     bool is_partition_end() const { return _type == partition_region::partition_end; }
     bool is_static_row() const { return _type == partition_region::static_row; }
-    bool is_clustering_row() const { return has_clustering_key() && !_bound_weight; }
+    bool is_clustering_row() const { return has_clustering_key() && _bound_weight == bound_weight::equal; }
     bool has_clustering_key() const { return _type == partition_region::clustered; }
 
     // Returns true if all fragments that can be seen for given schema have
     // positions >= than this. partition_start is ignored.
     bool is_before_all_fragments(const schema& s) const {
         return _type == partition_region::partition_start || _type == partition_region::static_row
-               || (_type == partition_region::clustered && !s.has_static_columns() && _bound_weight < 0 && key().is_empty(s));
+               || (_type == partition_region::clustered && !s.has_static_columns() && _bound_weight == bound_weight::before_all_prefixed && key().is_empty(s));
     }
 
     bool is_after_all_clustered_rows(const schema& s) const {
-        return is_partition_end() || (_ck && _ck->is_empty(s) && _bound_weight > 0);
+        return is_partition_end() || (_ck && _ck->is_empty(s) && _bound_weight == bound_weight::after_all_prefixed);
     }
 
     // Valid when >= before_all_clustered_rows()
@@ -180,18 +194,32 @@ public:
 
     // Can be called only when !is_static_row && !is_clustering_row().
     bound_view as_start_bound_view() const {
-        assert(_bound_weight != 0);
-        return bound_view(*_ck, _bound_weight < 0 ? bound_kind::incl_start : bound_kind::excl_start);
+        assert(_bound_weight != bound_weight::equal);
+        return bound_view(*_ck, _bound_weight == bound_weight::before_all_prefixed ? bound_kind::incl_start : bound_kind::excl_start);
     }
 
+    bound_view as_end_bound_view() const {
+        assert(_bound_weight != bound_weight::equal);
+        return bound_view(*_ck, _bound_weight == bound_weight::before_all_prefixed ? bound_kind::excl_end : bound_kind::incl_end);
+    }
+
+    class printer {
+        const schema& _schema;
+        const position_in_partition_view& _pipv;
+    public:
+        printer(const schema& schema, const position_in_partition_view& pipv) : _schema(schema), _pipv(pipv) {}
+        friend std::ostream& operator<<(std::ostream& os, printer p);
+    };
+
+    friend std::ostream& operator<<(std::ostream& os, printer p);
     friend std::ostream& operator<<(std::ostream&, position_in_partition_view);
     friend bool no_clustering_row_between(const schema&, position_in_partition_view, position_in_partition_view);
 };
 
 class position_in_partition {
     partition_region _type;
-    int _bound_weight = 0;
-    stdx::optional<clustering_key_prefix> _ck;
+    bound_weight _bound_weight = bound_weight::equal;
+    std::optional<clustering_key_prefix> _ck;
 public:
     friend class clustering_interval_set;
     struct partition_start_tag_t { };
@@ -203,7 +231,11 @@ public:
     struct before_clustering_row_tag_t { };
     struct range_tag_t { };
     using range_tombstone_tag_t = range_tag_t;
-
+    partition_region get_type() const { return _type; }
+    bound_weight get_bound_weight() const { return _bound_weight; }
+    const std::optional<clustering_key_prefix>& get_clustering_key_prefix() const { return _ck; }
+    position_in_partition(partition_region type, bound_weight weight, std::optional<clustering_key_prefix> ck)
+        : _type(type), _bound_weight(weight), _ck(std::move(ck)) { }
     explicit position_in_partition(partition_start_tag_t) : _type(partition_region::partition_start) { }
     explicit position_in_partition(end_of_partition_tag_t) : _type(partition_region::partition_end) { }
     explicit position_in_partition(static_row_tag_t) : _type(partition_region::static_row) { }
@@ -211,15 +243,17 @@ public:
         : _type(partition_region::clustered), _ck(std::move(ck)) { }
     position_in_partition(after_clustering_row_tag_t, clustering_key_prefix ck)
         // FIXME: Use lexicographical_relation::before_strictly_prefixed here. Refs #1446
-        : _type(partition_region::clustered), _bound_weight(1), _ck(std::move(ck)) { }
+        : _type(partition_region::clustered), _bound_weight(bound_weight::after_all_prefixed), _ck(std::move(ck)) { }
     position_in_partition(after_clustering_row_tag_t, position_in_partition_view pos)
         : _type(partition_region::clustered)
-        , _bound_weight(pos._bound_weight ? pos._bound_weight : 1)
+        , _bound_weight(pos._bound_weight != bound_weight::equal ? pos._bound_weight : bound_weight::after_all_prefixed)
         , _ck(*pos._ck) { }
     position_in_partition(before_clustering_row_tag_t, clustering_key_prefix ck)
-        : _type(partition_region::clustered), _bound_weight(-1), _ck(std::move(ck)) { }
+        : _type(partition_region::clustered), _bound_weight(bound_weight::before_all_prefixed), _ck(std::move(ck)) { }
     position_in_partition(range_tag_t, bound_view bv)
-        : _type(partition_region::clustered), _bound_weight(position_weight(bv.kind)), _ck(bv.prefix) { }
+        : _type(partition_region::clustered), _bound_weight(position_weight(bv.kind())), _ck(bv.prefix()) { }
+    position_in_partition(range_tag_t, bound_kind kind, clustering_key_prefix&& prefix)
+        : _type(partition_region::clustered), _bound_weight(position_weight(kind)), _ck(std::move(prefix)) { }
     position_in_partition(after_static_row_tag_t) :
         position_in_partition(range_tag_t(), bound_view::bottom()) { }
     explicit position_in_partition(position_in_partition_view view)
@@ -229,6 +263,17 @@ public:
                 _ck = *view._ck;
             }
         }
+
+    position_in_partition& operator=(position_in_partition_view view) {
+        _type = view._type;
+        _bound_weight = view._bound_weight;
+        if (view._ck) {
+            _ck = *view._ck;
+        } else {
+            _ck.reset();
+        }
+        return *this;
+    }
 
     static position_in_partition before_all_clustered_rows() {
         return {position_in_partition::range_tag_t(), bound_view::bottom()};
@@ -257,6 +302,10 @@ public:
         return {clustering_row_tag_t(), std::move(ck)};
     }
 
+    static position_in_partition for_partition_start() {
+        return position_in_partition{partition_start_tag_t()};
+    }
+
     static position_in_partition for_static_row() {
         return position_in_partition{static_row_tag_t()};
     }
@@ -268,14 +317,20 @@ public:
     static position_in_partition for_range_start(const query::clustering_range&);
     static position_in_partition for_range_end(const query::clustering_range&);
 
+    partition_region region() const { return _type; }
     bool is_partition_start() const { return _type == partition_region::partition_start; }
     bool is_partition_end() const { return _type == partition_region::partition_end; }
     bool is_static_row() const { return _type == partition_region::static_row; }
-    bool is_clustering_row() const { return has_clustering_key() && !_bound_weight; }
+    bool is_clustering_row() const { return has_clustering_key() && _bound_weight == bound_weight::equal; }
     bool has_clustering_key() const { return _type == partition_region::clustered; }
 
     bool is_after_all_clustered_rows(const schema& s) const {
-        return is_partition_end() || (_ck && _ck->is_empty(s) && _bound_weight > 0);
+        return is_partition_end() || (_ck && _ck->is_empty(s) && _bound_weight == bound_weight::after_all_prefixed);
+    }
+
+    bool is_before_all_clustered_rows(const schema& s) const {
+        return _type < partition_region::clustered
+               || (_type == partition_region::clustered && _ck->is_empty(s) && _bound_weight == bound_weight::before_all_prefixed);
     }
 
     template<typename Hasher>
@@ -294,6 +349,10 @@ public:
     }
     operator position_in_partition_view() const {
         return { _type, _bound_weight, _ck ? &*_ck : nullptr };
+    }
+
+    size_t external_memory_usage() const {
+        return _ck ? _ck->external_memory_usage() : 0;
     }
 
     // Defines total order on the union of position_and_partition and composite objects.
@@ -396,7 +455,7 @@ public:
             if (!a._ck) {
                 return 0;
             }
-            return _cmp(*a._ck, a._bound_weight, *b._ck, b._bound_weight);
+            return _cmp(*a._ck, int8_t(a._bound_weight), *b._ck, int8_t(b._bound_weight));
         }
     public:
         tri_compare(const schema& s) : _cmp(s) { }
@@ -477,7 +536,7 @@ inline
 bool no_clustering_row_between(const schema& s, position_in_partition_view a, position_in_partition_view b) {
     clustering_key_prefix::equality eq(s);
     if (a._ck && b._ck) {
-        return eq(*a._ck, *b._ck) && (a._bound_weight >= 0 || b._bound_weight <= 0);
+        return eq(*a._ck, *b._ck) && (a._bound_weight != bound_weight::before_all_prefixed || b._bound_weight != bound_weight::after_all_prefixed);
     } else {
         return !a._ck && !b._ck;
     }
@@ -534,107 +593,12 @@ public:
     position_in_partition&& end() && { return std::move(_end); }
     bool contains(const schema& s, position_in_partition_view pos) const;
     bool overlaps(const schema& s, position_in_partition_view start, position_in_partition_view end) const;
+    bool is_all_clustered_rows(const schema&) const;
 
     friend std::ostream& operator<<(std::ostream&, const position_range&);
 };
 
-// Represents a non-contiguous subset of clustering_key domain of a particular schema.
-// Can be treated like an ordered and non-overlapping sequence of position_range:s.
-class clustering_interval_set {
-    // Needed to make position_in_partition comparable, required by boost::icl::interval_set.
-    class position_in_partition_with_schema {
-        schema_ptr _schema;
-        position_in_partition _pos;
-    public:
-        position_in_partition_with_schema()
-            : _pos(position_in_partition::for_static_row())
-        { }
-        position_in_partition_with_schema(schema_ptr s, position_in_partition pos)
-            : _schema(std::move(s))
-            , _pos(std::move(pos))
-        { }
-        bool operator<(const position_in_partition_with_schema& other) const {
-            return position_in_partition::less_compare(*_schema)(_pos, other._pos);
-        }
-        bool operator==(const position_in_partition_with_schema& other) const {
-            return position_in_partition::equal_compare(*_schema)(_pos, other._pos);
-        }
-        const position_in_partition& position() const { return _pos; }
-    };
-private:
-    // We want to represent intervals of clustering keys, not position_in_partitions,
-    // but clustering_key domain is not enough to represent all kinds of clustering ranges.
-    // All intervals in this set are of the form [x, y).
-    using set_type = boost::icl::interval_set<position_in_partition_with_schema>;
-    using interval = boost::icl::interval<position_in_partition_with_schema>;
-    set_type _set;
-public:
-    clustering_interval_set() = default;
-    // Constructs from legacy clustering_row_ranges
-    clustering_interval_set(const schema& s, const query::clustering_row_ranges& ranges) {
-        for (auto&& r : ranges) {
-            add(s, position_range::from_range(r));
-        }
-    }
-    query::clustering_row_ranges to_clustering_row_ranges() const {
-        query::clustering_row_ranges result;
-        for (position_range r : *this) {
-            result.push_back(query::clustering_range::make(
-                {r.start().key(), r.start()._bound_weight <= 0},
-                {r.end().key(), r.end()._bound_weight > 0}));
-        }
-        return result;
-    }
-    class position_range_iterator : public std::iterator<std::input_iterator_tag, const position_range> {
-        set_type::iterator _i;
-    public:
-        position_range_iterator(set_type::iterator i) : _i(i) {}
-        position_range operator*() const {
-            // FIXME: Produce position_range view. Not performance critical yet.
-            const interval::interval_type& iv = *_i;
-            return position_range{iv.lower().position(), iv.upper().position()};
-        }
-        bool operator==(const position_range_iterator& other) const { return _i == other._i; }
-        bool operator!=(const position_range_iterator& other) const { return _i != other._i; }
-        position_range_iterator& operator++() {
-            ++_i;
-            return *this;
-        }
-        position_range_iterator operator++(int) {
-            auto tmp = *this;
-            ++_i;
-            return tmp;
-        }
-    };
-    static interval::type make_interval(const schema& s, const position_range& r) {
-        assert(r.start().has_clustering_key());
-        assert(r.end().has_clustering_key());
-        return interval::right_open(
-            position_in_partition_with_schema(s.shared_from_this(), r.start()),
-            position_in_partition_with_schema(s.shared_from_this(), r.end()));
-    }
-public:
-    bool equals(const schema& s, const clustering_interval_set& other) const {
-        return boost::equal(_set, other._set);
-    }
-    bool contains(const schema& s, position_in_partition_view pos) const {
-        // FIXME: Avoid copy
-        return _set.find(position_in_partition_with_schema(s.shared_from_this(), position_in_partition(pos))) != _set.end();
-    }
-    bool overlaps(const schema& s, const position_range& range) const {
-        // FIXME: Avoid copy
-        auto r = _set.equal_range(make_interval(s, range));
-        return r.first != r.second;
-    }
-    // Adds given clustering range to this interval set.
-    // The range may overlap with this set.
-    void add(const schema& s, const position_range& r) {
-        _set += make_interval(s, r);
-    }
-    position_range_iterator begin() const { return {_set.begin()}; }
-    position_range_iterator end() const { return {_set.end()}; }
-    friend std::ostream& operator<<(std::ostream&, const clustering_interval_set&);
-};
+class clustering_interval_set;
 
 inline
 bool position_range::contains(const schema& s, position_in_partition_view pos) const {
@@ -646,4 +610,9 @@ inline
 bool position_range::overlaps(const schema& s, position_in_partition_view start, position_in_partition_view end) const {
     position_in_partition::less_compare less(s);
     return !less(end, _start) && less(start, _end);
+}
+
+inline
+bool position_range::is_all_clustered_rows(const schema& s) const {
+    return _start.is_before_all_clustered_rows(s) && _end.is_after_all_clustered_rows(s);
 }

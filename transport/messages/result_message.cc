@@ -26,36 +26,50 @@
 namespace cql_transport::messages {
 
 std::ostream& operator<<(std::ostream& os, const result_message::void_message& msg) {
-    return fprint(os, "{result_message::void}");
+    return fmt_print(os, "{{result_message::void}}");
+}
+
+std::ostream& operator<<(std::ostream& os, const result_message::bounce_to_shard& msg) {
+    return fmt_print(os, "{{result_message::bounce_to_shard {}}}", msg.move_to_shard());
 }
 
 std::ostream& operator<<(std::ostream& os, const result_message::set_keyspace& msg) {
-    return fprint(os, "{result_message::set_keyspace %s}", msg.get_keyspace());
+    return fmt_print(os, "{{result_message::set_keyspace {}}}", msg.get_keyspace());
 }
 
 std::ostream& operator<<(std::ostream& os, const result_message::prepared::thrift& msg) {
-    return fprint(os, "{result_message::prepared::thrift %d}", msg.get_id());
+    return fmt_print(os, "{{result_message::prepared::thrift {:d}}}", msg.get_id());
 }
 
 std::ostream& operator<<(std::ostream& os, const result_message::prepared::cql& msg) {
-    return fprint(os, "{result_message::prepared::cql %s}", to_hex(msg.get_id()));
+    return fmt_print(os, "{{result_message::prepared::cql {}}}", to_hex(msg.get_id()));
 }
 
 std::ostream& operator<<(std::ostream& os, const result_message::schema_change& msg) {
     // FIXME: format contents
-    return fprint(os, "{result_message::prepared::schema_change %p}", (void*)msg.get_change().get());
+    return fmt_print(os, "{{result_message::prepared::schema_change {:p}}}", (void*)msg.get_change().get());
 }
 
 std::ostream& operator<<(std::ostream& os, const result_message::rows& msg) {
-    fprint(os, "{result_message::rows ");
-    for (auto&& row : msg.rs().rows()) {
-        fprint(os, "{row:");
-        for (auto&& col : row) {
-            fprint(os, " %s", col);
+    os << "{result_message::rows ";
+    struct visitor {
+        std::ostream& _os;
+        void start_row() { _os << "{row: "; }
+        void accept_value(std::optional<query::result_bytes_view> value) {
+            if (!value) {
+                _os << " null";
+                return;
+            }
+            _os << " ";
+            using boost::range::for_each;
+            for_each(*value, [this] (bytes_view fragment) {
+                _os << fragment;
+            });
         }
-        fprint(os, "}");
-    }
-    fprint(os, "}");
+        void end_row() { _os << "}"; }
+    };
+    msg.rs().visit(visitor { os });
+    os << "}";
     return os;
 }
 
@@ -70,6 +84,7 @@ std::ostream& operator<<(std::ostream& os, const result_message& msg) {
         void visit(const result_message::prepared::thrift& m) override { _os << m; };
         void visit(const result_message::schema_change& m) override { _os << m; };
         void visit(const result_message::rows& m) override { _os << m; };
+        void visit(const result_message::bounce_to_shard& m) override { _os << m; };
     };
     visitor print_visitor{os};
     msg.accept(print_visitor);

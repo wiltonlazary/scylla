@@ -38,6 +38,8 @@
 #include "idl/uuid.dist.impl.hh"
 #include "idl/keys.dist.impl.hh"
 #include "idl/mutation.dist.impl.hh"
+#include "flat_mutation_reader.hh"
+#include "converting_mutation_partition_applier.hh"
 
 //
 // Representation layout:
@@ -63,13 +65,13 @@ frozen_mutation::schema_version() const {
 }
 
 partition_key_view
-frozen_mutation::key(const schema& s) const {
+frozen_mutation::key() const {
     return _pk;
 }
 
 dht::decorated_key
 frozen_mutation::decorated_key(const schema& s) const {
-    return dht::global_partitioner().decorate_key(s, key(s));
+    return dht::decorate_key(s, key());
 }
 
 partition_key frozen_mutation::deserialize_key() const {
@@ -107,14 +109,22 @@ frozen_mutation::frozen_mutation(const mutation& m)
 
 mutation
 frozen_mutation::unfreeze(schema_ptr schema) const {
-    mutation m(schema, key(*schema));
+    check_schema_version(schema_version(), *schema);
+    mutation m(schema, key());
     partition_builder b(*schema, m.partition());
     partition().accept(*schema, b);
     return m;
 }
 
+mutation frozen_mutation::unfreeze_upgrading(schema_ptr schema, const column_mapping& cm) const {
+    mutation m(schema, key());
+    converting_mutation_partition_applier v(cm, *schema, m.partition());
+    partition().accept(cm, v);
+    return m;
+}
+
 frozen_mutation freeze(const mutation& m) {
-    return { m };
+    return frozen_mutation{ m };
 }
 
 mutation_partition_view frozen_mutation::partition() const {
@@ -169,10 +179,10 @@ frozen_mutation streamed_mutation_freezer::consume_end_of_stream() {
 
 class fragmenting_mutation_freezer {
     const schema& _schema;
-    stdx::optional<partition_key> _key;
+    std::optional<partition_key> _key;
 
     tombstone _partition_tombstone;
-    stdx::optional<static_row> _sr;
+    std::optional<static_row> _sr;
     std::deque<clustering_row> _crs;
     range_tombstone_list _rts;
 
@@ -222,18 +232,18 @@ public:
 
     future<stop_iteration> consume(static_row&& sr) {
         _sr = std::move(sr);
-        _dirty_size += _sr->memory_usage();
+        _dirty_size += _sr->memory_usage(_schema);
         return maybe_flush();
     }
 
     future<stop_iteration> consume(clustering_row&& cr) {
-        _dirty_size += cr.memory_usage();
+        _dirty_size += cr.memory_usage(_schema);
         _crs.emplace_back(std::move(cr));
         return maybe_flush();
     }
 
     future<stop_iteration> consume(range_tombstone&& rt) {
-        _dirty_size += rt.memory_usage();
+        _dirty_size += rt.memory_usage(_schema);
         _rts.apply(_schema, std::move(rt));
         return maybe_flush();
     }
@@ -251,7 +261,7 @@ future<> fragment_and_freeze(flat_mutation_reader mr, frozen_mutation_consumer_f
     fragmenting_mutation_freezer freezer(*mr.schema(), c, fragment_size);
     return do_with(std::move(mr), std::move(freezer), [] (auto& mr, auto& freezer) {
         return repeat([&] {
-            return mr().then([&] (auto mfopt) {
+            return mr(db::no_timeout).then([&] (auto mfopt) {
                 if (!mfopt) {
                     return make_ready_future<stop_iteration>(stop_iteration::yes);
                 }

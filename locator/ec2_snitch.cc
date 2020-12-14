@@ -1,9 +1,10 @@
 #include "locator/ec2_snitch.hh"
+#include <seastar/core/seastar.hh>
 
 namespace locator {
 
 ec2_snitch::ec2_snitch(const sstring& fname, unsigned io_cpuid) : production_snitch_base(fname) {
-    if (engine().cpu_id() == io_cpuid) {
+    if (this_shard_id() == io_cpuid) {
         io_cpu_id() = io_cpuid;
     }
 }
@@ -16,8 +17,8 @@ ec2_snitch::ec2_snitch(const sstring& fname, unsigned io_cpuid) : production_sni
 future<> ec2_snitch::load_config() {
     using namespace boost::algorithm;
 
-    if (engine().cpu_id() == io_cpu_id()) {
-        return aws_api_call(AWS_QUERY_SERVER_ADDR, ZONE_NAME_QUERY_REQ).then([this](sstring az){
+    if (this_shard_id() == io_cpu_id()) {
+        return aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, ZONE_NAME_QUERY_REQ).then([this](sstring az) {
             assert(az.size());
 
             std::vector<std::string> splits;
@@ -42,7 +43,7 @@ future<> ec2_snitch::load_config() {
                     [this] (snitch_ptr& local_s) {
 
                     // Distribute the new values on all CPUs but the current one
-                    if (engine().cpu_id() != io_cpu_id()) {
+                    if (this_shard_id() != io_cpu_id()) {
                         local_s->set_my_dc(_my_dc);
                         local_s->set_my_rack(_my_rack);
                     }
@@ -62,8 +63,8 @@ future<> ec2_snitch::start() {
     });
 }
 
-future<sstring> ec2_snitch::aws_api_call(sstring addr, sstring cmd) {
-    return engine().net().connect(make_ipv4_address(ipv4_addr{addr}))
+future<sstring> ec2_snitch::aws_api_call(sstring addr, uint16_t port, sstring cmd) {
+    return connect(socket_address(inet_address{addr}, port))
     .then([this, addr, cmd] (connected_socket fd) {
         _sd = std::move(fd);
         _in = std::move(_sd.input());
@@ -105,7 +106,7 @@ future<sstring> ec2_snitch::read_property_file() {
     return load_property_file().then([this] {
         sstring dc_suffix;
 
-        if (_prop_values.count(dc_suffix_property_key)) {
+        if (_prop_values.contains(dc_suffix_property_key)) {
             dc_suffix = _prop_values[dc_suffix_property_key];
         }
 

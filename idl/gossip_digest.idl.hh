@@ -38,10 +38,6 @@ enum class application_state:int {
         SUPPORTED_FEATURES
 };
 
-class inet_address final {
-  uint32_t raw_addr();
-};
-
 class versioned_value {
     sstring value;
     int version;
@@ -66,16 +62,24 @@ class gossip_digest {
 class gossip_digest_syn {
     sstring get_cluster_id();
     sstring get_partioner();
-    std::vector<gms::gossip_digest> get_gossip_digests();
+    utils::chunked_vector<gms::gossip_digest> get_gossip_digests();
 };
 
 class gossip_digest_ack {
-    std::vector<gms::gossip_digest> get_gossip_digest_list();
+    utils::chunked_vector<gms::gossip_digest> get_gossip_digest_list();
     std::map<gms::inet_address, gms::endpoint_state> get_endpoint_state_map();
 };
 
 class gossip_digest_ack2 {
     std::map<gms::inet_address, gms::endpoint_state> get_endpoint_state_map();
+};
+
+struct gossip_get_endpoint_states_request {
+    std::unordered_set<gms::application_state> application_states;
+};
+
+struct gossip_get_endpoint_states_response {
+    std::unordered_map<gms::inet_address, gms::endpoint_state> endpoint_state_map;
 };
 
 }

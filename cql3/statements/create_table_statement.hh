@@ -48,16 +48,16 @@
 #include "cql3/cql3_type.hh"
 
 #include "service/migration_manager.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 
 #include <seastar/util/indirect.hh>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include <set>
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 
@@ -90,35 +90,35 @@ class create_table_statement : public schema_altering_statement {
     column_set_type _static_columns;
     const ::shared_ptr<cf_prop_defs> _properties;
     const bool _if_not_exists;
-    stdx::optional<utils::UUID> _id;
+    std::optional<utils::UUID> _id;
 public:
     create_table_statement(::shared_ptr<cf_name> name,
                            ::shared_ptr<cf_prop_defs> properties,
                            bool if_not_exists,
                            column_set_type static_columns,
-                           const stdx::optional<utils::UUID>& id);
+                           const std::optional<utils::UUID>& id);
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    virtual void validate(service::storage_proxy&, const service::client_state& state) override;
+    virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) const override;
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
-    virtual future<> grant_permissions_to_creator(const service::client_state&) override;
+    virtual future<> grant_permissions_to_creator(const service::client_state&) const override;
 
-    schema_ptr get_cf_meta_data(const database&);
+    schema_ptr get_cf_meta_data(const database&) const;
 
     class raw_statement;
 
     friend raw_statement;
 private:
-    std::vector<column_definition> get_columns();
+    std::vector<column_definition> get_columns() const;
 
-    void apply_properties_to(schema_builder& builder, const database&);
+    void apply_properties_to(schema_builder& builder, const database&) const;
 
-    void add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind);
+    void add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind) const;
 };
 
 class create_table_statement::raw_statement : public raw::cf_statement {
@@ -139,7 +139,7 @@ private:
 public:
     raw_statement(::shared_ptr<cf_name> name, bool if_not_exists);
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
     cf_properties& properties() {
         return _properties;

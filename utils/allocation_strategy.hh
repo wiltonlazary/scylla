@@ -83,6 +83,7 @@ public:
 template <typename T>
 standard_migrator<T>& get_standard_migrator()
 {
+    seastar::memory::scoped_critical_alloc_section dfg;
     static thread_local standard_migrator<T> instance;
     return instance;
 }
@@ -165,7 +166,7 @@ public:
         free(obj, size);
     }
 
-    size_t preferred_max_contiguous_allocation() const {
+    size_t preferred_max_contiguous_allocation() const noexcept {
         return _preferred_max_contiguous_allocation;
     }
 
@@ -173,11 +174,11 @@ public:
     // are invalidated, e.g. due to internal events like compaction or eviction.
     // When the value returned by this method doesn't change, references obtained
     // between invocations remain valid.
-    uint64_t invalidate_counter() const {
+    uint64_t invalidate_counter() const noexcept {
         return _invalidate_counter;
     }
 
-    void invalidate_references() {
+    void invalidate_references() noexcept {
         ++_invalidate_counter;
     }
 };
@@ -234,7 +235,7 @@ template<typename T>
 inline
 auto current_deleter() {
     auto& alloc = current_allocator();
-    return [&alloc] (T* obj) {
+    return [&alloc] (T* obj) noexcept {
         alloc.destroy(obj);
     };
 }

@@ -61,8 +61,10 @@
 #include "schema_builder.hh"
 #include "service/storage_proxy.hh"
 #include "validation.hh"
-#include "db/config.hh"
-#include "service/storage_service.hh"
+#include "db/extensions.hh"
+#include "database.hh"
+#include "gms/feature_service.hh"
+#include "db/view/view.hh"
 
 namespace cql3 {
 
@@ -84,54 +86,45 @@ create_view_statement::create_view_statement(
     , _clustering_keys{clustering_keys}
     , _if_not_exists{if_not_exists}
 {
-    service::get_local_storage_proxy().get_db().local().get_config().check_experimental("Creating materialized views");
-    if (!service::get_local_storage_service().cluster_supports_materialized_views()) {
-        throw exceptions::invalid_request_exception("Can't create materialized views until the whole cluster has been upgraded");
-    }
 }
 
-future<> create_view_statement::check_access(const service::client_state& state) {
-    return state.has_column_family_access(keyspace(), _base_name->get_column_family(), auth::permission::ALTER);
+future<> create_view_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
+    return state.has_column_family_access(proxy.local_db(), keyspace(), _base_name->get_column_family(), auth::permission::ALTER);
 }
 
-void create_view_statement::validate(service::storage_proxy&, const service::client_state& state) {
-    // validated in announceMigration()
+void create_view_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const {
 }
 
-static const column_definition* get_column_definition(schema_ptr schema, column_identifier::raw& identifier) {
+static const column_definition* get_column_definition(const schema& schema, column_identifier::raw& identifier) {
     auto prepared = identifier.prepare(schema);
     assert(dynamic_pointer_cast<column_identifier>(prepared));
     auto id = static_pointer_cast<column_identifier>(prepared);
-    return schema->get_column_definition(id->name());
+    return schema.get_column_definition(id->name());
 }
 
 static bool validate_primary_key(
-        schema_ptr schema,
+        const schema& schema,
         const column_definition* def,
         const std::unordered_set<const column_definition*>& base_pk,
         bool has_non_pk_column,
         const restrictions::statement_restrictions& restrictions) {
 
     if (def->type->is_multi_cell()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Cannot use MultiCell column '%s' in PRIMARY KEY of materialized view", def->name_as_text()));
+        throw exceptions::invalid_request_exception(format("Cannot use MultiCell column '{}' in PRIMARY KEY of materialized view", def->name_as_text()));
     }
 
     if (def->type->references_duration()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Cannot use Duration column '%s' in PRIMARY KEY of materialized view", def->name_as_text()));
+        throw exceptions::invalid_request_exception(format("Cannot use Duration column '{}' in PRIMARY KEY of materialized view", def->name_as_text()));
     }
 
     if (def->is_static()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Cannot use Static column '%s' in PRIMARY KEY of materialized view", def->name_as_text()));
+        throw exceptions::invalid_request_exception(format("Cannot use Static column '{}' in PRIMARY KEY of materialized view", def->name_as_text()));
     }
 
     bool new_non_pk_column = false;
-    if (base_pk.find(def) == base_pk.end()) {
+    if (!base_pk.contains(def)) {
         if (has_non_pk_column) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Cannot include more than one non-primary key column '%s' in materialized view primary key", def->name_as_text()));
+            throw exceptions::invalid_request_exception(format("Cannot include more than one non-primary key column '{}' in materialized view primary key", def->name_as_text()));
         }
         new_non_pk_column = true;
     }
@@ -139,16 +132,15 @@ static bool validate_primary_key(
     // We don't need to include the "IS NOT NULL" filter on a non-composite partition key
     // because we will never allow a single partition key to be NULL
     bool is_non_composite_partition_key = def->is_partition_key() &&
-            schema->partition_key_columns().size() == 1;
+            schema.partition_key_columns().size() == 1;
     if (!is_non_composite_partition_key && !restrictions.is_restricted(def)) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Primary key column '%s' is required to be filtered by 'IS NOT NULL'", def->name_as_text()));
+        throw exceptions::invalid_request_exception(format("Primary key column '{}' is required to be filtered by 'IS NOT NULL'", def->name_as_text()));
     }
 
     return new_non_pk_column;
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) {
+future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const {
     // We need to make sure that:
     //  - primary key includes all columns in base table's primary key
     //  - make sure that the select statement does not have anything other than columns
@@ -158,11 +150,16 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     //  - make sure there is not currently a table or view
     //  - make sure base_table gc_grace_seconds > 0
 
-    _properties.validate(proxy.get_db().local().get_config().extensions());
+    auto&& db = proxy.get_db().local();
+    auto schema_extensions = _properties.properties()->make_schema_extensions(db.extensions());
+    _properties.validate(db, schema_extensions);
 
     if (_properties.use_compact_storage()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Cannot use 'COMPACT STORAGE' when defining a materialized view"));
+        throw exceptions::invalid_request_exception(format("Cannot use 'COMPACT STORAGE' when defining a materialized view"));
+    }
+
+    if (_properties.properties()->get_cdc_options(schema_extensions)) {
+        throw exceptions::invalid_request_exception("Cannot enable CDC for a materialized view");
     }
 
     // View and base tables must be in the same keyspace, to ensure that RF
@@ -174,22 +171,18 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
         _base_name->set_keyspace(keyspace(), true);
     }
     if (_base_name->get_keyspace() != keyspace()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Cannot create a materialized view on a table in a separate keyspace ('%s' != '%s')",
+        throw exceptions::invalid_request_exception(format("Cannot create a materialized view on a table in a separate keyspace ('{}' != '{}')",
                 _base_name->get_keyspace(), keyspace()));
     }
 
-    auto&& db = proxy.get_db().local();
     schema_ptr schema = validation::validate_column_family(db, _base_name->get_keyspace(), _base_name->get_column_family());
 
     if (schema->is_counter()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Materialized views are not supported on counter tables"));
+        throw exceptions::invalid_request_exception(format("Materialized views are not supported on counter tables"));
     }
 
     if (schema->is_view()) {
-        throw exceptions::invalid_request_exception(sprint(
-                "Materialized views cannot be created against other materialized views"));
+        throw exceptions::invalid_request_exception(format("Materialized views cannot be created against other materialized views"));
     }
 
     if (schema->gc_grace_seconds().count() == 0) {
@@ -204,41 +197,35 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     // Gather all included columns, as specified by the select clause
     auto included = boost::copy_range<std::unordered_set<const column_definition*>>(_select_clause | boost::adaptors::transformed([&](auto&& selector) {
         if (selector->alias) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Cannot use alias when defining a materialized view"));
+            throw exceptions::invalid_request_exception(format("Cannot use alias when defining a materialized view"));
         }
 
         auto selectable = selector->selectable_;
         if (dynamic_pointer_cast<selection::selectable::with_field_selection::raw>(selectable)) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Cannot select out a part of type when defining a materialized view"));
+            throw exceptions::invalid_request_exception(format("Cannot select out a part of type when defining a materialized view"));
         }
         if (dynamic_pointer_cast<selection::selectable::with_function::raw>(selectable)) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Cannot use function when defining a materialized view"));
+            throw exceptions::invalid_request_exception(format("Cannot use function when defining a materialized view"));
         }
         if (dynamic_pointer_cast<selection::selectable::writetime_or_ttl::raw>(selectable)) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Cannot use function when defining a materialized view"));
+            throw exceptions::invalid_request_exception(format("Cannot use function when defining a materialized view"));
         }
 
         assert(dynamic_pointer_cast<column_identifier::raw>(selectable));
         auto identifier = static_pointer_cast<column_identifier::raw>(selectable);
-        auto* def = get_column_definition(schema, *identifier);
+        auto* def = get_column_definition(*schema, *identifier);
         if (!def) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Unknown column name detected in CREATE MATERIALIZED VIEW statement : ", identifier));
+            throw exceptions::invalid_request_exception(format("Unknown column name detected in CREATE MATERIALIZED VIEW statement: {}", identifier));
         }
         return def;
     }));
 
-    if (!get_bound_variables()->empty()) {
-        throw exceptions::invalid_request_exception(sprint(
-                    "Cannot use query parameters in CREATE MATERIALIZED VIEW statements"));
+    if (!_variables.empty()) {
+        throw exceptions::invalid_request_exception(format("Cannot use query parameters in CREATE MATERIALIZED VIEW statements"));
     }
 
-    auto parameters = ::make_shared<raw::select_statement::parameters>(raw::select_statement::parameters::orderings_type(), false, true);
-    raw::select_statement raw_select(_base_name, std::move(parameters), _select_clause, _where_clause, nullptr);
+    auto parameters = make_lw_shared<raw::select_statement::parameters>(raw::select_statement::parameters::orderings_type(), false, true);
+    raw::select_statement raw_select(_base_name, std::move(parameters), _select_clause, _where_clause, nullptr, nullptr, {});
     raw_select.prepare_keyspace(keyspace());
     raw_select.set_bound_variables({});
 
@@ -257,17 +244,15 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     std::vector<const column_definition*> target_clustering_keys;
     auto validate_pk = [&] (const std::vector<::shared_ptr<cql3::column_identifier::raw>>& keys, std::vector<const column_definition*>& target_keys) mutable {
         for (auto&& identifier : keys) {
-            auto* def = get_column_definition(schema, *identifier);
+            auto* def = get_column_definition(*schema, *identifier);
             if (!def) {
-                throw exceptions::invalid_request_exception(sprint(
-                        "Unknown column name detected in CREATE MATERIALIZED VIEW statement : ", identifier));
+                throw exceptions::invalid_request_exception(format("Unknown column name detected in CREATE MATERIALIZED VIEW statement: {}", identifier));
             }
             if (!target_primary_keys.insert(def).second) {
-                throw exceptions::invalid_request_exception(sprint(
-                        "Duplicate entry found in PRIMARY KEY: ", identifier));
+                throw exceptions::invalid_request_exception(format("Duplicate entry found in PRIMARY KEY: {}", identifier));
             }
             target_keys.push_back(def);
-            has_non_pk_column |= validate_primary_key(schema, def, base_primary_key_cols, has_non_pk_column, *restrictions);
+            has_non_pk_column |= validate_primary_key(*schema, def, base_primary_key_cols, has_non_pk_column, *restrictions);
         }
     };
     validate_pk(_partition_keys, target_partition_keys);
@@ -275,6 +260,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
 
     std::vector<const column_definition*> missing_pk_columns;
     std::vector<const column_definition*> target_non_pk_columns;
+    std::vector<const column_definition*> unselected_columns;
 
     // We need to include all of the primary key columns from the base table in order to make sure that we do not
     // overwrite values in the view. We cannot support "collapsing" the base table into a smaller number of rows in
@@ -282,15 +268,17 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     // used in the view and whether or not to generate a tombstone. In order to not surprise our users, we require
     // that they include all of the columns. We provide them with a list of all of the columns left to include.
     for (auto& def : schema->all_columns()) {
-        bool included_def = included.empty() || included.find(&def) != included.end();
+        bool included_def = included.empty() || included.contains(&def);
         if (included_def && def.is_static()) {
-            throw exceptions::invalid_request_exception(sprint(
-                    "Unable to include static column '%s' which would be included by Materialized View SELECT * statement", def));
+            throw exceptions::invalid_request_exception(format("Unable to include static column '{}' which would be included by Materialized View SELECT * statement", def));
         }
 
-        bool def_in_target_pk = std::find(target_primary_keys.begin(), target_primary_keys.end(), &def) != target_primary_keys.end();
+        bool def_in_target_pk = target_primary_keys.contains(&def);
         if (included_def && !def_in_target_pk) {
             target_non_pk_columns.push_back(&def);
+        }
+        if (!included_def && !def_in_target_pk && !def.is_static()) {
+            unselected_columns.push_back(&def);
         }
         if (def.is_primary_key() && !def_in_target_pk) {
             missing_pk_columns.push_back(&def);
@@ -299,29 +287,58 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
 
     if (!missing_pk_columns.empty()) {
         auto column_names = ::join(", ", missing_pk_columns | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)));
-        throw exceptions::invalid_request_exception(sprint(
-                        "Cannot create Materialized View %s without primary key columns from base %s (%s)",
+        throw exceptions::invalid_request_exception(format("Cannot create Materialized View {} without primary key columns from base {} ({})",
                         column_family(), _base_name->get_column_family(), column_names));
     }
 
     if (_partition_keys.empty()) {
-        throw exceptions::invalid_request_exception(sprint("Must select at least a column for a Materialized View"));
+        throw exceptions::invalid_request_exception(format("Must select at least a column for a Materialized View"));
     }
-    if (_clustering_keys.empty()) {
-        throw exceptions::invalid_request_exception(sprint("No columns are defined for Materialized View other than primary key"));
+
+    // The unique feature of a filter by a non-key column is that the
+    // value of such column can be updated - and also be expired with TTL
+    // and cause the view row to appear and disappear. We don't currently
+    // support support this case - see issue #3430, and neither does
+    // Cassandra - see see CASSANDRA-13798 and CASSANDRA-13832.
+    // Actually, as CASSANDRA-13798 explains, the problem is "the liveness of
+    // view row is now depending on multiple base columns (multiple filtered
+    // non-pk base column + base column used in view pk)". When the filtered
+    // column *is* the base column added to the view pk, we don't have this
+    // problem. And this case actually works correctly.
+    auto non_pk_restrictions = restrictions->get_non_pk_restriction();
+    if (non_pk_restrictions.size() == 1 && has_non_pk_column &&
+            target_primary_keys.contains(non_pk_restrictions.cbegin()->first)) {
+        // This case (filter by new PK column of the view) works, as explained above
+    } else if (!non_pk_restrictions.empty()) {
+        auto column_names = ::join(", ", non_pk_restrictions | boost::adaptors::map_keys | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)));
+        throw exceptions::invalid_request_exception(format("Non-primary key columns cannot be restricted in the SELECT statement used for materialized view {} creation (got restrictions on: {})",
+                column_family(), column_names));
     }
 
     schema_builder builder{keyspace(), column_family()};
     auto add_columns = [this, &builder] (std::vector<const column_definition*>& defs, column_kind kind) mutable {
         for (auto* def : defs) {
-            auto&& type = _properties.get_reversable_type(def->column_specification->name, def->type);
+            auto&& type = _properties.get_reversable_type(*def->column_specification->name, def->type);
             builder.with_column(def->name(), type, kind);
         }
     };
     add_columns(target_partition_keys, column_kind::partition_key);
     add_columns(target_clustering_keys, column_kind::clustering_key);
     add_columns(target_non_pk_columns, column_kind::regular_column);
-    _properties.properties()->apply_to_builder(builder, proxy.get_db().local().get_config().extensions());
+    // Add all unselected columns (base-table columns which are not selected
+    // in the view) as "virtual columns" - columns which have timestamp and
+    // ttl information, but an empty value. These are needed to keep view
+    // rows alive when the base row is alive, even if the view row has no
+    // data, just a key (see issue #3362). The virtual columns are not needed
+    // when the view pk adds a regular base column (i.e., has_non_pk_column)
+    // because in that case, the liveness of that base column is what
+    // determines the liveness of the view row.
+    if (!has_non_pk_column) {
+        for (auto* def : unselected_columns) {
+            db::view::create_virtual_column(builder, def->name(), def->type);
+        }
+    }
+    _properties.properties()->apply_to_builder(builder, std::move(schema_extensions));
 
     if (builder.default_time_to_live().count() > 0) {
         throw exceptions::invalid_request_exception(
@@ -339,7 +356,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
         try {
             f.get();
             using namespace cql_transport;
-            return make_shared<event::schema_change>(
+            return ::make_shared<event::schema_change>(
                     event::schema_change::change_type::CREATED,
                     event::schema_change::target_type::TABLE,
                     this->keyspace(),

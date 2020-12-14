@@ -46,11 +46,11 @@
 #include "cql3/column_identifier.hh"
 #include "cql3/cql_statement.hh"
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/checked_ptr.hh>
-#include <experimental/optional>
+#include <optional>
 #include <vector>
 
 namespace cql3 {
@@ -68,12 +68,11 @@ public:
     typedef seastar::checked_ptr<weak_ptr<prepared_statement>> checked_weak_ptr;
 
 public:
-    sstring raw_cql_statement;
     const ::shared_ptr<cql_statement> statement;
-    const std::vector<::shared_ptr<column_specification>> bound_names;
+    const std::vector<lw_shared_ptr<column_specification>> bound_names;
     std::vector<uint16_t> partition_key_bind_indices;
 
-    prepared_statement(::shared_ptr<cql_statement> statement_, std::vector<::shared_ptr<column_specification>> bound_names_, std::vector<uint16_t> partition_key_bind_indices);
+    prepared_statement(::shared_ptr<cql_statement> statement_, std::vector<lw_shared_ptr<column_specification>> bound_names_, std::vector<uint16_t> partition_key_bind_indices);
 
     prepared_statement(::shared_ptr<cql_statement> statement_, const variable_specifications& names, const std::vector<uint16_t>& partition_key_bind_indices);
 

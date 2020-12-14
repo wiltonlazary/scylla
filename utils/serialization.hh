@@ -40,9 +40,8 @@
 
 #include <stdint.h>
 
-#include <seastar/util/gcc6-concepts.hh>
-#include "core/sstring.hh"
-#include "net/byteorder.hh"
+#include <seastar/core/sstring.hh>
+#include <seastar/net/byteorder.hh>
 #include "bytes.hh"
 #include <iosfwd>
 #include <iterator>
@@ -60,9 +59,9 @@ static constexpr size_t serialize_int64_size = 8;
 namespace internal_impl {
 
 template <typename ExplicitIntegerType, typename CharOutputIterator, typename IntegerType>
-GCC6_CONCEPT(requires std::is_integral<ExplicitIntegerType>::value && std::is_integral<IntegerType>::value && requires (CharOutputIterator it) {
+requires std::is_integral<ExplicitIntegerType>::value && std::is_integral<IntegerType>::value && requires (CharOutputIterator it) {
     *it++ = 'a';
-})
+}
 inline
 void serialize_int(CharOutputIterator& out, IntegerType val) {
     ExplicitIntegerType nval = net::hton(ExplicitIntegerType(val));
@@ -109,9 +108,9 @@ void serialize_bool(CharOutputIterator& out, bool val) {
 // For now we'll just assume those aren't in the string...
 // TODO: fix the compatibility with Java even in this case.
 template <typename CharOutputIterator>
-GCC6_CONCEPT(requires requires (CharOutputIterator it) {
+requires requires (CharOutputIterator it) {
     *it++ = 'a';
-})
+}
 inline
 void serialize_string(CharOutputIterator& out, const sstring& s) {
     // Java specifies that nulls in the string need to be replaced by the
@@ -132,9 +131,9 @@ void serialize_string(CharOutputIterator& out, const sstring& s) {
 }
 
 template <typename CharOutputIterator>
-GCC6_CONCEPT(requires requires (CharOutputIterator it) {
+requires requires (CharOutputIterator it) {
     *it++ = 'a';
-})
+}
 inline
 void serialize_string(CharOutputIterator& out, const char* s) {
     // TODO: like above, need to change UTF-8 when above 16-bit.
@@ -154,9 +153,9 @@ size_t serialize_string_size(const sstring& s) {;
     return serialize_int16_size + s.size();
 }
 
-template<typename T>
+template<typename T, typename CharOutputIterator>
 static inline
-void write(bytes::iterator& out, const T& val) {
+void write(CharOutputIterator& out, const T& val) {
     auto v = net::ntoh(val);
     out = std::copy_n(reinterpret_cast<char*>(&v), sizeof(v), out);
 }

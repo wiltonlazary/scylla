@@ -41,11 +41,16 @@
 
 #pragma once
 
+#include "function.hh"
 #include "types.hh"
 #include "cql3/cql3_type.hh"
 #include <vector>
 #include <iosfwd>
 #include <boost/functional/hash.hpp>
+
+namespace std {
+    std::ostream& operator<<(std::ostream& os, const std::vector<data_type>& arg_types);
+}
 
 namespace cql3 {
 
@@ -65,6 +70,9 @@ protected:
     }
 
 public:
+
+    virtual bool requires_thread() const;
+
     virtual const function_name& name() const override {
         return _name;
     }
@@ -73,7 +81,7 @@ public:
         return _arg_types;
     }
 
-    virtual data_type return_type() const {
+    virtual const data_type& return_type() const {
         return _return_type;
     }
 
@@ -83,16 +91,8 @@ public:
             && _return_type == x._return_type;
     }
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) override {
-        return _name.keyspace == ks_name && _name.name == function_name;
-    }
-
-    virtual bool has_reference_to(function& f) override {
-        return false;
-    }
-
-    virtual sstring column_name(const std::vector<sstring>& column_names) override {
-        return sprint("%s(%s)", _name, join(", ", column_names));
+    virtual sstring column_name(const std::vector<sstring>& column_names) const override {
+        return format("{}({})", _name, join(", ", column_names));
     }
 
     virtual void print(std::ostream& os) const override;
@@ -102,13 +102,8 @@ inline
 void
 abstract_function::print(std::ostream& os) const {
     os << _name << " : (";
-    for (size_t i = 0; i < _arg_types.size(); ++i) {
-        if (i > 0) {
-            os << ", ";
-        }
-        os << _arg_types[i]->as_cql3_type()->to_string();
-    }
-    os << ") -> " << _return_type->as_cql3_type()->to_string();
+    os << _arg_types;
+    os << ") -> " << _return_type->as_cql3_type().to_string();
 }
 
 }

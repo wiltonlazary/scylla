@@ -1,33 +1,147 @@
-#!/bin/bash -e
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# Copyright 2018 ScyllaDB
+#
 
-. /usr/lib/scylla/scylla_lib.sh
+#
+# This file is part of Scylla.
+#
+# Scylla is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Scylla is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
 
-if [ "$AMI" = "yes" ] && [ -f /etc/scylla/ami_disabled ]; then
-    rm /etc/scylla/ami_disabled
-    exit 1
-fi
+import os
+import sys
+import glob
+import platform
+import distro
 
-if [ "$NETWORK_MODE" = "virtio" ]; then
-    ip tuntap del mode tap dev $TAP
-    ip tuntap add mode tap dev $TAP user $USER one_queue vnet_hdr
-    ip link set dev $TAP up
-    ip link set dev $TAP master $BRIDGE
-    chown $USER.$GROUP /dev/vhost-net
-elif [ "$NETWORK_MODE" = "dpdk" ]; then
-    modprobe uio
-    modprobe uio_pci_generic
-    /usr/lib/scylla/dpdk-devbind.py --force --bind=uio_pci_generic $ETHPCIID
-    for n in /sys/devices/system/node/node?; do
-        echo $NR_HUGEPAGES > $n/hugepages/hugepages-2048kB/nr_hugepages
-    done
-    if [ "$ID" = "ubuntu" ]; then
-        hugeadm --create-mounts
-    fi
-else # NETWORK_MODE = posix
-    if [ "$SET_NIC" = "yes" ]; then
-        create_perftune_conf "$IFNAME"
-        /usr/lib/scylla/posix_net_conf.sh $IFNAME --options-file /etc/scylla.d/perftune.yaml
-    fi
-fi
+from scylla_util import *
+from subprocess import run
 
-/usr/lib/scylla/scylla-blocktune
+def get_mode_cpuset(nic, mode):
+    mode_cpu_mask = run('/opt/scylladb/scripts/perftune.py --tune net --nic {} --mode {} --get-cpu-mask-quiet'.format(nic, mode), shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+    return hex2list(mode_cpu_mask)
+
+def get_cur_cpuset():
+    cfg = sysconfig_parser('/etc/scylla.d/cpuset.conf')
+    cpuset = cfg.get('CPUSET')
+    return re.sub(r'^--cpuset (.+)$', r'\1', cpuset).strip()
+
+def get_tune_mode(nic):
+    if not os.path.exists('/etc/scylla.d/cpuset.conf'):
+        raise Exception('/etc/scylla.d/cpuset.conf not found')
+    cur_cpuset = get_cur_cpuset()
+    mq_cpuset = get_mode_cpuset(nic, 'mq')
+    sq_cpuset = get_mode_cpuset(nic, 'sq')
+    sq_split_cpuset = get_mode_cpuset(nic, 'sq_split')
+
+    if cur_cpuset == mq_cpuset:
+        return 'mq'
+    elif cur_cpuset == sq_cpuset:
+        return 'sq'
+    elif cur_cpuset == sq_split_cpuset:
+        return 'sq_split'
+    else:
+        raise Exception('tune mode not found')
+
+def create_perftune_conf(cfg):
+    """
+    This function checks if a perftune configuration file should be created and
+    creates it if so is the case, returning a boolean accordingly. It returns False
+    if none of the perftune options are enabled in scylla_server file. If the perftune
+    configuration file already exists, none is created.
+    :return boolean indicating if perftune.py should be executed
+    """
+    params = ''
+    if get_set_nic_and_disks_config_value(cfg) == 'yes':
+        nic = cfg.get('IFNAME')
+        if not nic:
+            nic = 'eth0'
+        params += '--tune net --nic "{nic}"'.format(nic=nic)
+
+    if cfg.has_option('SET_CLOCKSOURCE') and cfg.get('SET_CLOCKSOURCE') == 'yes':
+        params += ' --tune system --tune-clock'
+
+    if len(params) > 0:
+        if os.path.exists('/etc/scylla.d/perftune.yaml'):
+            return True
+
+        mode = get_tune_mode(nic)
+        params += ' --mode {mode} --dump-options-file'.format(mode=mode)
+        yaml = run('/opt/scylladb/scripts/perftune.py ' + params, shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+        with open('/etc/scylla.d/perftune.yaml', 'w') as f:
+            f.write(yaml)
+        return True
+    else:
+        return False
+
+def verify_cpu():
+    if platform.machine() == 'x86_64':
+        needed_flags = set(['sse4_2', 'pclmulqdq'])
+        for line in open('/proc/cpuinfo'):
+            if line.startswith('flags'):
+                actual_flags = set(line.split()[2:])
+                missing_flags = needed_flags - actual_flags
+                if len(missing_flags) > 0:
+                    print(f"ERROR: You will not be able to run Scylla on this machine because its CPU lacks the following features: {' '.join(missing_flags)}")
+                    print('\nIf this is a virtual machine, please update its CPU feature configuration or upgrade to a newer hypervisor.')
+                    sys.exit(1)
+
+if __name__ == '__main__':
+    verify_cpu()
+
+    if os.getuid() > 0:
+        print('Requires root permission.')
+        sys.exit(1)
+    if is_redhat_variant():
+        cfg = sysconfig_parser('/etc/sysconfig/scylla-server')
+    else:
+        cfg = sysconfig_parser('/etc/default/scylla-server')
+    ami = cfg.get('AMI')
+    mode = cfg.get('NETWORK_MODE')
+
+    if ami == 'yes' and os.path.exists('/etc/scylla/ami_disabled'):
+        os.remove('/etc/scylla/ami_disabled')
+        sys.exit(1)
+
+    if mode == 'virtio':
+        tap = cfg.get('TAP')
+        user = cfg.get('USER')
+        group = cfg.get('GROUP')
+        bridge = cfg.get('BRIDGE')
+        run('ip tuntap del mode tap dev {TAP}'.format(TAP=tap), shell=True, check=True)
+        run('ip tuntap add mode tap dev {TAP} user {USER} one_queue vnet_hdr'.format(TAP=tap, USER=user), shell=True, check=True)
+        run('ip link set dev {TAP} up'.format(TAP=tap), shell=True, check=True)
+        run('ip link set dev {TAP} master {BRIDGE}'.format(TAP=tap, BRIDGE=bridge), shell=True, check=True)
+        run('chown {USER}.{GROUP} /dev/vhost-net'.format(USER=user, GROUP=group), shell=True, check=True)
+    elif mode == 'dpdk':
+        ethpciid = cfg.get('ETHPCIID')
+        nr_hugepages = cfg.get('NR_HUGEPAGES')
+        run('modprobe uio', shell=True, check=True)
+        run('modprobe uio_pci_generic', shell=True, check=True)
+        run('/opt/scylladb/scripts/dpdk-devbind.py --force --bind=uio_pci_generic {ETHPCIID}'.format(ETHPCIID=ethpciid), shell=True, check=True)
+        for n in glob.glob('/sys/devices/system/node/node?'):
+            with open('{n}/hugepages/hugepages-2048kB/nr_hugepages'.format(n=n), 'w') as f:
+                f.write(nr_hugepages)
+        if distro.name() == 'Ubuntu':
+            run('hugeadm --create-mounts', shell=True, check=True)
+    else:
+        try:
+            if create_perftune_conf(cfg):
+                run("{} --options-file /etc/scylla.d/perftune.yaml".format(perftune_base_command()), shell=True, check=True)
+        except Exception as e:
+            print(f'Exception occurred while creating perftune.yaml: {e}')
+            print('To fix the error, please re-run scylla_setup.')
+            sys.exit(1)
+

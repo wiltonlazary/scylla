@@ -22,21 +22,37 @@
 #include "storage_service.hh"
 #include "api/api-doc/storage_service.json.hh"
 #include "db/config.hh"
+#include "db/schema_tables.hh"
+#include <optional>
+#include <time.h>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/filtered.hpp>
-#include <service/storage_service.hh>
-#include <db/commitlog/commitlog.hh>
-#include <gms/gossiper.hh>
-#include <db/system_keyspace.hh>
-#include "http/exception.hh"
+#include <boost/algorithm/string/trim_all.hpp>
+#include "service/storage_service.hh"
+#include "service/load_meter.hh"
+#include "db/commitlog/commitlog.hh"
+#include "gms/gossiper.hh"
+#include "db/system_keyspace.hh"
+#include "seastar/http/exception.hh"
 #include "repair/repair.hh"
 #include "locator/snitch_base.hh"
 #include "column_family.hh"
 #include "log.hh"
 #include "release.hh"
 #include "sstables/compaction_manager.hh"
+#include "sstables/sstables.hh"
+#include "database.hh"
+#include "db/extensions.hh"
+#include "db/snapshot-ctl.hh"
+#include "transport/controller.hh"
+#include "thrift/controller.hh"
+#include "locator/token_metadata.hh"
 
 namespace api {
+
+const locator::token_metadata& http_context::get_token_metadata() {
+        return *shared_token_metadata.local().get();
+}
 
 namespace ss = httpd::storage_service_json;
 using namespace json;
@@ -48,27 +64,195 @@ static sstring validate_keyspace(http_context& ctx, const parameters& param) {
     throw bad_param_exception("Keyspace " + param["keyspace"] + " Does not exist");
 }
 
-
-static std::vector<ss::token_range> describe_ring(const sstring& keyspace) {
-    std::vector<ss::token_range> res;
-    for (auto d : service::get_local_storage_service().describe_ring(keyspace)) {
-        ss::token_range r;
-        r.start_token = d._start_token;
-        r.end_token = d._end_token;
-        r.endpoints = d._endpoints;
-        r.rpc_endpoints = d._rpc_endpoints;
-        for (auto det : d._endpoint_details) {
-            ss::endpoint_detail ed;
-            ed.host = det._host;
-            ed.datacenter = det._datacenter;
-            if (det._rack != "") {
-                ed.rack = det._rack;
-            }
-            r.endpoint_details.push(ed);
+static ss::token_range token_range_endpoints_to_json(const dht::token_range_endpoints& d) {
+    ss::token_range r;
+    r.start_token = d._start_token;
+    r.end_token = d._end_token;
+    r.endpoints = d._endpoints;
+    r.rpc_endpoints = d._rpc_endpoints;
+    for (auto det : d._endpoint_details) {
+        ss::endpoint_detail ed;
+        ed.host = det._host;
+        ed.datacenter = det._datacenter;
+        if (det._rack != "") {
+            ed.rack = det._rack;
         }
-        res.push_back(r);
+        r.endpoint_details.push(ed);
     }
-    return res;
+    return r;
+}
+
+using ks_cf_func = std::function<future<json::json_return_type>(http_context&, std::unique_ptr<request>, sstring, std::vector<sstring>)>;
+
+static auto wrap_ks_cf(http_context &ctx, ks_cf_func f) {
+    return [&ctx, f = std::move(f)](std::unique_ptr<request> req) {
+        auto keyspace = validate_keyspace(ctx, req->param);
+        auto column_families = split_cf(req->get_query_param("cf"));
+        if (column_families.empty()) {
+            column_families = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
+        }
+        return f(ctx, std::move(req), std::move(keyspace), std::move(column_families));
+    };
+}
+
+future<json::json_return_type> set_tables_autocompaction(http_context& ctx, const sstring &keyspace, std::vector<sstring> tables, bool enabled) {
+    if (tables.empty()) {
+        tables = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
+    }
+
+    return service::get_local_storage_service().set_tables_autocompaction(keyspace, tables, enabled).then([]{
+        return make_ready_future<json::json_return_type>(json_void());
+    });
+}
+
+void set_transport_controller(http_context& ctx, routes& r, cql_transport::controller& ctl) {
+    ss::start_native_transport.set(r, [&ctl](std::unique_ptr<request> req) {
+        return ctl.start_server().then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::stop_native_transport.set(r, [&ctl](std::unique_ptr<request> req) {
+        return ctl.stop_server().then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::is_native_transport_running.set(r, [&ctl] (std::unique_ptr<request> req) {
+        return ctl.is_server_running().then([] (bool running) {
+            return make_ready_future<json::json_return_type>(running);
+        });
+    });
+}
+
+void unset_transport_controller(http_context& ctx, routes& r) {
+    ss::start_native_transport.unset(r);
+    ss::stop_native_transport.unset(r);
+    ss::is_native_transport_running.unset(r);
+}
+
+void set_rpc_controller(http_context& ctx, routes& r, thrift_controller& ctl) {
+    ss::stop_rpc_server.set(r, [&ctl](std::unique_ptr<request> req) {
+        return ctl.stop_server().then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::start_rpc_server.set(r, [&ctl](std::unique_ptr<request> req) {
+        return ctl.start_server().then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::is_rpc_server_running.set(r, [&ctl] (std::unique_ptr<request> req) {
+        return ctl.is_server_running().then([] (bool running) {
+            return make_ready_future<json::json_return_type>(running);
+        });
+    });
+}
+
+void unset_rpc_controller(http_context& ctx, routes& r) {
+    ss::stop_rpc_server.unset(r);
+    ss::start_rpc_server.unset(r);
+    ss::is_rpc_server_running.unset(r);
+}
+
+void set_repair(http_context& ctx, routes& r, sharded<netw::messaging_service>& ms) {
+    ss::repair_async.set(r, [&ctx, &ms](std::unique_ptr<request> req) {
+        static std::vector<sstring> options = {"primaryRange", "parallelism", "incremental",
+                "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "trace",
+                "startToken", "endToken" };
+        std::unordered_map<sstring, sstring> options_map;
+        for (auto o : options) {
+            auto s = req->get_query_param(o);
+            if (s != "") {
+                options_map[o] = s;
+            }
+        }
+
+        // The repair process is asynchronous: repair_start only starts it and
+        // returns immediately, not waiting for the repair to finish. The user
+        // then has other mechanisms to track the ongoing repair's progress,
+        // or stop it.
+        return repair_start(ctx.db, ms, validate_keyspace(ctx, req->param),
+                options_map).then([] (int i) {
+                    return make_ready_future<json::json_return_type>(i);
+                });
+    });
+
+    ss::get_active_repair_async.set(r, [&ctx](std::unique_ptr<request> req) {
+        return get_active_repairs(ctx.db).then([] (std::vector<int> res){
+            return make_ready_future<json::json_return_type>(res);
+        });
+    });
+
+    ss::repair_async_status.set(r, [&ctx](std::unique_ptr<request> req) {
+        return repair_get_status(ctx.db, boost::lexical_cast<int>( req->get_query_param("id")))
+                .then_wrapped([] (future<repair_status>&& fut) {
+            ss::ns_repair_async_status::return_type_wrapper res;
+            try {
+                res = fut.get0();
+            } catch(std::runtime_error& e) {
+                throw httpd::bad_param_exception(e.what());
+            }
+            return make_ready_future<json::json_return_type>(json::json_return_type(res));
+        });
+    });
+
+    ss::repair_await_completion.set(r, [&ctx](std::unique_ptr<request> req) {
+        int id;
+        using clock = std::chrono::steady_clock;
+        clock::time_point expire;
+        try {
+            id = boost::lexical_cast<int>(req->get_query_param("id"));
+            // If timeout is not provided, it means no timeout.
+            sstring s = req->get_query_param("timeout");
+            int64_t timeout = s.empty() ? int64_t(-1) : boost::lexical_cast<int64_t>(s);
+            if (timeout < 0 && timeout != -1) {
+                return make_exception_future<json::json_return_type>(
+                        httpd::bad_param_exception("timeout can only be -1 (means no timeout) or non negative integer"));
+            }
+            if (timeout < 0) {
+                expire = clock::time_point::max();
+            } else {
+                expire = clock::now() + std::chrono::seconds(timeout);
+            }
+        } catch (std::exception& e) {
+            return make_exception_future<json::json_return_type>(httpd::bad_param_exception(e.what()));
+        }
+        return repair_await_completion(ctx.db, id, expire)
+                .then_wrapped([] (future<repair_status>&& fut) {
+            ss::ns_repair_async_status::return_type_wrapper res;
+            try {
+                res = fut.get0();
+            } catch (std::exception& e) {
+                return make_exception_future<json::json_return_type>(httpd::server_error_exception(e.what()));
+            }
+            return make_ready_future<json::json_return_type>(json::json_return_type(res));
+        });
+    });
+
+    ss::force_terminate_all_repair_sessions.set(r, [](std::unique_ptr<request> req) {
+        return repair_abort_all(service::get_local_storage_service().db()).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::force_terminate_all_repair_sessions_new.set(r, [](std::unique_ptr<request> req) {
+        return repair_abort_all(service::get_local_storage_service().db()).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+}
+
+void unset_repair(http_context& ctx, routes& r) {
+    ss::repair_async.unset(r);
+    ss::get_active_repair_async.unset(r);
+    ss::repair_async_status.unset(r);
+    ss::repair_await_completion.unset(r);
+    ss::force_terminate_all_repair_sessions.unset(r);
+    ss::force_terminate_all_repair_sessions_new.unset(r);
 }
 
 void set_storage_service(http_context& ctx, routes& r) {
@@ -78,15 +262,17 @@ void set_storage_service(http_context& ctx, routes& r) {
         });
     });
 
-    ss::get_tokens.set(r, [] (const_req req) {
-        auto tokens = service::get_local_storage_service().get_token_metadata().sorted_tokens();
-        return container_to_vec(tokens);
+    ss::get_tokens.set(r, [&ctx] (std::unique_ptr<request> req) {
+        return make_ready_future<json::json_return_type>(stream_range_as_array(ctx.get_token_metadata().sorted_tokens(), [](const dht::token& i) {
+           return boost::lexical_cast<std::string>(i);
+        }));
     });
 
-    ss::get_node_tokens.set(r, [] (const_req req) {
-        gms::inet_address addr(req.param["endpoint"]);
-        auto tokens = service::get_local_storage_service().get_token_metadata().get_tokens(addr);
-        return container_to_vec(tokens);
+    ss::get_node_tokens.set(r, [&ctx] (std::unique_ptr<request> req) {
+        gms::inet_address addr(req->param["endpoint"]);
+        return make_ready_future<json::json_return_type>(stream_range_as_array(ctx.get_token_metadata().get_tokens(addr), [](const dht::token& i) {
+           return boost::lexical_cast<std::string>(i);
+       }));
     });
 
     ss::get_commitlog.set(r, [&ctx](const_req req) {
@@ -102,21 +288,17 @@ void set_storage_service(http_context& ctx, routes& r) {
         }));
     });
 
-    ss::get_leaving_nodes.set(r, [](const_req req) {
-        return container_to_vec(service::get_local_storage_service().get_token_metadata().get_leaving_endpoints());
+    ss::get_leaving_nodes.set(r, [&ctx](const_req req) {
+        return container_to_vec(ctx.get_token_metadata().get_leaving_endpoints());
     });
 
     ss::get_moving_nodes.set(r, [](const_req req) {
-        auto points = service::get_local_storage_service().get_token_metadata().get_moving_endpoints();
         std::unordered_set<sstring> addr;
-        for (auto i: points) {
-            addr.insert(boost::lexical_cast<std::string>(i.second));
-        }
         return container_to_vec(addr);
     });
 
-    ss::get_joining_nodes.set(r, [](const_req req) {
-        auto points = service::get_local_storage_service().get_token_metadata().get_bootstrap_tokens();
+    ss::get_joining_nodes.set(r, [&ctx](const_req req) {
+        auto points = ctx.get_token_metadata().get_bootstrap_tokens();
         std::unordered_set<sstring> addr;
         for (auto i: points) {
             addr.insert(boost::lexical_cast<std::string>(i.second));
@@ -144,11 +326,26 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
     ss::get_range_to_endpoint_map.set(r, [&ctx](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
         auto keyspace = validate_keyspace(ctx, req->param);
         std::vector<ss::maplist_mapper> res;
-        return make_ready_future<json::json_return_type>(res);
+        return make_ready_future<json::json_return_type>(stream_range_as_array(service::get_local_storage_service().get_range_to_address_map(keyspace),
+                [](const std::pair<dht::token_range, std::vector<gms::inet_address>>& entry){
+            ss::maplist_mapper m;
+            if (entry.first.start()) {
+                m.key.push(entry.first.start().value().value().to_sstring());
+            } else {
+                m.key.push("");
+            }
+            if (entry.first.end()) {
+                m.key.push(entry.first.end().value().value().to_sstring());
+            } else {
+                m.key.push("");
+            }
+            for (const gms::inet_address& address : entry.second) {
+                m.value.push(address.to_sstring());
+            }
+            return m;
+        }));
     });
 
     ss::get_pending_range_to_endpoint_map.set(r, [&ctx](std::unique_ptr<request> req) {
@@ -159,27 +356,26 @@ void set_storage_service(http_context& ctx, routes& r) {
         return make_ready_future<json::json_return_type>(res);
     });
 
-    ss::describe_any_ring.set(r, [&ctx](const_req req) {
-        return describe_ring("");
+    ss::describe_any_ring.set(r, [&ctx](std::unique_ptr<request> req) {
+        return make_ready_future<json::json_return_type>(stream_range_as_array(service::get_local_storage_service().describe_ring(""), token_range_endpoints_to_json));
     });
 
-    ss::describe_ring.set(r, [&ctx](const_req req) {
-        auto keyspace = validate_keyspace(ctx, req.param);
-        return describe_ring(keyspace);
+    ss::describe_ring.set(r, [&ctx](std::unique_ptr<request> req) {
+        auto keyspace = validate_keyspace(ctx, req->param);
+        return make_ready_future<json::json_return_type>(stream_range_as_array(service::get_local_storage_service().describe_ring(keyspace), token_range_endpoints_to_json));
     });
 
-    ss::get_host_id_map.set(r, [](const_req req) {
+    ss::get_host_id_map.set(r, [&ctx](const_req req) {
         std::vector<ss::mapper> res;
-        return map_to_key_value(service::get_local_storage_service().
-                get_token_metadata().get_endpoint_to_host_id_map_for_reading(), res);
+        return map_to_key_value(ctx.get_token_metadata().get_endpoint_to_host_id_map_for_reading(), res);
     });
 
     ss::get_load.set(r, [&ctx](std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &column_family::stats::live_disk_space_used);
+        return get_cf_stats(ctx, &column_family_stats::live_disk_space_used);
     });
 
-    ss::get_load_map.set(r, [] (std::unique_ptr<request> req) {
-        return service::get_local_storage_service().get_load_map().then([] (auto&& load_map) {
+    ss::get_load_map.set(r, [&ctx] (std::unique_ptr<request> req) {
+        return ctx.lmeter.get_load_map().then([] (auto&& load_map) {
             std::vector<ss::map_string_double> res;
             for (auto i : load_map) {
                 ss::map_string_double val;
@@ -204,61 +400,9 @@ void set_storage_service(http_context& ctx, routes& r) {
                 req.get_query_param("key")));
     });
 
-    ss::get_snapshot_details.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().get_snapshot_details().then([] (auto result) {
-            std::vector<ss::snapshots> res;
-            for (auto& map: result) {
-                ss::snapshots all_snapshots;
-                all_snapshots.key = map.first;
-
-                std::vector<ss::snapshot> snapshot;
-                for (auto& cf: map.second) {
-                    ss::snapshot s;
-                    s.ks = cf.ks;
-                    s.cf = cf.cf;
-                    s.live = cf.live;
-                    s.total = cf.total;
-                    snapshot.push_back(std::move(s));
-                }
-                all_snapshots.value = std::move(snapshot);
-                res.push_back(std::move(all_snapshots));
-            }
-            return make_ready_future<json::json_return_type>(std::move(res));
-        });
-    });
-
-    ss::take_snapshot.set(r, [](std::unique_ptr<request> req) {
-        auto tag = req->get_query_param("tag");
-        auto column_family = req->get_query_param("cf");
-
-        std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
-
-        auto resp = make_ready_future<>();
-        if (column_family.empty()) {
-            resp = service::get_local_storage_service().take_snapshot(tag, keynames);
-        } else {
-            if (keynames.size() > 1) {
-                throw httpd::bad_param_exception("Only one keyspace allowed when specifying a column family");
-            }
-            resp = service::get_local_storage_service().take_column_family_snapshot(keynames[0], column_family, tag);
-        }
-        return resp.then([] {
+    ss::cdc_streams_check_and_repair.set(r, [&ctx] (std::unique_ptr<request> req) {
+        return service::get_local_storage_service().check_and_repair_cdc_streams().then([] {
             return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::del_snapshot.set(r, [](std::unique_ptr<request> req) {
-        auto tag = req->get_query_param("tag");
-
-        std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
-        return service::get_local_storage_service().clear_snapshot(tag, keynames).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::true_snapshots_size.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().true_snapshots_size().then([] (int64_t size) {
-            return make_ready_future<json::json_return_type>(size);
         });
     });
 
@@ -287,38 +431,40 @@ void set_storage_service(http_context& ctx, routes& r) {
         if (column_families.empty()) {
             column_families = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
         }
-        return ctx.db.invoke_on_all([keyspace, column_families] (database& db) {
-            std::vector<column_family*> column_families_vec;
-            auto& cm = db.get_compaction_manager();
-            for (auto cf : column_families) {
-                column_families_vec.push_back(&db.find_column_family(keyspace, cf));
+        return service::get_local_storage_service().is_cleanup_allowed(keyspace).then([&ctx, keyspace,
+                column_families = std::move(column_families)] (bool is_cleanup_allowed) mutable {
+            if (!is_cleanup_allowed) {
+                return make_exception_future<json::json_return_type>(
+                        std::runtime_error("Can not perform cleanup operation when topology changes"));
             }
-            return parallel_for_each(column_families_vec, [&cm] (column_family* cf) {
-                return cm.perform_cleanup(cf);
+            return ctx.db.invoke_on_all([keyspace, column_families] (database& db) {
+                std::vector<column_family*> column_families_vec;
+                auto& cm = db.get_compaction_manager();
+                for (auto cf : column_families) {
+                    column_families_vec.push_back(&db.find_column_family(keyspace, cf));
+                }
+                return parallel_for_each(column_families_vec, [&cm, &db] (column_family* cf) {
+                    return cm.perform_cleanup(db, cf);
+                });
+            }).then([]{
+                return make_ready_future<json::json_return_type>(0);
+            });
+        });
+    });
+
+    ss::upgrade_sstables.set(r, wrap_ks_cf(ctx, [] (http_context& ctx, std::unique_ptr<request> req, sstring keyspace, std::vector<sstring> column_families) {
+        bool exclude_current_version = req_param<bool>(*req, "exclude_current_version", false);
+
+        return ctx.db.invoke_on_all([=] (database& db) {
+            return do_for_each(column_families, [=, &db](sstring cfname) {
+                auto& cm = db.get_compaction_manager();
+                auto& cf = db.find_column_family(keyspace, cfname);
+                return cm.perform_sstable_upgrade(db, &cf, exclude_current_version);
             });
         }).then([]{
             return make_ready_future<json::json_return_type>(0);
         });
-    });
-
-    ss::scrub.set(r, [&ctx](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_family = req->get_query_param("cf");
-        auto disable_snapshot = req->get_query_param("disable_snapshot");
-        auto skip_corrupted = req->get_query_param("skip_corrupted");
-        return make_ready_future<json::json_return_type>(json_void());
-    });
-
-    ss::upgrade_sstables.set(r, [&ctx](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_family = req->get_query_param("cf");
-        auto exclude_current_version = req->get_query_param("exclude_current_version");
-        return make_ready_future<json::json_return_type>(json_void());
-    });
+    }));
 
     ss::force_keyspace_flush.set(r, [&ctx](std::unique_ptr<request> req) {
         auto keyspace = validate_keyspace(ctx, req->param);
@@ -336,59 +482,6 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
 
-    ss::repair_async.set(r, [&ctx](std::unique_ptr<request> req) {
-        static std::vector<sstring> options = {"primaryRange", "parallelism", "incremental",
-                "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "trace",
-                "startToken", "endToken" };
-        std::unordered_map<sstring, sstring> options_map;
-        for (auto o : options) {
-            auto s = req->get_query_param(o);
-            if (s != "") {
-                options_map[o] = s;
-            }
-        }
-
-        // The repair process is asynchronous: repair_start only starts it and
-        // returns immediately, not waiting for the repair to finish. The user
-        // then has other mechanisms to track the ongoing repair's progress,
-        // or stop it.
-        return repair_start(ctx.db, validate_keyspace(ctx, req->param),
-                options_map).then([] (int i) {
-                    return make_ready_future<json::json_return_type>(i);
-                });
-    });
-
-    ss::get_active_repair_async.set(r, [&ctx](std::unique_ptr<request> req) {
-        return get_active_repairs(ctx.db).then([] (std::vector<int> res){
-            return make_ready_future<json::json_return_type>(res);
-        });
-    });
-
-    ss::repair_async_status.set(r, [&ctx](std::unique_ptr<request> req) {
-        return repair_get_status(ctx.db, boost::lexical_cast<int>( req->get_query_param("id")))
-                .then_wrapped([] (future<repair_status>&& fut) {
-            ss::ns_repair_async_status::return_type_wrapper res;
-            try {
-                res = fut.get0();
-            } catch(std::runtime_error& e) {
-                throw httpd::bad_param_exception(e.what());
-            }
-            return make_ready_future<json::json_return_type>(json::json_return_type(res));
-        });
-    });
-
-    ss::force_terminate_all_repair_sessions.set(r, [](std::unique_ptr<request> req) {
-        return repair_abort_all(service::get_local_storage_service().db()).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::force_terminate_all_repair_sessions_new.set(r, [](std::unique_ptr<request> req) {
-        return repair_abort_all(service::get_local_storage_service().db()).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
     ss::decommission.set(r, [](std::unique_ptr<request> req) {
         return service::get_local_storage_service().decommission().then([] {
             return make_ready_future<json::json_return_type>(json_void());
@@ -404,7 +497,22 @@ void set_storage_service(http_context& ctx, routes& r) {
 
     ss::remove_node.set(r, [](std::unique_ptr<request> req) {
         auto host_id = req->get_query_param("host_id");
-        return service::get_local_storage_service().removenode(host_id).then([] {
+        std::vector<sstring> ignore_nodes_strs= split(req->get_query_param("ignore_nodes"), ",");
+        auto ignore_nodes = std::list<gms::inet_address>();
+        for (std::string n : ignore_nodes_strs) {
+            try {
+                std::replace(n.begin(), n.end(), '\"', ' ');
+                std::replace(n.begin(), n.end(), '\'', ' ');
+                boost::trim_all(n);
+                if (!n.empty()) {
+                    auto node = gms::inet_address(n);
+                    ignore_nodes.push_back(node);
+                }
+            } catch (...) {
+                throw std::runtime_error(format("Failed to parse ignore_nodes parameter: ignore_nodes={}, node={}", ignore_nodes_strs, n));
+            }
+        }
+        return service::get_local_storage_service().removenode(host_id, std::move(ignore_nodes)).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
     });
@@ -456,7 +564,7 @@ void set_storage_service(http_context& ctx, routes& r) {
         return service::get_storage_service().map_reduce(adder<service::storage_service::drain_progress>(), [] (auto& ss) {
             return ss.get_drain_progress();
         }).then([] (auto&& progress) {
-            auto progress_str = sprint("Drained %s/%s ColumnFamilies", progress.remaining_cfs, progress.total_cfs);
+            auto progress_str = format("Drained {}/{} ColumnFamilies", progress.remaining_cfs, progress.total_cfs);
             return make_ready_future<json::json_return_type>(std::move(progress_str));
         });
     });
@@ -524,46 +632,8 @@ void set_storage_service(http_context& ctx, routes& r) {
         });
     });
 
-    ss::stop_rpc_server.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().stop_rpc_server().then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::start_rpc_server.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().start_rpc_server().then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::is_rpc_server_running.set(r, [] (std::unique_ptr<request> req) {
-        return service::get_local_storage_service().is_rpc_server_running().then([] (bool running) {
-            return make_ready_future<json::json_return_type>(running);
-        });
-    });
-
-    ss::start_native_transport.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().start_native_transport().then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::stop_native_transport.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().stop_native_transport().then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::is_native_transport_running.set(r, [] (std::unique_ptr<request> req) {
-        return service::get_local_storage_service().is_native_transport_running().then([] (bool running) {
-            return make_ready_future<json::json_return_type>(running);
-        });
-    });
-
     ss::join_ring.set(r, [](std::unique_ptr<request> req) {
-        return service::get_local_storage_service().join_ring().then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
+        return make_ready_future<json::json_return_type>(json_void());
     });
 
     ss::is_joined.set(r, [] (std::unique_ptr<request> req) {
@@ -667,7 +737,11 @@ void set_storage_service(http_context& ctx, routes& r) {
         auto coordinator = std::hash<sstring>()(cf) % smp::count;
         return service::get_storage_service().invoke_on(coordinator, [ks = std::move(ks), cf = std::move(cf)] (service::storage_service& s) {
             return s.load_new_sstables(ks, cf);
-        }).then([] {
+        }).then_wrapped([] (auto&& f) {
+            if (f.failed()) {
+                auto msg = fmt::format("Failed to load new sstables: {}", f.get_exception());
+                return make_exception_future<json::json_return_type>(httpd::server_error_exception(msg));
+            }
             return make_ready_future<json::json_return_type>(json_void());
         });
     });
@@ -680,14 +754,17 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
     ss::reset_local_schema.set(r, [](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        return make_ready_future<json::json_return_type>(json_void());
+        // FIXME: We should truncate schema tables if more than one node in the cluster.
+        auto& sp = service::get_storage_proxy();
+        auto& fs = service::get_local_storage_service().features();
+        return db::schema_tables::recalculate_schema_version(sp, fs).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
     });
 
     ss::set_trace_probability.set(r, [](std::unique_ptr<request> req) {
         auto probability = req->get_query_param("probability");
-        return futurize<json::json_return_type>::apply([probability] {
+        return futurize_invoke([probability] {
             double real_prob = std::stod(probability.c_str());
             return tracing::tracing::tracing_instance().invoke_on_all([real_prob] (auto& local_tracing) {
                 local_tracing.set_trace_probability(real_prob);
@@ -701,7 +778,7 @@ void set_storage_service(http_context& ctx, routes& r) {
             } catch (std::out_of_range& e) {
                 throw httpd::bad_param_exception(e.what());
             } catch (std::invalid_argument&){
-                throw httpd::bad_param_exception(sprint("Bad format in a probability value: \"%s\"", probability.c_str()));
+                throw httpd::bad_param_exception(format("Bad format in a probability value: \"{}\"", probability.c_str()));
             }
         });
     });
@@ -737,24 +814,22 @@ void set_storage_service(http_context& ctx, routes& r) {
                 return make_ready_future<json::json_return_type>(json_void());
             });
         } catch (...) {
-            throw httpd::bad_param_exception(sprint("Bad format value: "));
+            throw httpd::bad_param_exception(format("Bad format value: "));
         }
     });
 
     ss::enable_auto_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
         auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_family = req->get_query_param("cf");
-        return make_ready_future<json::json_return_type>(json_void());
+        auto tables = split_cf(req->get_query_param("cf"));
+
+        return set_tables_autocompaction(ctx, keyspace, tables, true);
     });
 
     ss::disable_auto_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
         auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_family = req->get_query_param("cf");
-        return make_ready_future<json::json_return_type>(json_void());
+        auto tables = split_cf(req->get_query_param("cf"));
+
+        return set_tables_autocompaction(ctx, keyspace, tables, false);
     });
 
     ss::deliver_hints.set(r, [](std::unique_ptr<request> req) {
@@ -819,7 +894,7 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
     ss::get_metrics_load.set(r, [&ctx](std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &column_family::stats::live_disk_space_used);
+        return get_cf_stats(ctx, &column_family_stats::live_disk_space_used);
     });
 
     ss::get_exceptions.set(r, [](const_req req) {
@@ -861,6 +936,243 @@ void set_storage_service(http_context& ctx, routes& r) {
             return make_ready_future<json::json_return_type>(map_to_key_value(std::move(status), res));
         });
     });
+
+    ss::sstable_info.set(r, [&ctx] (std::unique_ptr<request> req) {
+        auto ks = api::req_param<sstring>(*req, "keyspace", {}).value;
+        auto cf = api::req_param<sstring>(*req, "cf", {}).value;
+
+        // The size of this vector is bound by ks::cf. I.e. it is as most Nks + Ncf long
+        // which is not small, but not huge either. 
+        using table_sstables_list = std::vector<ss::table_sstables>;
+
+        return do_with(table_sstables_list{}, [ks, cf, &ctx](table_sstables_list& dst) {
+            return service::get_local_storage_service().db().map_reduce([&dst](table_sstables_list&& res) {
+                for (auto&& t : res) {
+                    auto i = std::find_if(dst.begin(), dst.end(), [&t](const ss::table_sstables& t2) {
+                        return t.keyspace() == t2.keyspace() && t.table() == t2.table();
+                    });
+                    if (i == dst.end()) {
+                        dst.emplace_back(std::move(t));
+                        continue;
+                    }
+                    auto& ssd = i->sstables; 
+                    for (auto&& sd : t.sstables._elements) {
+                        auto j = std::find_if(ssd._elements.begin(), ssd._elements.end(), [&sd](const ss::sstable& s) {
+                            return s.generation() == sd.generation();
+                        });
+                        if (j == ssd._elements.end()) {
+                            i->sstables.push(std::move(sd));
+                        }
+                    }
+                }
+            }, [ks, cf](const database& db) {
+                // see above
+                table_sstables_list res;
+
+                auto& ext = db.get_config().extensions();
+
+                for (auto& t : db.get_column_families() | boost::adaptors::map_values) {
+                    auto& schema = t->schema();
+                    if ((ks.empty() || ks == schema->ks_name()) && (cf.empty() || cf == schema->cf_name())) {
+                        // at most Nsstables long
+                        ss::table_sstables tst;
+                        tst.keyspace = schema->ks_name();
+                        tst.table = schema->cf_name();
+
+                        for (auto sstable : *t->get_sstables_including_compacted_undeleted()) {
+                            auto ts = db_clock::to_time_t(sstable->data_file_write_time());
+                            ::tm t;
+                            ::gmtime_r(&ts, &t);
+
+                            ss::sstable info;
+
+                            info.timestamp = t;
+                            info.generation = sstable->generation();
+                            info.level = sstable->get_sstable_level();
+                            info.size = sstable->bytes_on_disk();
+                            info.data_size = sstable->ondisk_data_size();
+                            info.index_size = sstable->index_size();
+                            info.filter_size = sstable->filter_size();
+                            info.version = sstable->get_version();
+
+                            if (sstable->has_component(sstables::component_type::CompressionInfo)) {
+                                auto& c = sstable->get_compression();
+                                auto cp = sstables::get_sstable_compressor(c);
+
+                                ss::named_maps nm;
+                                nm.group = "compression_parameters";
+                                for (auto& p : cp->options()) {
+                                    ss::mapper e;
+                                    e.key = p.first;
+                                    e.value = p.second;
+                                    nm.attributes.push(std::move(e));
+                                }
+                                if (!cp->options().contains(compression_parameters::SSTABLE_COMPRESSION)) {
+                                    ss::mapper e;
+                                    e.key = compression_parameters::SSTABLE_COMPRESSION;
+                                    e.value = cp->name();
+                                    nm.attributes.push(std::move(e));
+                                }
+                                info.extended_properties.push(std::move(nm));
+                            }
+
+                            sstables::file_io_extension::attr_value_map map;
+
+                            for (auto* ep : ext.sstable_file_io_extensions()) {
+                                map.merge(ep->get_attributes(*sstable));
+                            }
+
+                            for (auto& p : map) {
+                                struct {
+                                    const sstring& key; 
+                                    ss::sstable& info;
+                                    void operator()(const std::map<sstring, sstring>& map) const {
+                                        ss::named_maps nm;
+                                        nm.group = key;
+                                        for (auto& p : map) {
+                                            ss::mapper e;
+                                            e.key = p.first;
+                                            e.value = p.second;
+                                            nm.attributes.push(std::move(e));
+                                        }
+                                        info.extended_properties.push(std::move(nm));
+                                    }
+                                    void operator()(const sstring& value) const {
+                                        ss::mapper e;
+                                        e.key = key;
+                                        e.value = value;
+                                        info.properties.push(std::move(e));                                        
+                                    }
+                                } v{p.first, info};
+
+                                std::visit(v, p.second);
+                            }
+
+                            tst.sstables.push(std::move(info));
+                        }
+                        res.emplace_back(std::move(tst));
+                    }
+                }
+                std::sort(res.begin(), res.end(), [](const ss::table_sstables& t1, const ss::table_sstables& t2) {
+                    return t1.keyspace() < t2.keyspace() || (t1.keyspace() == t2.keyspace() && t1.table() < t2.table());
+                });
+                return res;
+            }).then([&dst] {
+                return make_ready_future<json::json_return_type>(stream_object(dst));
+            });
+        });
+    });
+
+}
+
+void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_ctl) {
+    ss::get_snapshot_details.set(r, [&snap_ctl](std::unique_ptr<request> req) {
+        return snap_ctl.local().get_snapshot_details().then([] (std::unordered_map<sstring, std::vector<db::snapshot_ctl::snapshot_details>>&& result) {
+            std::function<future<>(output_stream<char>&&)> f = [result = std::move(result)](output_stream<char>&& s) {
+                return do_with(output_stream<char>(std::move(s)), true, [&result] (output_stream<char>& s, bool& first){
+                    return s.write("[").then([&s, &first, &result] {
+                        return do_for_each(result, [&s, &first](std::tuple<sstring, std::vector<db::snapshot_ctl::snapshot_details>>&& map){
+                            return do_with(ss::snapshots(), [&s, &first, &map](ss::snapshots& all_snapshots) {
+                                all_snapshots.key = std::get<0>(map);
+                                future<> f = first ? make_ready_future<>() : s.write(", ");
+                                first = false;
+                                std::vector<ss::snapshot> snapshot;
+                                for (auto& cf: std::get<1>(map)) {
+                                    ss::snapshot snp;
+                                    snp.ks = cf.ks;
+                                    snp.cf = cf.cf;
+                                    snp.live = cf.live;
+                                    snp.total = cf.total;
+                                    snapshot.push_back(std::move(snp));
+                                }
+                                all_snapshots.value = std::move(snapshot);
+                                return f.then([&s, &all_snapshots] {
+                                    return all_snapshots.write(s);
+                                });
+                            });
+                        });
+                    }).then([&s] {
+                        return s.write("]").then([&s] {
+                            return s.close();
+                        });
+                    });
+                });
+            };
+
+            return make_ready_future<json::json_return_type>(std::move(f));
+        });
+    });
+
+    ss::take_snapshot.set(r, [&snap_ctl](std::unique_ptr<request> req) {
+        auto tag = req->get_query_param("tag");
+        auto column_families = split(req->get_query_param("cf"), ",");
+
+        std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
+
+        auto resp = make_ready_future<>();
+        if (column_families.empty()) {
+            resp = snap_ctl.local().take_snapshot(tag, keynames);
+        } else {
+            if (keynames.empty()) {
+                throw httpd::bad_param_exception("The keyspace of column families must be specified");
+            }
+            if (keynames.size() > 1) {
+                throw httpd::bad_param_exception("Only one keyspace allowed when specifying a column family");
+            }
+            resp = snap_ctl.local().take_column_family_snapshot(keynames[0], column_families, tag);
+        }
+        return resp.then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::del_snapshot.set(r, [&snap_ctl](std::unique_ptr<request> req) {
+        auto tag = req->get_query_param("tag");
+        auto column_family = req->get_query_param("cf");
+
+        std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
+        return snap_ctl.local().clear_snapshot(tag, keynames, column_family).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    ss::true_snapshots_size.set(r, [&snap_ctl](std::unique_ptr<request> req) {
+        return snap_ctl.local().true_snapshots_size().then([] (int64_t size) {
+            return make_ready_future<json::json_return_type>(size);
+        });
+    });
+
+    ss::scrub.set(r, wrap_ks_cf(ctx, [&snap_ctl] (http_context& ctx, std::unique_ptr<request> req, sstring keyspace, std::vector<sstring> column_families) {
+        const auto skip_corrupted = req_param<bool>(*req, "skip_corrupted", false);
+
+        auto f = make_ready_future<>();
+        if (!req_param<bool>(*req, "disable_snapshot", false)) {
+            auto tag = format("pre-scrub-{:d}", db_clock::now().time_since_epoch().count());
+            f = parallel_for_each(column_families, [&snap_ctl, keyspace, tag](sstring cf) {
+                return snap_ctl.local().take_column_family_snapshot(keyspace, cf, tag);
+            });
+        }
+
+        return f.then([&ctx, keyspace, column_families, skip_corrupted] {
+            return ctx.db.invoke_on_all([=] (database& db) {
+                return do_for_each(column_families, [=, &db](sstring cfname) {
+                    auto& cm = db.get_compaction_manager();
+                    auto& cf = db.find_column_family(keyspace, cfname);
+                    return cm.perform_sstable_scrub(&cf, skip_corrupted);
+                });
+            });
+        }).then([]{
+            return make_ready_future<json::json_return_type>(0);
+        });
+    }));
+}
+
+void unset_snapshot(http_context& ctx, routes& r) {
+    ss::get_snapshot_details.unset(r);
+    ss::take_snapshot.unset(r);
+    ss::del_snapshot.unset(r);
+    ss::true_snapshots_size.unset(r);
+    ss::scrub.unset(r);
 }
 
 }

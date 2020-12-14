@@ -68,7 +68,7 @@
                "summary":"Get the hinted handoff enabled by dc",
                "type":"array",
                "items":{
-                  "type":"mapper_list"
+                  "type":"array"
                },
                "nickname":"get_hinted_handoff_enabled_by_dc",
                "produces":[
@@ -105,7 +105,7 @@
             {
                "method":"GET",
                "summary":"Get the max hint window",
-               "type":"int",
+               "type": "long",
                "nickname":"get_max_hint_window",
                "produces":[
                   "application/json"
@@ -128,7 +128,7 @@
                      "description":"max hint window in ms",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -141,7 +141,7 @@
             {
                "method":"GET",
                "summary":"Get max hints in progress",
-               "type":"int",
+               "type": "long",
                "nickname":"get_max_hints_in_progress",
                "produces":[
                   "application/json"
@@ -164,7 +164,7 @@
                      "description":"max hints in progress",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -177,7 +177,7 @@
             {
                "method":"GET",
                "summary":"get hints in progress",
-               "type":"int",
+               "type": "long",
                "nickname":"get_hints_in_progress",
                "produces":[
                   "application/json"
@@ -602,7 +602,7 @@
         {
           "method": "GET",
           "summary": "Get cas write metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_cas_write_metrics_unfinished_commit",
           "produces": [
             "application/json"
@@ -632,8 +632,23 @@
         {
           "method": "GET",
           "summary": "Get cas write metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_cas_write_metrics_condition_not_met",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        }
+      ]
+    },
+    {
+      "path": "/storage_proxy/metrics/cas_write/failed_read_round_optimization",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get cas write metrics",
+          "type": "long",
+          "nickname": "get_cas_write_metrics_failed_read_round_optimization",
           "produces": [
             "application/json"
           ],
@@ -647,7 +662,7 @@
         {
           "method": "GET",
           "summary": "Get cas read metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_cas_read_metrics_unfinished_commit",
           "produces": [
             "application/json"
@@ -672,27 +687,12 @@
       ]
     },
     {
-      "path": "/storage_proxy/metrics/cas_read/condition_not_met",
-      "operations": [
-        {
-          "method": "GET",
-          "summary": "Get cas read metrics",
-          "type": "int",
-          "nickname": "get_cas_read_metrics_condition_not_met",
-          "produces": [
-            "application/json"
-          ],
-          "parameters": []
-        }
-      ]
-    },
-    {
       "path": "/storage_proxy/metrics/read/timeouts",
       "operations": [
         {
           "method": "GET",
           "summary": "Get read metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_read_metrics_timeouts",
           "produces": [
             "application/json"
@@ -707,7 +707,7 @@
         {
           "method": "GET",
           "summary": "Get read metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_read_metrics_unavailables",
           "produces": [
             "application/json"
@@ -792,6 +792,36 @@
       ]
     },
     {
+      "path": "/storage_proxy/metrics/cas_read/moving_average_histogram",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get CAS read rate and latency histogram",
+          "$ref": "#/utils/rate_moving_average_and_histogram",
+          "nickname": "get_cas_read_metrics_latency_histogram",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        }
+      ]
+    },
+    {
+      "path": "/storage_proxy/metrics/view_write/moving_average_histogram",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get view write rate and latency histogram",
+          "$ref": "#/utils/rate_moving_average_and_histogram",
+          "nickname": "get_view_write_metrics_latency_histogram",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        }
+      ]
+    },
+    {
       "path": "/storage_proxy/metrics/range/moving_average_histogram",
       "operations": [
         {
@@ -812,7 +842,7 @@
         {
           "method": "GET",
           "summary": "Get range metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_range_metrics_timeouts",
           "produces": [
             "application/json"
@@ -827,7 +857,7 @@
         {
           "method": "GET",
           "summary": "Get range metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_range_metrics_unavailables",
           "produces": [
             "application/json"
@@ -872,7 +902,7 @@
         {
           "method": "GET",
           "summary": "Get write metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_write_metrics_timeouts",
           "produces": [
             "application/json"
@@ -887,7 +917,7 @@
         {
           "method": "GET",
           "summary": "Get write metrics",
-          "type": "int",
+          "type": "long",
           "nickname": "get_write_metrics_unavailables",
           "produces": [
             "application/json"
@@ -957,6 +987,21 @@
       ]
     },
     {
+      "path": "/storage_proxy/metrics/cas_write/moving_average_histogram",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get CAS write rate and latency histogram",
+          "$ref": "#/utils/rate_moving_average_and_histogram",
+          "nickname": "get_cas_write_metrics_latency_histogram",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        }
+      ]
+    },
+    {
          "path":"/storage_proxy/metrics/read/estimated_histogram/",
          "operations":[
             {
@@ -978,7 +1023,7 @@
             {
                "method":"GET",
                "summary":"Get read latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_read_latency",
                "produces":[
                   "application/json"
@@ -1010,7 +1055,7 @@
             {
                "method":"GET",
                "summary":"Get write latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_write_latency",
                "produces":[
                   "application/json"
@@ -1042,7 +1087,7 @@
             {
                "method":"GET",
                "summary":"Get range latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_range_latency",
                "produces":[
                   "application/json"

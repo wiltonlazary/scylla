@@ -63,27 +63,27 @@ public:
                 : _column_name(std::move(column_name)), _idx(idx), _is_writetime(is_writetime) {
             }
 
-            virtual sstring column_name() override {
-                return sprint("%s(%s)", _is_writetime ? "writetime" : "ttl", _column_name);
+            virtual sstring column_name() const override {
+                return format("{}({})", _is_writetime ? "writetime" : "ttl", _column_name);
             }
 
-            virtual data_type get_return_type() override {
+            virtual data_type get_return_type() const override {
                 return _is_writetime ? long_type : int32_type;
             }
 
-            virtual shared_ptr<selector> new_instance() override {
-                return make_shared<writetime_or_ttl_selector>(_column_name, _idx, _is_writetime);
+            virtual shared_ptr<selector> new_instance() const override {
+                return ::make_shared<writetime_or_ttl_selector>(_column_name, _idx, _is_writetime);
             }
 
-            virtual bool is_write_time_selector_factory() override {
+            virtual bool is_write_time_selector_factory() const override {
                 return _is_writetime;
             }
 
-            virtual bool is_ttl_selector_factory() override {
+            virtual bool is_ttl_selector_factory() const override {
                 return !_is_writetime;
             }
         };
-        return make_shared<wtots_factory>(std::move(column_name), idx, is_writetime);
+        return ::make_shared<wtots_factory>(std::move(column_name), idx, is_writetime);
     }
 
     virtual void add_input(cql_serialization_format sf, result_set_builder& rs) override {
@@ -94,7 +94,7 @@ public:
                 auto i = _current->begin();
                 serialize_int64(i, ts);
             } else {
-                _current = std::experimental::nullopt;
+                _current = std::nullopt;
             }
         } else {
             int ttl = rs.ttl_of(_idx);
@@ -103,7 +103,7 @@ public:
                 auto i = _current->begin();
                 serialize_int32(i, ttl);
             } else {
-                _current = std::experimental::nullopt;
+                _current = std::nullopt;
             }
         }
     }
@@ -113,10 +113,10 @@ public:
     }
 
     virtual void reset() override {
-        _current = std::experimental::nullopt;
+        _current = std::nullopt;
     }
 
-    virtual data_type get_type() override {
+    virtual data_type get_type() const override {
         return _is_writetime ? long_type : int32_type;
     }
 

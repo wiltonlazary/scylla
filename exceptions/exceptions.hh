@@ -44,8 +44,8 @@
 #include "db/consistency_level_type.hh"
 #include "db/write_type.hh"
 #include <stdexcept>
-#include "core/sstring.hh"
-#include "core/print.hh"
+#include <seastar/core/sstring.hh>
+#include <seastar/core/print.hh>
 #include "bytes.hh"
 
 namespace exceptions {
@@ -62,9 +62,11 @@ enum class exception_code : int32_t {
     IS_BOOTSTRAPPING= 0x1002,
     TRUNCATE_ERROR  = 0x1003,
     WRITE_TIMEOUT   = 0x1100,
-    WRITE_FAILURE   = 0x1500,
     READ_TIMEOUT    = 0x1200,
     READ_FAILURE    = 0x1300,
+    FUNCTION_FAILURE= 0x1400,
+    WRITE_FAILURE   = 0x1500,
+    CDC_WRITE_FAILURE = 0x1600,
 
     // 2xx: problem validating the request
     SYNTAX_ERROR    = 0x2000,
@@ -74,6 +76,8 @@ enum class exception_code : int32_t {
     ALREADY_EXISTS  = 0x2400,
     UNPREPARED      = 0x2500
 };
+
+const std::unordered_map<exception_code, sstring>& exception_map();
 
 class cassandra_exception : public std::exception {
 private:
@@ -93,9 +97,16 @@ public:
         : _code(code)
         , _msg(std::move(msg))
     { }
-    virtual const char* what() const noexcept override { return _msg.begin(); }
+    virtual const char* what() const noexcept override { return _msg.c_str(); }
     exception_code code() const { return _code; }
     sstring get_message() const { return what(); }
+};
+
+class server_exception : public cassandra_exception {
+public:
+    server_exception(sstring msg) noexcept
+        : exceptions::cassandra_exception{exceptions::exception_code::SERVER_ERROR, std::move(msg)}
+    { }
 };
 
 class protocol_exception : public cassandra_exception {
@@ -110,11 +121,17 @@ struct unavailable_exception : cassandra_exception {
     int32_t required;
     int32_t alive;
 
-    unavailable_exception(db::consistency_level cl, int32_t required, int32_t alive) noexcept
-        : exceptions::cassandra_exception(exceptions::exception_code::UNAVAILABLE, prepare_message("Cannot achieve consistency level for cl %s. Requires %ld, alive %ld", cl, required, alive))
+
+    unavailable_exception(sstring msg, db::consistency_level cl, int32_t required, int32_t alive) noexcept
+        : exceptions::cassandra_exception(exceptions::exception_code::UNAVAILABLE, std::move(msg))
         , consistency(cl)
         , required(required)
         , alive(alive)
+    {}
+
+    unavailable_exception(db::consistency_level cl, int32_t required, int32_t alive) noexcept
+        : unavailable_exception(prepare_message("Cannot achieve consistency level for cl %s. Requires %ld, alive %ld", cl, required, alive),
+                cl, required, alive)
     {}
 };
 
@@ -178,6 +195,14 @@ protected:
         , failures{failures_}
         , block_for{block_for_}
     {}
+
+    request_failure_exception(exception_code code, const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_) noexcept
+        : cassandra_exception{code, msg}
+        , consistency{consistency_}
+        , received{received_}
+        , failures{failures_}
+        , block_for{block_for_}
+    {}
 };
 
 struct mutation_write_failure_exception : public request_failure_exception {
@@ -195,11 +220,18 @@ struct read_failure_exception : public request_failure_exception {
         : request_failure_exception{exception_code::READ_FAILURE, ks, cf, consistency_, received_, failures_, block_for_}
         , data_present{data_present_}
     { }
+
+    read_failure_exception(const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, bool data_present_) noexcept
+        : request_failure_exception{exception_code::READ_FAILURE, msg, consistency_, received_, failures_, block_for_}
+        , data_present{data_present_}
+    { }
 };
 
 struct overloaded_exception : public cassandra_exception {
-    overloaded_exception(size_t c) noexcept :
+    explicit overloaded_exception(size_t c) noexcept :
         cassandra_exception(exception_code::OVERLOADED, prepare_message("Too many in flight hints: %lu", c)) {}
+    explicit overloaded_exception(sstring msg) noexcept :
+        cassandra_exception(exception_code::OVERLOADED, std::move(msg)) {}
 };
 
 class request_validation_exception : public cassandra_exception {
@@ -239,6 +271,13 @@ class keyspace_not_defined_exception : public invalid_request_exception {
 public:
     keyspace_not_defined_exception(std::string cause) noexcept
         : invalid_request_exception(std::move(cause))
+    { }
+};
+
+class overflow_error_exception : public invalid_request_exception {
+public:
+    overflow_error_exception(std::string msg) noexcept
+        : invalid_request_exception(std::move(msg))
     { }
 };
 
@@ -282,11 +321,11 @@ private:
     { }
 public:
     already_exists_exception(sstring ks_name_, sstring cf_name_)
-        : already_exists_exception{ks_name_, cf_name_, sprint("Cannot add already existing table \"%s\" to keyspace \"%s\"", cf_name_, ks_name_)}
+        : already_exists_exception{ks_name_, cf_name_, format("Cannot add already existing table \"{}\" to keyspace \"{}\"", cf_name_, ks_name_)}
     { }
 
     already_exists_exception(sstring ks_name_)
-        : already_exists_exception{ks_name_, "", sprint("Cannot add existing keyspace \"%s\"", ks_name_)}
+        : already_exists_exception{ks_name_, "", format("Cannot add existing keyspace \"{}\"", ks_name_)}
     { }
 };
 

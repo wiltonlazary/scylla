@@ -39,12 +39,13 @@
  */
 
 #include <seastar/net/dns.hh>
+#include <seastar/core/seastar.hh>
 #include "locator/gce_snitch.hh"
 
 namespace locator {
 
 gce_snitch::gce_snitch(const sstring& fname, unsigned io_cpuid, const sstring& meta_server_url) : production_snitch_base(fname) {
-    if (engine().cpu_id() == io_cpuid) {
+    if (this_shard_id() == io_cpuid) {
         io_cpu_id() = io_cpuid;
         _meta_server_url = std::move(meta_server_url);
     }
@@ -58,7 +59,7 @@ gce_snitch::gce_snitch(const sstring& fname, unsigned io_cpuid, const sstring& m
 future<> gce_snitch::load_config() {
     using namespace boost::algorithm;
 
-    if (engine().cpu_id() == io_cpu_id()) {
+    if (this_shard_id() == io_cpu_id()) {
         sstring meta_server_url(GCE_QUERY_SERVER_ADDR);
         if (!_meta_server_url.empty()) {
             meta_server_url = _meta_server_url;
@@ -66,7 +67,7 @@ future<> gce_snitch::load_config() {
 
         return gce_api_call(std::move(meta_server_url), ZONE_NAME_QUERY_REQ).then([this, meta_server_url] (sstring az) {
             if (az.empty()) {
-                return make_exception_future(std::runtime_error(sprint("Got an empty zone name from the GCE meta server %s", meta_server_url)));
+                return make_exception_future(std::runtime_error(format("Got an empty zone name from the GCE meta server {}", meta_server_url)));
             }
 
             std::vector<std::string> splits;
@@ -74,7 +75,7 @@ future<> gce_snitch::load_config() {
             // Split "us-central1-a" or "asia-east1-a" into "us-central1"/"a" and "asia-east1"/"a".
             split(splits, az, is_any_of("-"));
             if (splits.size() <= 1) {
-                return make_exception_future(std::runtime_error(sprint("Bad GCE zone format: %s", az)));
+                return make_exception_future(std::runtime_error(format("Bad GCE zone format: {}", az)));
             }
 
             _my_rack = splits[splits.size() - 1];
@@ -86,7 +87,7 @@ future<> gce_snitch::load_config() {
 
                 return _my_distributed->invoke_on_all([this] (snitch_ptr& local_s) {
                     // Distribute the new values on all CPUs but the current one
-                    if (engine().cpu_id() != io_cpu_id()) {
+                    if (this_shard_id() != io_cpu_id()) {
                         local_s->set_my_dc(_my_dc);
                         local_s->set_my_rack(_my_rack);
                     }
@@ -111,7 +112,7 @@ future<sstring> gce_snitch::gce_api_call(sstring addr, sstring cmd) {
         using namespace boost::algorithm;
 
         net::inet_address a = seastar::net::dns::resolve_name(addr, net::inet_address::family::INET).get0();
-        connected_socket sd(connect(make_ipv4_address(ipv4_addr(a, 80))).get0());
+        connected_socket sd(connect(socket_address(a, 80)).get0());
         input_stream<char> in(sd.input());
         output_stream<char> out(sd.output());
         sstring zone_req(seastar::format("GET {} HTTP/1.1\r\nHost: metadata\r\nMetadata-Flavor: Google\r\n\r\n", cmd));
@@ -155,7 +156,7 @@ future<sstring> gce_snitch::read_property_file() {
     return load_property_file().then([this] {
         sstring dc_suffix;
 
-        if (_prop_values.count(dc_suffix_property_key)) {
+        if (_prop_values.contains(dc_suffix_property_key)) {
             dc_suffix = _prop_values[dc_suffix_property_key];
         }
 

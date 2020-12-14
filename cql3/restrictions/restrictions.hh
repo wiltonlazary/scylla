@@ -46,8 +46,9 @@
 
 #include "cql3/query_options.hh"
 #include "types.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "index/secondary_index_manager.hh"
+#include "restriction.hh"
 
 namespace cql3 {
 
@@ -66,16 +67,9 @@ public:
      */
     virtual std::vector<const column_definition*> get_column_defs() const = 0;
 
-    virtual std::vector<bytes_opt> values(const query_options& options) const = 0;
-
-    /**
-     * Returns <code>true</code> if one of the restrictions use the specified function.
-     *
-     * @param ks_name the keyspace name
-     * @param function_name the function name
-     * @return <code>true</code> if one of the restrictions use the specified function, <code>false</code> otherwise.
-     */
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const = 0;
+    virtual bytes_opt value_for(const column_definition& cdef, const query_options& options) const {
+        throw exceptions::invalid_request_exception("Single value can be obtained from single-column restrictions only");
+    }
 
     /**
      * Check if the restriction is on indexed columns.
@@ -83,7 +77,8 @@ public:
      * @param index_manager the index manager
      * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
      */
-    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager) const = 0;
+    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager,
+                                      expr::allow_local_index allow_local) const = 0;
 
 #if 0
     /**

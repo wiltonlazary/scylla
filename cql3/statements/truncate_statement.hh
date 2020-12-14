@@ -44,35 +44,30 @@
 #include "cql3/statements/raw/cf_statement.hh"
 #include "cql3/cql_statement.hh"
 
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 
 namespace statements {
 
-class truncate_statement : public raw::cf_statement, public cql_statement_no_metadata, public ::enable_shared_from_this<truncate_statement> {
+class truncate_statement : public raw::cf_statement, public cql_statement_no_metadata {
 public:
     truncate_statement(::shared_ptr<cf_name> name);
 
-    virtual uint32_t get_bound_terms() override;
+    virtual uint32_t get_bound_terms() const override;
 
-    virtual std::unique_ptr<prepared> prepare(database& db,cql_stats& stats) override;
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
     virtual bool depends_on_keyspace(const sstring& ks_name) const override;
 
     virtual bool depends_on_column_family(const sstring& cf_name) const override;
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    virtual void validate(service::storage_proxy&, const service::client_state& state) override;
-
-    virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) override;
+    virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute_internal(service::storage_proxy& proxy, service::query_state& state, const query_options& options) override;
+    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const override;
 };
 
 }

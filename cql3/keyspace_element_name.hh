@@ -41,10 +41,10 @@
 
 #pragma once
 
-#include "core/sstring.hh"
+#include <seastar/core/sstring.hh>
 #include "seastarx.hh"
 
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 
@@ -55,7 +55,7 @@ class keyspace_element_name {
     /**
      * The keyspace name as stored internally.
      */
-    std::experimental::optional<sstring> _ks_name = std::experimental::nullopt;
+    std::optional<sstring> _ks_name = std::nullopt;
 
 public:
     /**
@@ -64,7 +64,7 @@ public:
      * @param ks the keyspace name
      * @param keepCase <code>true</code> if the case must be kept, <code>false</code> otherwise.
      */
-    void set_keyspace(const sstring& ks, bool keep_case);
+    void set_keyspace(std::string_view ks, bool keep_case);
 
     /**
      * Checks if the keyspace is specified.
@@ -84,7 +84,7 @@ protected:
      * @param keepCase <code>true</code> if the case must be kept, <code>false</code> otherwise.
      * @return the name used internally.
      */
-    static sstring to_internal_name(sstring name, bool keep_case);
+    static sstring to_internal_name(std::string_view name, bool keep_case);
 };
 
 }

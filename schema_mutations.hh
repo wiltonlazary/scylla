@@ -23,7 +23,7 @@
 
 #include <vector>
 #include "mutation.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "canonical_mutation.hh"
 
 // Commutative representation of table schema
@@ -31,14 +31,18 @@
 class schema_mutations {
     mutation _columnfamilies;
     mutation _columns;
+    mutation_opt _view_virtual_columns;
+    mutation_opt _computed_columns;
     mutation_opt _indices;
     mutation_opt _dropped_columns;
     mutation_opt _scylla_tables;
 public:
-    schema_mutations(mutation columnfamilies, mutation columns, mutation_opt indices, mutation_opt dropped_columns,
+    schema_mutations(mutation columnfamilies, mutation columns, mutation_opt view_virtual_columns, mutation_opt computed_columns, mutation_opt indices, mutation_opt dropped_columns,
         mutation_opt scylla_tables)
             : _columnfamilies(std::move(columnfamilies))
             , _columns(std::move(columns))
+            , _view_virtual_columns(std::move(view_virtual_columns))
+            , _computed_columns(std::move(computed_columns))
             , _indices(std::move(indices))
             , _dropped_columns(std::move(dropped_columns))
             , _scylla_tables(std::move(scylla_tables))
@@ -46,9 +50,11 @@ public:
     schema_mutations(canonical_mutation columnfamilies,
                      canonical_mutation columns,
                      bool is_view,
-                     stdx::optional<canonical_mutation> indices,
-                     stdx::optional<canonical_mutation> dropped_columns,
-                     stdx::optional<canonical_mutation> scylla_tables);
+                     std::optional<canonical_mutation> indices,
+                     std::optional<canonical_mutation> dropped_columns,
+                     std::optional<canonical_mutation> scylla_tables,
+                     std::optional<canonical_mutation> view_virtual_columns,
+                     std::optional<canonical_mutation> computed_columns);
 
     schema_mutations(schema_mutations&&) = default;
     schema_mutations& operator=(schema_mutations&&) = default;
@@ -63,6 +69,14 @@ public:
 
     const mutation& columns_mutation() const {
         return _columns;
+    }
+
+    const mutation_opt& view_virtual_columns_mutation() const {
+        return _view_virtual_columns;
+    }
+
+    const mutation_opt& computed_columns_mutation() const {
+        return _computed_columns;
     }
 
     const mutation_opt& scylla_tables() const {
@@ -88,19 +102,33 @@ public:
         return canonical_mutation(_columns);
     }
 
-    stdx::optional<canonical_mutation> indices_canonical_mutation() const {
+    std::optional<canonical_mutation> view_virtual_columns_canonical_mutation() const {
+        if (_view_virtual_columns) {
+            return canonical_mutation(*_view_virtual_columns);
+        }
+        return {};
+    }
+
+    std::optional<canonical_mutation> computed_columns_canonical_mutation() const {
+        if (_computed_columns) {
+            return canonical_mutation(*_computed_columns);
+        }
+        return {};
+    }
+
+    std::optional<canonical_mutation> indices_canonical_mutation() const {
         if (_indices) {
             return canonical_mutation(*_indices);
         }
         return {};
     }
-    stdx::optional<canonical_mutation> dropped_columns_canonical_mutation() const {
+    std::optional<canonical_mutation> dropped_columns_canonical_mutation() const {
         if (_dropped_columns) {
             return canonical_mutation(*_dropped_columns);
         }
         return {};
     }
-    stdx::optional<canonical_mutation> scylla_tables_canonical_mutation() const {
+    std::optional<canonical_mutation> scylla_tables_canonical_mutation() const {
         if (_scylla_tables) {
             return canonical_mutation(*_scylla_tables);
         }
@@ -110,11 +138,14 @@ public:
     bool is_view() const;
 
     table_schema_version digest() const;
+    std::optional<sstring> partitioner() const;
 
     bool operator==(const schema_mutations&) const;
     bool operator!=(const schema_mutations&) const;
 
     // Returns true iff any mutations contain any live cells
     bool live() const;
+
+    friend std::ostream& operator<<(std::ostream&, const schema_mutations&);
 };
 

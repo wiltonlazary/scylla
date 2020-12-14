@@ -62,7 +62,7 @@ namespace raw {
 class update_statement : public raw::modification_statement {
 private:
     // Provided for an UPDATE
-    std::vector<std::pair<::shared_ptr<column_identifier::raw>, ::shared_ptr<operation::raw_update>>> _updates;
+    std::vector<std::pair<::shared_ptr<column_identifier::raw>, std::unique_ptr<operation::raw_update>>> _updates;
     std::vector<relation_ptr> _where_clause;
 public:
     /**
@@ -75,13 +75,13 @@ public:
      * @param whereClause the where clause
      */
     update_statement(::shared_ptr<cf_name> name,
-        ::shared_ptr<attributes::raw> attrs,
-        std::vector<std::pair<::shared_ptr<column_identifier::raw>, ::shared_ptr<operation::raw_update>>> updates,
+        std::unique_ptr<attributes::raw> attrs,
+        std::vector<std::pair<::shared_ptr<column_identifier::raw>, std::unique_ptr<operation::raw_update>>> updates,
         std::vector<relation_ptr> where_clause,
-        conditions_vector conditions);
+        conditions_vector conditions, bool if_exists);
 protected:
     virtual ::shared_ptr<cql3::statements::modification_statement> prepare_internal(database& db, schema_ptr schema,
-                ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats);
+                variable_specifications& bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats) const override;
 };
 
 }

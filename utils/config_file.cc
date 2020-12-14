@@ -30,11 +30,15 @@
 #include <boost/range/adaptor/filtered.hpp>
 
 #include <seastar/core/file.hh>
-#include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/print.hh>
+#include <seastar/core/thread.hh>
+
+#include <seastar/json/json_elements.hh>
 
 #include "config_file.hh"
 #include "config_file_impl.hh"
@@ -199,7 +203,30 @@ std::istream& std::operator>>(std::istream& is, std::vector<seastar::sstring>& r
 }
 template std::istream& std::operator>>(std::istream&, std::unordered_map<seastar::sstring, seastar::sstring>&);
 
-sstring utils::hyphenate(const stdx::string_view& v) {
+thread_local unsigned utils::config_file::s_shard_id = 0;
+
+json::json_return_type
+utils::config_type::to_json(const void* value) const {
+    return _to_json(value);
+}
+
+bool
+utils::config_file::config_src::matches(std::string_view name) const {
+    if (_name == name) {
+        return true;
+    }
+    if (!_alias.empty() && _alias == name) {
+        return true;
+    }
+    return false;
+}
+
+json::json_return_type
+utils::config_file::config_src::value_as_json() const {
+    return _type->to_json(current_value());
+}
+
+sstring utils::hyphenate(const std::string_view& v) {
     sstring result(v.begin(), v.end());
     std::replace(result.begin(), result.end(), '_', '-');
     return result;
@@ -209,8 +236,15 @@ utils::config_file::config_file(std::initializer_list<cfg_ref> cfgs)
     : _cfgs(cfgs)
 {}
 
-void utils::config_file::add(cfg_ref cfg) {
+void utils::config_file::add(cfg_ref cfg, std::unique_ptr<any_value> value) {
+    if (_per_shard_values.size() != 1) {
+        throw std::runtime_error("Can only add config_src to config_file during initialization");
+    }
     _cfgs.emplace_back(cfg);
+    auto undo = defer([&] { _cfgs.pop_back(); });
+    cfg.get()._per_shard_values_offset = _per_shard_values[0].size();
+    _per_shard_values[0].emplace_back(std::move(value));
+    undo.cancel();
 }
 
 void utils::config_file::add(std::initializer_list<cfg_ref> cfgs) {
@@ -236,10 +270,7 @@ bpo::options_description_easy_init&
 utils::config_file::add_options(bpo::options_description_easy_init& init) {
     for (config_src& src : _cfgs) {
         if (src.status() == value_status::Used) {
-            auto&& name = src.name();
-            sstring tmp(name.begin(), name.end());
-            std::replace(tmp.begin(), tmp.end(), '_', '-');
-            src.add_command_line_option(init, tmp, src.desc());
+            src.add_command_line_option(init);
         }
     }
     return init;
@@ -268,9 +299,9 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
     for (auto node : doc) {
         auto label = node.first.as<sstring>();
 
-        auto i = std::find_if(_cfgs.begin(), _cfgs.end(), [&label](const config_src& cfg) { return cfg.name() == label; });
+        auto i = std::find_if(_cfgs.begin(), _cfgs.end(), [&label](const config_src& cfg) { return cfg.matches(label); });
         if (i == _cfgs.end()) {
-            h(label, "Unknown option", stdx::nullopt);
+            h(label, "Unknown option", std::nullopt);
             continue;
         }
 
@@ -338,5 +369,51 @@ future<> utils::config_file::read_from_file(const sstring& filename, error_handl
     });
 }
 
+future<> utils::config_file::broadcast_to_all_shards() {
+    return async([this] {
+        if (_per_shard_values.size() != smp::count) {
+            _per_shard_values.resize(smp::count);
+            smp::invoke_on_all([this] {
+                auto cpu = this_shard_id();
+                if (cpu != 0) {
+                    s_shard_id = cpu;
+                    auto& shard_0_values = _per_shard_values[0];
+                    auto nr_values = shard_0_values.size();
+                    auto& this_shard_values = _per_shard_values[cpu];
+                    this_shard_values.resize(nr_values);
+                    for (size_t i = 0; i != nr_values; ++i) {
+                        this_shard_values[i] = shard_0_values[i]->clone();
+                    }
+                }
+            }).get();
+        } else {
+            smp::invoke_on_all([this] {
+                if (s_shard_id != 0) {
+                    auto& shard_0_values = _per_shard_values[0];
+                    auto nr_values = shard_0_values.size();
+                    auto& this_shard_values = _per_shard_values[s_shard_id];
+                    for (size_t i = 0; i != nr_values; ++i) {
+                        this_shard_values[i]->update_from(shard_0_values[i].get());
+                    }
+                }
+            }).get();
+        }
+
+        // #4713
+        // We can have values retained that are not pointing to
+        // our storage (extension config). Need to broadcast
+        // these configs as well.
+        std::set<config_file *> files;
+        for (config_src& v : _cfgs) {
+            auto f = v.get_config_file();
+            if (f != this) {
+                files.insert(f);
+            }
+        }
+        for (auto* f : files) {
+            f->broadcast_to_all_shards().get();
+        }
+    });
+}
 
 

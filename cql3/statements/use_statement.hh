@@ -57,23 +57,18 @@ private:
 public:
     use_statement(sstring keyspace);
 
-    virtual uint32_t get_bound_terms() override;
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
+    virtual uint32_t get_bound_terms() const override;
 
     virtual bool depends_on_keyspace(const sstring& ks_name) const override;
 
     virtual bool depends_on_column_family(const sstring& cf_name) const override;
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    virtual void validate(service::storage_proxy&, const service::client_state& state) override;
-
-    virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) override;
+    virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute_internal(service::storage_proxy& proxy, service::query_state& state, const query_options& options) override;
+    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const override;
 };
 
 }

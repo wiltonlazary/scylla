@@ -42,13 +42,12 @@
 #pragma once
 
 #include "cql3/variable_specifications.hh"
-#include "cql3/column_specification.hh"
 #include "cql3/column_identifier.hh"
 #include "cql3/stats.hh"
 
 #include <seastar/core/shared_ptr.hh>
 
-#include <experimental/optional>
+#include <optional>
 #include <vector>
 
 namespace cql3 {
@@ -60,20 +59,18 @@ class prepared_statement;
 namespace raw {
 
 class parsed_statement {
-private:
-    ::shared_ptr<variable_specifications> _variables;
+protected:
+    variable_specifications _variables;
 
 public:
-    using prepared = statements::prepared_statement;
     virtual ~parsed_statement();
 
-    shared_ptr<variable_specifications> get_bound_variables();
+    variable_specifications& get_bound_variables();
+    const variable_specifications& get_bound_variables() const;
 
     void set_bound_variables(const std::vector<::shared_ptr<column_identifier>>& bound_names);
 
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) = 0;
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const;
 };
 
 }

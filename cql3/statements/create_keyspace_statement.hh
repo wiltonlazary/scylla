@@ -44,8 +44,9 @@
 #include "cql3/statements/schema_altering_statement.hh"
 #include "cql3/statements/ks_prop_defs.hh"
 #include "transport/event.hh"
+#include "log.hh"
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 
 namespace cql3 {
 
@@ -54,6 +55,8 @@ namespace statements {
 /** A <code>CREATE KEYSPACE</code> statement parsed from a CQL query. */
 class create_keyspace_statement : public schema_altering_statement {
 private:
+    static logging::logger _logger;
+
     sstring _name;
     shared_ptr<ks_prop_defs> _attrs;
     bool _if_not_exists;
@@ -70,7 +73,7 @@ public:
 
     virtual const sstring& keyspace() const override;
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
     /**
      * The <code>CqlParser</code> only goes as far as extracting the keyword arguments
@@ -79,13 +82,16 @@ public:
      *
      * @throws InvalidRequestException if arguments are missing or unacceptable
      */
-    virtual void validate(service::storage_proxy&, const service::client_state& state) override;
+    virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) const override;
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
-    virtual future<> grant_permissions_to_creator(const service::client_state&) override;
+    virtual future<> grant_permissions_to_creator(const service::client_state&) const override;
+
+    virtual future<::shared_ptr<messages::result_message>>
+    execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const override;
 };
 
 }

@@ -21,30 +21,31 @@
 
 #pragma once
 
+#include <seastar/core/future.hh>
+#include <seastar/util/noncopyable_function.hh>
+#include <seastar/core/file.hh>
+
+#include "schema_fwd.hh"
 #include "sstables/shared_sstable.hh"
 #include "exceptions/exceptions.hh"
 #include "sstables/compaction_backlog_manager.hh"
+#include "compaction_strategy_type.hh"
 
-class column_family;
-class schema;
-using schema_ptr = lw_shared_ptr<const schema>;
+class table;
+using column_family = table;
+
+class flat_mutation_reader;
+struct mutation_source_metadata;
 
 namespace sstables {
-
-enum class compaction_strategy_type {
-    null,
-    major,
-    size_tiered,
-    leveled,
-    date_tiered,
-    time_window,
-};
 
 class compaction_strategy_impl;
 class sstable;
 class sstable_set;
 struct compaction_descriptor;
 struct resharding_descriptor;
+
+using reader_consumer = noncopyable_function<future<> (flat_mutation_reader)>;
 
 class compaction_strategy {
     ::shared_ptr<compaction_strategy_impl> _compaction_strategy_impl;
@@ -60,7 +61,7 @@ public:
     // Return a list of sstables to be compacted after applying the strategy.
     compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<shared_sstable> candidates);
 
-    std::vector<resharding_descriptor> get_resharding_jobs(column_family& cf, std::vector<shared_sstable> candidates);
+    compaction_descriptor get_major_compaction_job(column_family& cf, std::vector<shared_sstable> candidates);
 
     // Some strategies may look at the compacted and resulting sstables to
     // get some useful information for subsequent compactions.
@@ -71,6 +72,9 @@ public:
 
     // Return if optimization to rule out sstables based on clustering key filter should be applied.
     bool use_clustering_key_filter() const;
+
+    // Return true if compaction strategy doesn't care if a sstable belonging to partial sstable run is compacted.
+    bool can_compact_partial_runs() const;
 
     // An estimation of number of compaction for strategy to be satisfied.
     int64_t estimated_pending_compactions(column_family& cf) const;
@@ -110,7 +114,7 @@ public:
         } else if (short_name == "TimeWindowCompactionStrategy") {
             return compaction_strategy_type::time_window;
         } else {
-            throw exceptions::configuration_exception(sprint("Unable to find compaction strategy class '%s'", name));
+            throw exceptions::configuration_exception(format("Unable to find compaction strategy class '{}'", name));
         }
     }
 
@@ -123,6 +127,27 @@ public:
     sstable_set make_sstable_set(schema_ptr schema) const;
 
     compaction_backlog_tracker& get_backlog_tracker();
+
+    uint64_t adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate);
+
+    reader_consumer make_interposer_consumer(const mutation_source_metadata& ms_meta, reader_consumer end_consumer);
+
+    // Returns whether or not interposer consumer is used by a given strategy.
+    bool use_interposer_consumer() const;
+
+    // Informs the caller (usually the compaction manager) about what would it take for this set of
+    // SSTables closer to becoming in-strategy. If this returns an empty compaction descriptor, this
+    // means that the sstable set is already in-strategy.
+    //
+    // The caller can specify one of two modes: strict or relaxed. In relaxed mode the tolerance for
+    // what is considered offstrategy is higher. It can be used, for instance, for when the system
+    // is restarting and previous compactions were likely in-flight. In strict mode, we are less
+    // tolerant to invariant breakages.
+    //
+    // The caller should also pass a maximum number of SSTables which is the maximum amount of
+    // SSTables that can be added into a single job.
+    compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode);
+
 };
 
 // Creates a compaction_strategy object from one of the strategies available.

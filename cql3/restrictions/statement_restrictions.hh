@@ -42,8 +42,9 @@
 #pragma once
 
 #include <vector>
+#include <list>
 #include "to_string.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "cql3/restrictions/restrictions.hh"
 #include "cql3/restrictions/primary_key_restrictions.hh"
 #include "cql3/restrictions/single_column_restrictions.hh"
@@ -66,18 +67,18 @@ private:
     template<typename>
     class initial_key_restrictions;
 
-    template<typename T>
-    static ::shared_ptr<primary_key_restrictions<T>> get_initial_key_restrictions(bool allow_filtering);
+    static ::shared_ptr<partition_key_restrictions> get_initial_partition_key_restrictions(bool allow_filtering);
+    static ::shared_ptr<clustering_key_restrictions> get_initial_clustering_key_restrictions(bool allow_filtering);
 
     /**
      * Restrictions on partitioning columns
      */
-    ::shared_ptr<primary_key_restrictions<partition_key>> _partition_key_restrictions;
+    ::shared_ptr<partition_key_restrictions> _partition_key_restrictions;
 
     /**
      * Restrictions on clustering columns
      */
-    ::shared_ptr<primary_key_restrictions<clustering_key_prefix>> _clustering_columns_restrictions;
+    ::shared_ptr<clustering_key_restrictions> _clustering_columns_restrictions;
 
     /**
      * Restriction on non-primary key columns (i.e. secondary index restrictions)
@@ -101,6 +102,8 @@ private:
      */
     bool _is_key_range = false;
 
+    bool _has_queriable_regular_index = false, _has_queriable_pk_index = false, _has_queriable_ck_index = false;
+
 public:
     /**
      * Creates a new empty <code>StatementRestrictions</code>.
@@ -114,17 +117,15 @@ public:
         schema_ptr schema,
         statements::statement_type type,
         const std::vector<::shared_ptr<relation>>& where_clause,
-        ::shared_ptr<variable_specifications> bound_names,
+        variable_specifications& bound_names,
         bool selects_only_static_columns,
         bool select_a_collection,
         bool for_view = false,
         bool allow_filtering = false);
-private:
-    void add_restriction(::shared_ptr<restriction> restriction);
-    void add_single_column_restriction(::shared_ptr<single_column_restriction> restriction);
-public:
-    bool uses_function(const sstring& ks_name, const sstring& function_name) const;
 
+    void add_restriction(::shared_ptr<restriction> restriction, bool for_view, bool allow_filtering);
+    void add_single_column_restriction(::shared_ptr<single_column_restriction> restriction, bool for_view, bool allow_filtering);
+public:
     const std::vector<::shared_ptr<restrictions>>& index_restrictions() const;
 
     /**
@@ -134,7 +135,21 @@ public:
      * otherwise.
      */
     bool key_is_in_relation() const {
-        return _partition_key_restrictions->is_IN();
+        return find(_partition_key_restrictions->expression, expr::oper_t::IN);
+    }
+
+    /**
+     * Checks if the restrictions on the clustering key is an IN restriction.
+     *
+     * @return <code>true</code> the restrictions on the partition key is an IN restriction, <code>false</code>
+     * otherwise.
+     */
+    bool clustering_key_restrictions_has_IN() const {
+        return find(_clustering_columns_restrictions->expression, expr::oper_t::IN);
+    }
+
+    bool clustering_key_restrictions_has_only_eq() const {
+        return _clustering_columns_restrictions->empty() || _clustering_columns_restrictions->is_all_eq();
     }
 
     /**
@@ -155,13 +170,34 @@ public:
         return _uses_secondary_indexing;
     }
 
-    ::shared_ptr<primary_key_restrictions<partition_key>> get_partition_key_restrictions() const {
+    ::shared_ptr<partition_key_restrictions> get_partition_key_restrictions() const {
         return _partition_key_restrictions;
     }
 
-    ::shared_ptr<primary_key_restrictions<clustering_key_prefix>> get_clustering_columns_restrictions() const {
+    ::shared_ptr<clustering_key_restrictions> get_clustering_columns_restrictions() const {
         return _clustering_columns_restrictions;
     }
+
+    /**
+     * Builds a possibly empty collection of column definitions that will be used for filtering
+     * @param db - the database context
+     * @return A list with the column definitions needed for filtering.
+     */
+    std::vector<const column_definition*> get_column_defs_for_filtering(database& db) const;
+
+    /**
+     * Gives a score that the index has - index with the highest score will be chosen
+     * in find_idx()
+     */
+    int score(const secondary_index::index& index) const;
+
+    /**
+     * Determines the index to be used with the restriction.
+     * @param db - the database context (for extracting index manager)
+     * @return If an index can be used, an optional containing this index, otherwise an empty optional.
+     * In case the index is returned, second parameter returns the index restriction it uses.
+     */
+    std::pair<std::optional<secondary_index::index>, ::shared_ptr<cql3::restrictions::restrictions>> find_idx(secondary_index::secondary_index_manager& sim) const;
 
     /**
      * Checks if the partition key has some unrestricted components.
@@ -175,13 +211,7 @@ public:
      */
     bool has_unrestricted_clustering_columns() const;
 private:
-    void process_partition_key_restrictions(bool has_queriable_index, bool for_view);
-
-    /**
-     * Returns the partition key components that are not restricted.
-     * @return the partition key components that are not restricted.
-     */
-    std::vector<::shared_ptr<column_identifier>> get_partition_key_unrestricted_components() const;
+    void process_partition_key_restrictions(bool for_view, bool allow_filtering);
 
     /**
      * Processes the clustering column restrictions.
@@ -190,7 +220,7 @@ private:
      * @param select_a_collection <code>true</code> if the query should return a collection column
      * @throws InvalidRequestException if the request is invalid
      */
-    void process_clustering_columns_restrictions(bool has_queriable_index, bool select_a_collection, bool for_view);
+    void process_clustering_columns_restrictions(bool select_a_collection, bool for_view, bool allow_filtering);
 
     /**
      * Returns the <code>Restrictions</code> for the specified type of columns.
@@ -358,7 +388,7 @@ public:
      * Checks if the query need to use filtering.
      * @return <code>true</code> if the query need to use filtering, <code>false</code> otherwise.
      */
-    bool need_filtering();
+    bool need_filtering() const;
 
     void validate_secondary_index_selections(bool selects_only_static_columns);
 
@@ -381,11 +411,19 @@ public:
         return !_nonprimary_key_restrictions->empty();
     }
 
+    bool pk_restrictions_need_filtering() const {
+        return _partition_key_restrictions->needs_filtering(*_schema);
+    }
+
+    bool ck_restrictions_need_filtering() const {
+        return _partition_key_restrictions->has_unrestricted_components(*_schema) || _clustering_columns_restrictions->needs_filtering(*_schema);
+    }
+
     /**
      * @return true if column is restricted by some restriction, false otherwise
      */
     bool is_restricted(const column_definition* cdef) const {
-        if (_not_null_columns.find(cdef) != _not_null_columns.end()) {
+        if (_not_null_columns.contains(cdef)) {
             return true;
         }
 
@@ -399,6 +437,16 @@ public:
     const single_column_restrictions::restrictions_map& get_non_pk_restriction() const {
         return _nonprimary_key_restrictions->restrictions();
     }
+
+    /**
+     * @return partition key restrictions split into single column restrictions (e.g. for filtering support).
+     */
+    const single_column_restrictions::restrictions_map& get_single_column_partition_key_restrictions() const;
+
+    /**
+     * @return clustering key restrictions split into single column restrictions (e.g. for filtering support).
+     */
+    const single_column_restrictions::restrictions_map& get_single_column_clustering_key_restrictions() const;
 };
 
 }

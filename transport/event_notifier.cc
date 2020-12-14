@@ -20,24 +20,31 @@
  */
 
 #include "transport/server.hh"
-#include "core/gate.hh"
-#include "service/migration_manager.hh"
+#include <seastar/core/gate.hh>
+#include "service/migration_listener.hh"
 #include "service/storage_service.hh"
+#include "transport/response.hh"
 
 namespace cql_transport {
 
 static logging::logger elogger("event_notifier");
 
-cql_server::event_notifier::event_notifier()
+cql_server::event_notifier::event_notifier(service::migration_notifier& mn) : _mnotifier(mn)
 {
-    service::get_local_migration_manager().register_listener(this);
+    _mnotifier.register_listener(this);
     service::get_local_storage_service().register_subscriber(this);
 }
 
 cql_server::event_notifier::~event_notifier()
 {
     service::get_local_storage_service().unregister_subscriber(this);
-    service::get_local_migration_manager().unregister_listener(this);
+    assert(_stopped);
+}
+
+future<> cql_server::event_notifier::stop() {
+    return _mnotifier.unregister_listener(this).then([this]{
+        _stopped = true;
+    });
 }
 
 void cql_server::event_notifier::register_event(event::event_type et, cql_server::connection* conn)
@@ -69,6 +76,7 @@ void cql_server::event_notifier::on_create_keyspace(const sstring& ks_name)
         if (!conn->_pending_requests_gate.is_closed()) {
             conn->write_response(conn->make_schema_change_event(event::schema_change{
                 event::schema_change::change_type::CREATED,
+                event::schema_change::target_type::KEYSPACE,
                 ks_name
             }));
         };
@@ -127,6 +135,7 @@ void cql_server::event_notifier::on_update_keyspace(const sstring& ks_name)
         if (!conn->_pending_requests_gate.is_closed()) {
             conn->write_response(conn->make_schema_change_event(event::schema_change{
                 event::schema_change::change_type::UPDATED,
+                event::schema_change::target_type::KEYSPACE,
                 ks_name
             }));
         };
@@ -185,6 +194,7 @@ void cql_server::event_notifier::on_drop_keyspace(const sstring& ks_name)
         if (!conn->_pending_requests_gate.is_closed()) {
             conn->write_response(conn->make_schema_change_event(event::schema_change{
                 event::schema_change::change_type::DROPPED,
+                event::schema_change::target_type::KEYSPACE,
                 ks_name
             }));
         };
@@ -238,10 +248,20 @@ void cql_server::event_notifier::on_drop_aggregate(const sstring& ks_name, const
 
 void cql_server::event_notifier::on_join_cluster(const gms::inet_address& endpoint)
 {
+    if (!gms::get_local_gossiper().is_cql_ready(endpoint)) {
+        _endpoints_pending_joined_notification.insert(endpoint);
+        return;
+    }
+
+    send_join_cluster(endpoint);
+}
+
+void cql_server::event_notifier::send_join_cluster(const gms::inet_address& endpoint)
+{
     for (auto&& conn : _topology_change_listeners) {
         using namespace cql_transport;
         if (!conn->_pending_requests_gate.is_closed()) {
-            conn->write_response(conn->make_topology_change_event(event::topology_change::new_node(endpoint, conn->_server_addr.port)));
+            conn->write_response(conn->make_topology_change_event(event::topology_change::new_node(endpoint, conn->_server_addr.port())));
         };
     }
 }
@@ -251,30 +271,24 @@ void cql_server::event_notifier::on_leave_cluster(const gms::inet_address& endpo
     for (auto&& conn : _topology_change_listeners) {
         using namespace cql_transport;
         if (!conn->_pending_requests_gate.is_closed()) {
-            conn->write_response(conn->make_topology_change_event(event::topology_change::removed_node(endpoint, conn->_server_addr.port)));
-        };
-    }
-}
-
-void cql_server::event_notifier::on_move(const gms::inet_address& endpoint)
-{
-    for (auto&& conn : _topology_change_listeners) {
-        using namespace cql_transport;
-        if (!conn->_pending_requests_gate.is_closed()) {
-            conn->write_response(conn->make_topology_change_event(event::topology_change::moved_node(endpoint, conn->_server_addr.port)));
+            conn->write_response(conn->make_topology_change_event(event::topology_change::removed_node(endpoint, conn->_server_addr.port())));
         };
     }
 }
 
 void cql_server::event_notifier::on_up(const gms::inet_address& endpoint)
 {
-    bool was_up = _last_status_change.count(endpoint) && _last_status_change.at(endpoint) == event::status_change::status_type::UP;
+    if (_endpoints_pending_joined_notification.erase(endpoint)) {
+        send_join_cluster(endpoint);
+    }
+
+    bool was_up = _last_status_change.contains(endpoint) && _last_status_change.at(endpoint) == event::status_change::status_type::UP;
     _last_status_change[endpoint] = event::status_change::status_type::UP;
     if (!was_up) {
         for (auto&& conn : _status_change_listeners) {
             using namespace cql_transport;
             if (!conn->_pending_requests_gate.is_closed()) {
-                conn->write_response(conn->make_status_change_event(event::status_change::node_up(endpoint, conn->_server_addr.port)));
+                conn->write_response(conn->make_status_change_event(event::status_change::node_up(endpoint, conn->_server_addr.port())));
             };
         }
     }
@@ -282,13 +296,13 @@ void cql_server::event_notifier::on_up(const gms::inet_address& endpoint)
 
 void cql_server::event_notifier::on_down(const gms::inet_address& endpoint)
 {
-    bool was_down = _last_status_change.count(endpoint) && _last_status_change.at(endpoint) == event::status_change::status_type::DOWN;
+    bool was_down = _last_status_change.contains(endpoint) && _last_status_change.at(endpoint) == event::status_change::status_type::DOWN;
     _last_status_change[endpoint] = event::status_change::status_type::DOWN;
     if (!was_down) {
         for (auto&& conn : _status_change_listeners) {
             using namespace cql_transport;
             if (!conn->_pending_requests_gate.is_closed()) {
-                conn->write_response(conn->make_status_change_event(event::status_change::node_down(endpoint, conn->_server_addr.port)));
+                conn->write_response(conn->make_status_change_event(event::status_change::node_down(endpoint, conn->_server_addr.port())));
             };
         }
     }

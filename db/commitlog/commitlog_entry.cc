@@ -34,6 +34,8 @@
 #include "idl/mutation.dist.impl.hh"
 #include "idl/commitlog.dist.impl.hh"
 
+#include <seastar/core/simple-stream.hh>
+
 template<typename Output>
 void commitlog_entry_writer::serialize(Output& out) const {
     [this, wr = ser::writer_of_commitlog_entry<Output>(out)] () mutable {
@@ -51,14 +53,13 @@ void commitlog_entry_writer::compute_size() {
     _size = ms.size();
 }
 
-void commitlog_entry_writer::write(data_output& out) const {
-    seastar::simple_output_stream str(out.reserve(size()), size());
-    serialize(str);
+void commitlog_entry_writer::write(typename seastar::memory_output_stream<std::vector<temporary_buffer<char>>::iterator>& out) const {
+    serialize(out);
 }
 
-commitlog_entry_reader::commitlog_entry_reader(const temporary_buffer<char>& buffer)
+commitlog_entry_reader::commitlog_entry_reader(const fragmented_temporary_buffer& buffer)
     : _ce([&] {
-    seastar::simple_input_stream in(buffer.get(), buffer.size());
+    auto in = seastar::fragmented_memory_input_stream(fragmented_temporary_buffer::view(buffer).begin(), buffer.size_bytes());
     return ser::deserialize(in, boost::type<commitlog_entry>());
 }())
 {

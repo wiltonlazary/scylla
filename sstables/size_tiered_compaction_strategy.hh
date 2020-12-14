@@ -23,9 +23,8 @@
 
 #include "compaction_strategy_impl.hh"
 #include "compaction.hh"
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm.hpp>
+#include "sstables/sstables.hh"
+#include "database.hh"
 #include <boost/algorithm/cxx11/any_of.hpp>
 
 namespace sstables {
@@ -45,28 +44,9 @@ class size_tiered_compaction_strategy_options {
     double bucket_high = DEFAULT_BUCKET_HIGH;
     double cold_reads_to_omit =  DEFAULT_COLD_READS_TO_OMIT;
 public:
-    size_tiered_compaction_strategy_options(const std::map<sstring, sstring>& options) {
-        using namespace cql3::statements;
+    size_tiered_compaction_strategy_options(const std::map<sstring, sstring>& options);
 
-        auto tmp_value = compaction_strategy_impl::get_value(options, MIN_SSTABLE_SIZE_KEY);
-        min_sstable_size = property_definitions::to_long(MIN_SSTABLE_SIZE_KEY, tmp_value, DEFAULT_MIN_SSTABLE_SIZE);
-
-        tmp_value = compaction_strategy_impl::get_value(options, BUCKET_LOW_KEY);
-        bucket_low = property_definitions::to_double(BUCKET_LOW_KEY, tmp_value, DEFAULT_BUCKET_LOW);
-
-        tmp_value = compaction_strategy_impl::get_value(options, BUCKET_HIGH_KEY);
-        bucket_high = property_definitions::to_double(BUCKET_HIGH_KEY, tmp_value, DEFAULT_BUCKET_HIGH);
-
-        tmp_value = compaction_strategy_impl::get_value(options, COLD_READS_TO_OMIT_KEY);
-        cold_reads_to_omit = property_definitions::to_double(COLD_READS_TO_OMIT_KEY, tmp_value, DEFAULT_COLD_READS_TO_OMIT);
-    }
-
-    size_tiered_compaction_strategy_options() {
-        min_sstable_size = DEFAULT_MIN_SSTABLE_SIZE;
-        bucket_low = DEFAULT_BUCKET_LOW;
-        bucket_high = DEFAULT_BUCKET_HIGH;
-        cold_reads_to_omit = DEFAULT_COLD_READS_TO_OMIT;
-    }
+    size_tiered_compaction_strategy_options();
 
     // FIXME: convert java code below.
 #if 0
@@ -117,9 +97,11 @@ class size_tiered_compaction_strategy : public compaction_strategy_impl {
     compaction_backlog_tracker _backlog_tracker;
 
     // Return a list of pair of shared_sstable and its respective size.
-    std::vector<std::pair<sstables::shared_sstable, uint64_t>> create_sstable_and_length_pairs(const std::vector<sstables::shared_sstable>& sstables) const;
+    static std::vector<std::pair<sstables::shared_sstable, uint64_t>> create_sstable_and_length_pairs(const std::vector<sstables::shared_sstable>& sstables);
 
     // Group files of similar size into buckets.
+    static std::vector<std::vector<sstables::shared_sstable>> get_buckets(const std::vector<sstables::shared_sstable>& sstables, size_tiered_compaction_strategy_options options);
+
     std::vector<std::vector<sstables::shared_sstable>> get_buckets(const std::vector<sstables::shared_sstable>& sstables) const;
 
     // Maybe return a bucket of sstables to compact
@@ -127,12 +109,11 @@ class size_tiered_compaction_strategy : public compaction_strategy_impl {
     most_interesting_bucket(std::vector<std::vector<sstables::shared_sstable>> buckets, unsigned min_threshold, unsigned max_threshold);
 
     // Return the average size of a given list of sstables.
-    uint64_t avg_size(std::vector<sstables::shared_sstable>& sstables) {
+    uint64_t avg_size(std::vector<sstables::shared_sstable> const& sstables) const {
         assert(sstables.size() > 0); // this should never fail
         uint64_t n = 0;
 
-        for (auto& sstable : sstables) {
-            // FIXME: Switch to sstable->bytes_on_disk() afterwards. That's what C* uses.
+        for (auto const& sstable : sstables) {
             n += sstable->data_size();
         }
 
@@ -156,6 +137,8 @@ public:
 
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) override;
 
+    static int64_t estimated_pending_compactions(const std::vector<sstables::shared_sstable>& sstables,
+        int min_threshold, int max_threshold, size_tiered_compaction_strategy_options options);
     virtual int64_t estimated_pending_compactions(column_family& cf) const override;
 
     virtual compaction_strategy_type type() const {
@@ -170,182 +153,9 @@ public:
     virtual compaction_backlog_tracker& get_backlog_tracker() override {
         return _backlog_tracker;
     }
+
+    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode) override;
+
 };
-
-inline std::vector<std::pair<sstables::shared_sstable, uint64_t>>
-size_tiered_compaction_strategy::create_sstable_and_length_pairs(const std::vector<sstables::shared_sstable>& sstables) const {
-
-    std::vector<std::pair<sstables::shared_sstable, uint64_t>> sstable_length_pairs;
-    sstable_length_pairs.reserve(sstables.size());
-
-    for(auto& sstable : sstables) {
-        auto sstable_size = sstable->data_size();
-        assert(sstable_size != 0);
-
-        sstable_length_pairs.emplace_back(sstable, sstable_size);
-    }
-
-    return sstable_length_pairs;
-}
-
-inline std::vector<std::vector<sstables::shared_sstable>>
-size_tiered_compaction_strategy::get_buckets(const std::vector<sstables::shared_sstable>& sstables) const {
-    // sstables sorted by size of its data file.
-    auto sorted_sstables = create_sstable_and_length_pairs(sstables);
-
-    std::sort(sorted_sstables.begin(), sorted_sstables.end(), [] (auto& i, auto& j) {
-        return i.second < j.second;
-    });
-
-    std::map<size_t, std::vector<sstables::shared_sstable>> buckets;
-
-    bool found;
-    for (auto& pair : sorted_sstables) {
-        found = false;
-        size_t size = pair.second;
-
-        // look for a bucket containing similar-sized files:
-        // group in the same bucket if it's w/in 50% of the average for this bucket,
-        // or this file and the bucket are all considered "small" (less than `minSSTableSize`)
-        for (auto it = buckets.begin(); it != buckets.end(); it++) {
-            size_t old_average_size = it->first;
-
-            if ((size > (old_average_size * _options.bucket_low) && size < (old_average_size * _options.bucket_high)) ||
-                    (size < _options.min_sstable_size && old_average_size < _options.min_sstable_size)) {
-                auto bucket = std::move(it->second);
-                size_t total_size = bucket.size() * old_average_size;
-                size_t new_average_size = (total_size + size) / (bucket.size() + 1);
-
-                bucket.push_back(pair.first);
-                buckets.erase(it);
-                buckets.insert({ new_average_size, std::move(bucket) });
-
-                found = true;
-                break;
-            }
-        }
-
-        // no similar bucket found; put it in a new one
-        if (!found) {
-            std::vector<sstables::shared_sstable> new_bucket;
-            new_bucket.push_back(pair.first);
-            buckets.insert({ size, std::move(new_bucket) });
-        }
-    }
-
-    std::vector<std::vector<sstables::shared_sstable>> bucket_list;
-    bucket_list.reserve(buckets.size());
-
-    for (auto& entry : buckets) {
-        bucket_list.push_back(std::move(entry.second));
-    }
-
-    return bucket_list;
-}
-
-inline std::vector<sstables::shared_sstable>
-size_tiered_compaction_strategy::most_interesting_bucket(std::vector<std::vector<sstables::shared_sstable>> buckets,
-        unsigned min_threshold, unsigned max_threshold)
-{
-    std::vector<std::pair<std::vector<sstables::shared_sstable>, uint64_t>> pruned_buckets_and_hotness;
-    pruned_buckets_and_hotness.reserve(buckets.size());
-
-    // FIXME: add support to get hotness for each bucket.
-
-    for (auto& bucket : buckets) {
-        // FIXME: the coldest sstables will be trimmed to meet the threshold, so we must add support to this feature
-        // by converting SizeTieredCompactionStrategy::trimToThresholdWithHotness.
-        // By the time being, we will only compact buckets that meet the threshold.
-        bucket.resize(std::min(bucket.size(), size_t(max_threshold)));
-        if (is_bucket_interesting(bucket, min_threshold)) {
-            auto avg = avg_size(bucket);
-            pruned_buckets_and_hotness.push_back({ std::move(bucket), avg });
-        }
-    }
-
-    if (pruned_buckets_and_hotness.empty()) {
-        return std::vector<sstables::shared_sstable>();
-    }
-
-    // NOTE: Compacting smallest sstables first, located at the beginning of the sorted vector.
-    auto& min = *std::min_element(pruned_buckets_and_hotness.begin(), pruned_buckets_and_hotness.end(), [] (auto& i, auto& j) {
-        // FIXME: ignoring hotness by the time being.
-
-        return i.second < j.second;
-    });
-    auto hottest = std::move(min.first);
-
-    return hottest;
-}
-
-inline compaction_descriptor
-size_tiered_compaction_strategy::get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) {
-    // make local copies so they can't be changed out from under us mid-method
-    int min_threshold = cfs.schema()->min_compaction_threshold();
-    int max_threshold = cfs.schema()->max_compaction_threshold();
-    auto gc_before = gc_clock::now() - cfs.schema()->gc_grace_seconds();
-
-    // TODO: Add support to filter cold sstables (for reference: SizeTieredCompactionStrategy::filterColdSSTables).
-
-    auto buckets = get_buckets(candidates);
-
-    if (is_any_bucket_interesting(buckets, min_threshold)) {
-        std::vector<sstables::shared_sstable> most_interesting = most_interesting_bucket(std::move(buckets), min_threshold, max_threshold);
-        return sstables::compaction_descriptor(std::move(most_interesting));
-    }
-
-    // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
-    // ratio is greater than threshold.
-    // prefer oldest sstables from biggest size tiers because they will be easier to satisfy conditions for
-    // tombstone purge, i.e. less likely to shadow even older data.
-    for (auto&& sstables : buckets | boost::adaptors::reversed) {
-        // filter out sstables which droppable tombstone ratio isn't greater than the defined threshold.
-        auto e = boost::range::remove_if(sstables, [this, &gc_before] (const sstables::shared_sstable& sst) -> bool {
-            return !worth_dropping_tombstones(sst, gc_before);
-        });
-        sstables.erase(e, sstables.end());
-        if (sstables.empty()) {
-            continue;
-        }
-        // find oldest sstable from current tier
-        auto it = std::min_element(sstables.begin(), sstables.end(), [] (auto& i, auto& j) {
-            return i->get_stats_metadata().min_timestamp < j->get_stats_metadata().min_timestamp;
-        });
-        return sstables::compaction_descriptor({ *it });
-    }
-    return sstables::compaction_descriptor();
-}
-
-inline int64_t size_tiered_compaction_strategy::estimated_pending_compactions(column_family& cf) const {
-    int min_threshold = cf.schema()->min_compaction_threshold();
-    int max_threshold = cf.schema()->max_compaction_threshold();
-    std::vector<sstables::shared_sstable> sstables;
-    int64_t n = 0;
-
-    sstables.reserve(cf.sstables_count());
-    for (auto& entry : *cf.get_sstables()) {
-        sstables.push_back(entry);
-    }
-
-    for (auto& bucket : get_buckets(sstables)) {
-        if (bucket.size() >= size_t(min_threshold)) {
-            n += std::ceil(double(bucket.size()) / max_threshold);
-        }
-    }
-    return n;
-}
-
-inline std::vector<sstables::shared_sstable>
-size_tiered_compaction_strategy::most_interesting_bucket(const std::vector<sstables::shared_sstable>& candidates,
-        int min_threshold, int max_threshold, size_tiered_compaction_strategy_options options) {
-    size_tiered_compaction_strategy cs(options);
-
-    auto buckets = cs.get_buckets(candidates);
-
-    std::vector<sstables::shared_sstable> most_interesting = cs.most_interesting_bucket(std::move(buckets),
-        min_threshold, max_threshold);
-
-    return most_interesting;
-}
 
 }

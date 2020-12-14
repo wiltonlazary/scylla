@@ -65,13 +65,13 @@ public:
     };
 private:
     type _type;
-    shared_ptr<attributes::raw> _attrs;
-    std::vector<shared_ptr<raw::modification_statement>> _parsed_statements;
+    std::unique_ptr<attributes::raw> _attrs;
+    std::vector<std::unique_ptr<raw::modification_statement>> _parsed_statements;
 public:
     batch_statement(
         type type_,
-        shared_ptr<attributes::raw> attrs,
-        std::vector<shared_ptr<raw::modification_statement>> parsed_statements)
+        std::unique_ptr<attributes::raw> attrs,
+        std::vector<std::unique_ptr<raw::modification_statement>> parsed_statements)
             : cf_statement(nullptr)
             , _type(type_)
             , _attrs(std::move(attrs))
@@ -84,7 +84,7 @@ public:
         }
     }
 
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 };
 
 }

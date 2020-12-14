@@ -41,8 +41,9 @@
 
 #include "cql3/statements/create_keyspace_statement.hh"
 #include "prepared_statement.hh"
-
+#include "database.hh"
 #include "service/migration_manager.hh"
+#include "transport/messages/result_message.hh"
 
 #include <regex>
 
@@ -51,6 +52,8 @@ bool is_system_keyspace(const sstring& keyspace);
 namespace cql3 {
 
 namespace statements {
+
+logging::logger create_keyspace_statement::_logger("create_keyspace");
 
 create_keyspace_statement::create_keyspace_statement(const sstring& name, shared_ptr<ks_prop_defs> attrs, bool if_not_exists)
     : _name{name}
@@ -64,12 +67,12 @@ const sstring& create_keyspace_statement::keyspace() const
     return _name;
 }
 
-future<> create_keyspace_statement::check_access(const service::client_state& state)
+future<> create_keyspace_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const
 {
     return state.has_all_keyspaces_access(auth::permission::CREATE);
 }
 
-void create_keyspace_statement::validate(service::storage_proxy&, const service::client_state& state)
+void create_keyspace_statement::validate(service::storage_proxy&, const service::client_state& state) const
 {
     std::string name;
     name.resize(_name.length());
@@ -80,10 +83,10 @@ void create_keyspace_statement::validate(service::storage_proxy&, const service:
     // keyspace name
     std::regex name_regex("\\w+");
     if (!std::regex_match(name, name_regex)) {
-        throw exceptions::invalid_request_exception(sprint("\"%s\" is not a valid keyspace name", _name.c_str()));
+        throw exceptions::invalid_request_exception(format("\"{}\" is not a valid keyspace name", _name.c_str()));
     }
     if (name.length() > schema::NAME_LENGTH) {
-        throw exceptions::invalid_request_exception(sprint("Keyspace names shouldn't be more than %d characters long (got \"%s\")", schema::NAME_LENGTH, _name.c_str()));
+        throw exceptions::invalid_request_exception(format("Keyspace names shouldn't be more than {:d} characters long (got \"{}\")", schema::NAME_LENGTH, _name.c_str()));
     }
 
     _attrs->validate();
@@ -103,16 +106,18 @@ void create_keyspace_statement::validate(service::storage_proxy&, const service:
 #endif
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_keyspace_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only)
+future<shared_ptr<cql_transport::event::schema_change>> create_keyspace_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
 {
-    return make_ready_future<>().then([this, is_local_only] {
-        return service::get_local_migration_manager().announce_new_keyspace(_attrs->as_ks_metadata(_name), is_local_only);
+    return make_ready_future<>().then([this, p = proxy.shared_from_this(), is_local_only] {
+        const auto& tm = *p->get_token_metadata_ptr();
+        return service::get_local_migration_manager().announce_new_keyspace(_attrs->as_ks_metadata(_name, tm), is_local_only);
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();
             using namespace cql_transport;
-            return make_shared<event::schema_change>(
+            return ::make_shared<event::schema_change>(
                     event::schema_change::change_type::CREATED,
+                    event::schema_change::target_type::KEYSPACE,
                     this->keyspace());
         } catch (const exceptions::already_exists_exception& e) {
             if (_if_not_exists) {
@@ -128,7 +133,7 @@ cql3::statements::create_keyspace_statement::prepare(database& db, cql_stats& st
     return std::make_unique<prepared_statement>(make_shared<create_keyspace_statement>(*this));
 }
 
-future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs) {
+future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs) const {
     return do_with(auth::make_data_resource(keyspace()), [&cs](const auth::resource& r) {
         return auth::grant_applicable_permissions(
                 *cs.get_auth_service(),
@@ -136,6 +141,23 @@ future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creat
                 r).handle_exception_type([](const auth::unsupported_authorization_operation&) {
             // Nothing.
         });
+    });
+}
+
+future<::shared_ptr<messages::result_message>>
+create_keyspace_statement::execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const {
+    return schema_altering_statement::execute(proxy, state, options).then([this, p = proxy.shared_from_this()] (::shared_ptr<messages::result_message> msg) {
+        bool multidc = p->get_token_metadata_ptr()->get_topology().get_datacenter_endpoints().size() > 1;
+        bool simple = _attrs->get_replication_strategy_class() == "SimpleStrategy";
+
+        if (multidc && simple) {
+            static const auto warning = "Using SimpleStrategy in a multi-datacenter environment is not recommended.";
+
+            msg->add_warning(warning);
+            _logger.warn(warning);
+        }
+
+        return msg;
     });
 }
 

@@ -40,8 +40,8 @@
  */
 #include <seastar/core/metrics.hh>
 #include "tracing/tracing.hh"
-#include "utils/class_registrator.hh"
 #include "tracing/trace_state.hh"
+#include "tracing/tracing_backend_registry.hh"
 
 namespace tracing {
 
@@ -56,9 +56,10 @@ std::vector<sstring> trace_type_names = {
     "REPAIR"
 };
 
-tracing::tracing(sstring tracing_backend_helper_class_name)
+tracing::tracing(const backend_registry& br, sstring tracing_backend_helper_class_name)
         : _write_timer([this] { write_timer_callback(); })
-        , _thread_name(seastar::format("shard {:d}", engine().cpu_id()))
+        , _thread_name(seastar::format("shard {:d}", this_shard_id()))
+        , _backend_registry(br)
         , _tracing_backend_helper_class_name(std::move(tracing_backend_helper_class_name))
         , _gen(std::random_device()())
         , _slow_query_duration_threshold(default_slow_query_duraion_threshold)
@@ -97,13 +98,13 @@ tracing::tracing(sstring tracing_backend_helper_class_name)
     });
 }
 
-future<> tracing::create_tracing(sstring tracing_backend_class_name) {
-    return tracing_instance().start(std::move(tracing_backend_class_name));
+future<> tracing::create_tracing(const backend_registry& br, sstring tracing_backend_class_name) {
+    return tracing_instance().start(std::ref(br), std::move(tracing_backend_class_name));
 }
 
-future<> tracing::start_tracing() {
-    return tracing_instance().invoke_on_all([] (tracing& local_tracing) {
-        return local_tracing.start();
+future<> tracing::start_tracing(sharded<cql3::query_processor>& qp) {
+    return tracing_instance().invoke_on_all([&qp] (tracing& local_tracing) {
+        return local_tracing.start(qp.local());
     });
 }
 
@@ -145,17 +146,17 @@ trace_state_ptr tracing::create_session(const trace_info& secondary_session_info
     }
 }
 
-future<> tracing::start() {
+future<> tracing::start(cql3::query_processor& qp) {
     try {
-        _tracing_backend_helper_ptr = create_object<i_tracing_backend_helper>(_tracing_backend_helper_class_name, *this);
-    } catch (no_such_class& e) {
+        _tracing_backend_helper_ptr = _backend_registry.create_backend(_tracing_backend_helper_class_name, *this);
+    } catch (no_such_tracing_backend& e) {
         tracing_logger.error("Can't create tracing backend helper {}: not supported", _tracing_backend_helper_class_name);
         throw;
     } catch (...) {
         throw;
     }
 
-    return _tracing_backend_helper_ptr->start().then([this] {
+    return _tracing_backend_helper_ptr->start(qp).then([this] {
         _down = false;
         _write_timer.arm(write_period);
     });
@@ -205,8 +206,9 @@ void tracing::set_trace_probability(double p) {
 }
 
 one_session_records::one_session_records()
-    : backend_state_ptr(tracing::get_local_tracing_instance().allocate_backend_session_state())
-    , budget_ptr(tracing::get_local_tracing_instance().get_cached_records_ptr()) {}
+    : _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
+    , backend_state_ptr(_local_tracing_ptr->allocate_backend_session_state())
+    , budget_ptr(_local_tracing_ptr->get_cached_records_ptr()) {}
 
 std::ostream& operator<<(std::ostream& os, const span_id& id) {
     return os << id.get_id();

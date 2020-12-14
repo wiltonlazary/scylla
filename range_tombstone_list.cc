@@ -114,7 +114,7 @@ void range_tombstone_list::insert_from(const schema& s,
             return;
         }
 
-        auto c = tomb.compare(it->tomb);
+        auto c = tomb <=> it->tomb;
         if (c == 0) {
             // same timestamp, overlapping or adjacent, so merge.
             if (less(it->start_bound(), start_bound)) {
@@ -252,7 +252,7 @@ range_tombstone_list range_tombstone_list::difference(const schema& s, const ran
             ++other_rt;
             continue;
         }
-        auto new_end = bound_view(other_rt->start_bound().prefix, invert_kind(other_rt->start_bound().kind));
+        auto new_end = bound_view(other_rt->start_bound().prefix(), invert_kind(other_rt->start_bound().kind()));
         if (cmp_rt(cur_start, new_end)) {
             diff.apply(s, cur_start, new_end, this_rt->tomb);
             cur_start = other_rt->start_bound();
@@ -267,7 +267,7 @@ range_tombstone_list range_tombstone_list::difference(const schema& s, const ran
             if (this_rt->tomb > other_rt->tomb) {
                 diff.apply(s, cur_start, end, this_rt->tomb);
             }
-            cur_start = bound_view(end.prefix, invert_kind(end.kind));
+            cur_start = bound_view(end.prefix(), invert_kind(end.kind()));
             ++other_rt;
             if (cmp_rt(cur_end, cur_start)) {
                 advance_this_rt();
@@ -279,6 +279,19 @@ range_tombstone_list range_tombstone_list::difference(const schema& s, const ran
         advance_this_rt();
     }
     return diff;
+}
+
+stop_iteration range_tombstone_list::clear_gently() noexcept {
+    auto del = current_deleter<range_tombstone>();
+    auto i = _tombstones.begin();
+    auto end = _tombstones.end();
+    while (i != end) {
+        i = _tombstones.erase_and_dispose(i, del);
+        if (need_preempt()) {
+            return stop_iteration::no;
+        }
+    }
+    return stop_iteration::yes;
 }
 
 void range_tombstone_list::apply(const schema& s, const range_tombstone_list& rt_list) {
@@ -424,14 +437,18 @@ bool range_tombstone_list::equal(const schema& s, const range_tombstone_list& ot
     });
 }
 
-void range_tombstone_list::apply_monotonically(const schema& s, range_tombstone_list&& list) {
+stop_iteration range_tombstone_list::apply_monotonically(const schema& s, range_tombstone_list&& list, is_preemptible preemptible) {
     auto del = current_deleter<range_tombstone>();
     auto it = list.begin();
     while (it != list.end()) {
         // FIXME: Optimize by stealing the entry
         apply_monotonically(s, *it);
         it = list._tombstones.erase_and_dispose(it, del);
+        if (preemptible && need_preempt()) {
+            return stop_iteration::no;
+        }
     }
+    return stop_iteration::yes;
 }
 
 void range_tombstone_list::apply_monotonically(const schema& s, const range_tombstone_list& list) {

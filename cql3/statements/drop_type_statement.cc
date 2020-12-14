@@ -43,6 +43,8 @@
 #include "boost/range/adaptor/map.hpp"
 
 #include "service/migration_manager.hh"
+#include "database.hh"
+#include "user_types_metadata.hh"
 
 namespace cql3 {
 
@@ -61,22 +63,22 @@ void drop_type_statement::prepare_keyspace(const service::client_state& state)
     }
 }
 
-future<> drop_type_statement::check_access(const service::client_state& state)
+future<> drop_type_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const
 {
     return state.has_keyspace_access(keyspace(), auth::permission::DROP);
 }
 
-void drop_type_statement::validate(service::storage_proxy& proxy, const service::client_state& state)
+void drop_type_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const
 {
     try {
         auto&& ks = proxy.get_db().local().find_keyspace(keyspace());
-        auto&& all_types = ks.metadata()->user_types()->get_all_types();
+        auto&& all_types = ks.metadata()->user_types().get_all_types();
         auto old = all_types.find(_name.get_user_type_name());
         if (old == all_types.end()) {
             if (_if_exists) {
                 return;
             } else {
-                throw exceptions::invalid_request_exception(sprint("No user type named %s exists.", _name.to_string()));
+                throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_string()));
             }
         }
 
@@ -118,20 +120,20 @@ void drop_type_statement::validate(service::storage_proxy& proxy, const service:
             }
 
             if (ut->references_user_type(keyspace, name)) {
-                throw exceptions::invalid_request_exception(sprint("Cannot drop user type %s.%s as it is still used by user type %s", keyspace, type->get_name_as_string(), ut->get_name_as_string()));
+                throw exceptions::invalid_request_exception(format("Cannot drop user type {}.{} as it is still used by user type {}", keyspace, type->get_name_as_string(), ut->get_name_as_string()));
             }
         }
 
         for (auto&& cfm : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
             for (auto&& col : cfm->all_columns()) {
                 if (col.type->references_user_type(keyspace, name)) {
-                    throw exceptions::invalid_request_exception(sprint("Cannot drop user type %s.%s as it is still used by table %s.%s", keyspace, type->get_name_as_string(), cfm->ks_name(), cfm->cf_name()));
+                    throw exceptions::invalid_request_exception(format("Cannot drop user type {}.{} as it is still used by table {}.{}", keyspace, type->get_name_as_string(), cfm->ks_name(), cfm->cf_name()));
                 }
             }
         }
 
     } catch (no_such_keyspace& e) {
-        throw exceptions::invalid_request_exception(sprint("Cannot drop type in unknown keyspace %s", keyspace()));
+        throw exceptions::invalid_request_exception(format("Cannot drop type in unknown keyspace {}", keyspace()));
     }
 }
 
@@ -140,14 +142,14 @@ const sstring& drop_type_statement::keyspace() const
     return _name.get_keyspace();
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> drop_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only)
+future<shared_ptr<cql_transport::event::schema_change>> drop_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
 {
     auto&& db = proxy.get_db().local();
 
     // Keyspace exists or we wouldn't have validated otherwise
     auto&& ks = db.find_keyspace(keyspace());
 
-    auto&& all_types = ks.metadata()->user_types()->get_all_types();
+    const auto& all_types = ks.metadata()->user_types().get_all_types();
     auto to_drop = all_types.find(_name.get_user_type_name());
 
     // Can happen with if_exists
@@ -158,7 +160,7 @@ future<shared_ptr<cql_transport::event::schema_change>> drop_type_statement::ann
     return service::get_local_migration_manager().announce_type_drop(to_drop->second, is_local_only).then([this] {
         using namespace cql_transport;
 
-        return make_shared<event::schema_change>(
+        return ::make_shared<event::schema_change>(
                 event::schema_change::change_type::DROPPED,
                 event::schema_change::target_type::TYPE,
                 keyspace(),

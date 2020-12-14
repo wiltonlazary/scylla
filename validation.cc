@@ -42,31 +42,38 @@
 #include "validation.hh"
 #include "database.hh"
 #include "exceptions/exceptions.hh"
-#include "service/storage_proxy.hh"
 
 namespace validation {
 
 /**
  * Based on org.apache.cassandra.thrift.ThriftValidation#validate_key()
  */
-void
-validate_cql_key(schema_ptr schema, const partition_key& key) {
+std::optional<sstring> is_cql_key_invalid(const schema& schema, partition_key_view key) {
     // C* validates here that the thrift key is not empty.
     // It can only be empty if it is not composite and its only component in CQL form is empty.
-    if (schema->partition_key_size() == 1 && key.begin(*schema)->empty()) {
-        throw exceptions::invalid_request_exception("Key may not be empty");
+    if (schema.partition_key_size() == 1 && key.begin(schema)->empty()) {
+        return sstring("Key may not be empty");
     }
 
     // check that key can be handled by FBUtilities.writeShortByteArray
     auto b = key.representation();
     if (b.size() > max_key_size) {
-        throw exceptions::invalid_request_exception(sprint("Key length of %d is longer than maximum of %d", b.size(), max_key_size));
+        return format("Key length of {:d} is longer than maximum of {:d}", b.size(), max_key_size);
     }
 
     try {
-        key.validate(*schema);
+        key.validate(schema);
     } catch (const marshal_exception& e) {
-        throw exceptions::invalid_request_exception(e.what());
+        return sstring(e.what());
+    }
+
+    return std::nullopt;
+}
+
+void
+validate_cql_key(const schema& schema, partition_key_view key) {
+    if (const auto err = is_cql_key_invalid(schema, key); err) {
+        throw exceptions::invalid_request_exception(std::move(*err));
     }
 }
 
@@ -74,7 +81,7 @@ validate_cql_key(schema_ptr schema, const partition_key& key) {
  * Based on org.apache.cassandra.thrift.ThriftValidation#validateColumnFamily(java.lang.String, java.lang.String)
  */
 schema_ptr
-validate_column_family(database& db, const sstring& keyspace_name, const sstring& cf_name) {
+validate_column_family(const database& db, const sstring& keyspace_name, const sstring& cf_name) {
     validate_keyspace(db, keyspace_name);
 
     if (cf_name.empty()) {
@@ -84,33 +91,18 @@ validate_column_family(database& db, const sstring& keyspace_name, const sstring
     try {
         return db.find_schema(keyspace_name, cf_name);
     } catch (...) {
-        throw exceptions::invalid_request_exception(sprint("unconfigured table %s", cf_name));
+        throw exceptions::invalid_request_exception(format("unconfigured table {}", cf_name));
     }
 }
 
-schema_ptr validate_column_family(const sstring& keyspace_name,
-                const sstring& cf_name) {
-    return validate_column_family(
-                    service::get_local_storage_proxy().get_db().local(),
-                    keyspace_name, cf_name);
-}
-
-void validate_keyspace(database& db, const sstring& keyspace_name) {
+void validate_keyspace(const database& db, const sstring& keyspace_name) {
     if (keyspace_name.empty()) {
         throw exceptions::invalid_request_exception("Keyspace not set");
     }
 
-    try {
-        db.find_keyspace(keyspace_name);
-    } catch (...) {
-        throw exceptions::keyspace_not_defined_exception(sprint("Keyspace %s does not exist", keyspace_name));
+    if (!db.has_keyspace(keyspace_name)) {
+        throw exceptions::keyspace_not_defined_exception(format("Keyspace {} does not exist", keyspace_name));
     }
 }
-
-void validate_keyspace(const sstring& keyspace_name) {
-    validate_keyspace(service::get_local_storage_proxy().get_db().local(),
-                    keyspace_name);
-}
-
 
 }

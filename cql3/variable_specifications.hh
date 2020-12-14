@@ -44,7 +44,7 @@
 #include "cql3/column_specification.hh"
 #include "cql3/column_identifier.hh"
 
-#include <experimental/optional>
+#include <optional>
 #include <vector>
 
 namespace cql3 {
@@ -52,27 +52,31 @@ namespace cql3 {
 class variable_specifications final {
 private:
     std::vector<shared_ptr<column_identifier>> _variable_names;
-    std::vector<::shared_ptr<column_specification>> _specs;
-    std::vector<::shared_ptr<column_specification>> _target_columns;
+    std::vector<lw_shared_ptr<column_specification>> _specs;
+    std::vector<lw_shared_ptr<column_specification>> _target_columns;
 
 public:
+
+    variable_specifications() = default;
     variable_specifications(const std::vector<::shared_ptr<column_identifier>>& variable_names);
 
     /**
      * Returns an empty instance of <code>VariableSpecifications</code>.
      * @return an empty instance of <code>VariableSpecifications</code>
      */
-    static ::shared_ptr<variable_specifications> empty();
+    static lw_shared_ptr<variable_specifications> empty();
 
     size_t size() const;
 
-    std::vector<::shared_ptr<column_specification>> get_specifications() const &;
+    std::vector<lw_shared_ptr<column_specification>> get_specifications() const &;
 
-    std::vector<::shared_ptr<column_specification>> get_specifications() &&;
+    std::vector<lw_shared_ptr<column_specification>> get_specifications() &&;
 
-    std::vector<uint16_t> get_partition_key_bind_indexes(schema_ptr schema) const;
+    std::vector<uint16_t> get_partition_key_bind_indexes(const schema& schema) const;
 
-    void add(int32_t bind_index, ::shared_ptr<column_specification> spec);
+    void add(int32_t bind_index, lw_shared_ptr<column_specification> spec);
+
+    void set_bound_variables(const std::vector<shared_ptr<column_identifier>>& bound_names);
 };
 
 }

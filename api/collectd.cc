@@ -21,8 +21,8 @@
 
 #include "collectd.hh"
 #include "api/api-doc/collectd.json.hh"
-#include "core/scollectd.hh"
-#include "core/scollectd_api.hh"
+#include <seastar/core/scollectd.hh>
+#include <seastar/core/scollectd_api.hh>
 #include "endian.h"
 #include <boost/range/irange.hpp>
 #include <regex>
@@ -64,7 +64,7 @@ static const char* str_to_regex(const sstring& v) {
 void set_collectd(http_context& ctx, routes& r) {
     cd::get_collectd.set(r, [&ctx](std::unique_ptr<request> req) {
 
-        auto id = make_shared<scollectd::type_instance_id>(req->param["pluginid"],
+        auto id = ::make_shared<scollectd::type_instance_id>(req->param["pluginid"],
                 req->get_query_param("instance"), req->get_query_param("type"),
                 req->get_query_param("type_instance"));
 

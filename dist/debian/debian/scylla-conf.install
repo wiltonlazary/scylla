@@ -1,2 +1,3 @@
-conf/scylla.yaml etc/scylla
-conf/cassandra-rackdc.properties etc/scylla
+etc/scylla/scylla.yaml
+etc/scylla/cassandra-rackdc.properties
+

@@ -23,7 +23,7 @@
 
 #include "abstract_replication_strategy.hh"
 
-#include <experimental/optional>
+#include <optional>
 #include <set>
 
 // forward declaration since database.hh includes this file
@@ -36,9 +36,9 @@ using token = dht::token;
 
 class local_strategy : public abstract_replication_strategy {
 protected:
-    virtual std::vector<inet_address> calculate_natural_endpoints(const token& search_token, token_metadata& tm) const override;
+    virtual std::vector<inet_address> calculate_natural_endpoints(const token& search_token, const token_metadata& tm, can_yield) const override;
 public:
-    local_strategy(const sstring& keyspace_name, token_metadata& token_metadata, snitch_ptr& snitch, const std::map<sstring, sstring>& config_options);
+    local_strategy(const sstring& keyspace_name, const shared_token_metadata& token_metadata, snitch_ptr& snitch, const std::map<sstring, sstring>& config_options);
     virtual ~local_strategy() {};
     virtual size_t get_replication_factor() const;
     /**
@@ -46,11 +46,16 @@ public:
      * because the default implementation depends on token calculations but
      * LocalStrategy may be used before tokens are set up.
      */
-    std::vector<inet_address> get_natural_endpoints(const token& search_token) override;
+    std::vector<inet_address> do_get_natural_endpoints(const token& search_token, const token_metadata& tm, can_yield) override;
 
     virtual void validate_options() const override;
 
-    virtual std::experimental::optional<std::set<sstring>> recognized_options() const override;
+    virtual std::optional<std::set<sstring>> recognized_options() const override;
+
+    virtual bool allow_remove_node_being_replaced_from_natural_endpoints() const override {
+        return false;
+    }
+
 };
 
 }

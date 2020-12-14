@@ -21,15 +21,13 @@
 
 #pragma once
 
-#include "database_fwd.hh"
-#include "db/system_keyspace.hh"
+#include "database.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "dht/i_partitioner.hh"
 #include "keys.hh"
 #include "query-request.hh"
 #include "service/migration_listener.hh"
 #include "service/migration_manager.hh"
-#include "sstables/sstable_set.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include "utils/serialized_action.hh"
 #include "utils/UUID.hh"
@@ -45,6 +43,14 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
+namespace db::system_keyspace {
+
+using view_name = std::pair<sstring, sstring>;
+class view_build_progress;
+
+}
+
 
 namespace db::view {
 
@@ -108,6 +114,11 @@ class view_builder final : public service::migration_listener::only_view_notific
         std::optional<dht::token> next_token;
     };
 
+    struct stats {
+        uint64_t steps_performed = 0;
+        uint64_t steps_failed = 0;
+    };
+
     /**
      * Keeps track of the build progress for all the views of a particular
      * base table. Each execution of the build step comprises a query of
@@ -139,26 +150,44 @@ class view_builder final : public service::migration_listener::only_view_notific
 
     database& _db;
     db::system_distributed_keyspace& _sys_dist_ks;
-    service::migration_manager& _mm;
+    service::migration_notifier& _mnotifier;
+    reader_permit _permit;
     base_to_build_step_type _base_to_build_step;
     base_to_build_step_type::iterator _current_step = _base_to_build_step.end();
     serialized_action _build_step{std::bind(&view_builder::do_build_step, this)};
     // Ensures bookkeeping operations are serialized, meaning that while we execute
     // a build step we don't consider newly added or removed views. This simplifies
     // the algorithms. Also synchronizes an operation wrt. a call to stop().
-    seastar::semaphore _sem{1};
+    seastar::named_semaphore _sem{1, named_semaphore_exception_factory{"view builder"}};
     seastar::abort_source _as;
     future<> _started = make_ready_future<>();
     // Used to coordinate between shards the conclusion of the build process for a particular view.
     std::unordered_set<utils::UUID> _built_views;
+    // Counter and promise (both on shard 0 only!) allowing to wait for all
+    // shards to have read the view build statuses
+    unsigned _shards_finished_read = 0;
+    seastar::shared_promise<> _shards_finished_read_promise;
     // Used for testing.
     std::unordered_map<std::pair<sstring, sstring>, seastar::shared_promise<>, utils::tuple_hash> _build_notifiers;
+    stats _stats;
+    metrics::metric_groups _metrics;
+
+    struct view_builder_init_state {
+        std::vector<future<>> bookkeeping_ops;
+        std::vector<std::vector<view_build_status>> status_per_shard;
+        std::unordered_set<utils::UUID> built_views;
+    };
 
 public:
+    // The view builder processes the base table in steps of batch_size rows.
+    // However, if the individual rows are large, there is no real need to
+    // collect batch_size of them in memory at once. Rather, as soon as we've
+    // collected batch_memory_max bytes, we can process the rows read so far.
     static constexpr size_t batch_size = 128;
+    static constexpr size_t batch_memory_max = 1024*1024;
 
 public:
-    view_builder(database&, db::system_distributed_keyspace&, service::migration_manager&);
+    view_builder(database&, db::system_distributed_keyspace&, service::migration_notifier&);
     view_builder(view_builder&&) = delete;
 
     /**
@@ -166,7 +195,7 @@ public:
      * Requires that all views have been loaded from the system tables and are accessible
      * through the database, and that the commitlog has been replayed.
      */
-    future<> start();
+    future<> start(service::migration_manager&);
 
     /**
      * Stops the view building process.
@@ -178,18 +207,20 @@ public:
     virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override;
 
     // For tests
-    future<> wait_until_built(const sstring& ks_name, const sstring& view_name, lowres_clock::time_point timeout);
+    future<> wait_until_built(const sstring& ks_name, const sstring& view_name);
 
 private:
     build_step& get_or_create_build_step(utils::UUID);
     void initialize_reader_at_current_token(build_step&);
     void load_view_status(view_build_status, std::unordered_set<utils::UUID>&);
     void reshard(std::vector<std::vector<view_build_status>>, std::unordered_set<utils::UUID>&);
-    future<> calculate_shard_build_step(std::vector<system_keyspace::view_name>, std::vector<system_keyspace::view_build_progress>);
+    void setup_shard_build_step(view_builder_init_state& vbi, std::vector<system_keyspace::view_name>, std::vector<system_keyspace::view_build_progress>);
+    future<> calculate_shard_build_step(view_builder_init_state& vbi);
     future<> add_new_view(view_ptr, build_step&);
     future<> do_build_step();
     void execute(build_step&, exponential_backoff_retry);
     future<> maybe_mark_view_as_built(view_ptr, dht::token);
+    void setup_metrics();
 
     struct consumer;
 };

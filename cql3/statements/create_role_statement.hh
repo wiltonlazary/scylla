@@ -54,10 +54,6 @@ namespace statements {
 class create_role_statement final : public authentication_statement {
     sstring _role;
 
-    bool _is_superuser;
-
-    bool _can_login;
-
     role_options _options;
 
     bool _if_not_exists;
@@ -70,14 +66,16 @@ public:
                 , _if_not_exists(if_not_exists) {
     }
 
+    std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
+
     future<> grant_permissions_to_creator(const service::client_state&) const;
 
-    void validate(service::storage_proxy&, const service::client_state&) override;
+    void validate(service::storage_proxy&, const service::client_state&) const override;
 
-    virtual future<> check_access(const service::client_state&) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state&) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(service::storage_proxy&, service::query_state&, const query_options&) override;
+    execute(service::storage_proxy&, service::query_state&, const query_options&) const override;
 };
 
 }

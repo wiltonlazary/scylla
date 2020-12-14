@@ -23,15 +23,21 @@
 
 #include <chrono>
 #include <unordered_map>
+
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/unordered_set.hpp>
+#include <boost/intrusive/parent_from_member.hpp>
+#include <boost/range/adaptor/filtered.hpp>
+#include <boost/range/adaptor/transformed.hpp>
 
-#include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/future-util.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/gate.hh>
 
 #include "exceptions/exceptions.hh"
 #include "utils/loading_shared_values.hh"
+#include "utils/chunked_vector.hh"
 #include "log.hh"
 
 namespace bi = boost::intrusive;
@@ -39,7 +45,7 @@ namespace bi = boost::intrusive;
 namespace utils {
 
 using loading_cache_clock_type = seastar::lowres_clock;
-using auto_unlink_list_hook = bi::list_base_hook<bi::link_mode<bi::auto_unlink>>;
+using safe_link_list_hook = bi::list_base_hook<bi::link_mode<bi::safe_link>>;
 
 template<typename Tp, typename Key, typename EntrySize , typename Hash, typename EqualPred, typename LoadingSharedValuesStats>
 class timestamped_val {
@@ -79,6 +85,10 @@ public:
     value_type& value() noexcept { return _value; }
     const value_type& value() const noexcept { return _value; }
 
+    static const timestamped_val& container_of(const value_type& value) {
+        return *bi::get_parent_from_member(&value, &timestamped_val::_value);
+    }
+
     loading_cache_clock_type::time_point last_read() const noexcept {
         return _last_read;
     }
@@ -92,6 +102,10 @@ public:
     }
 
     bool ready() const noexcept {
+        return _lru_entry_ptr;
+    }
+
+    lru_entry* lru_entry_ptr() const noexcept {
         return _lru_entry_ptr;
     }
 
@@ -136,13 +150,13 @@ public:
 
 /// \brief This is and LRU list entry which is also an anchor for a loading_cache value.
 template<typename Tp, typename Key, typename EntrySize , typename Hash, typename EqualPred, typename LoadingSharedValuesStats>
-class timestamped_val<Tp, Key, EntrySize, Hash, EqualPred, LoadingSharedValuesStats>::lru_entry : public auto_unlink_list_hook {
+class timestamped_val<Tp, Key, EntrySize, Hash, EqualPred, LoadingSharedValuesStats>::lru_entry : public safe_link_list_hook {
 private:
     using ts_value_type = timestamped_val<Tp, Key, EntrySize, Hash, EqualPred, LoadingSharedValuesStats>;
     using loading_values_type = typename ts_value_type::loading_values_type;
 
 public:
-    using lru_list_type = bi::list<lru_entry, bi::constant_time_size<false>>;
+    using lru_list_type = bi::list<lru_entry>;
     using timestamped_val_ptr = typename loading_values_type::entry_ptr;
 
 private:
@@ -161,6 +175,9 @@ public:
     }
 
     ~lru_entry() {
+        if (safe_link_list_hook::is_linked()) {
+            _lru_list.erase(_lru_list.iterator_to(*this));
+        }
         _cache_size -= _ts_val_ptr->size();
         _ts_val_ptr->set_anchor_back_reference(nullptr);
     }
@@ -172,7 +189,9 @@ public:
     /// Set this item as the most recently used item.
     /// The MRU item is going to be at the front of the _lru_list, the LRU item - at the back.
     void touch() noexcept {
-        auto_unlink_list_hook::unlink();
+        if (safe_link_list_hook::is_linked()) {
+            _lru_list.erase(_lru_list.iterator_to(*this));
+        }
         _lru_list.push_front(*this);
     }
 
@@ -241,9 +260,10 @@ private:
     using ts_value_lru_entry = typename ts_value_type::lru_entry;
     using set_iterator = typename loading_values_type::iterator;
     using lru_list_type = typename ts_value_lru_entry::lru_list_type;
+    using list_iterator = typename lru_list_type::iterator;
     struct value_extractor_fn {
-        Tp& operator()(ts_value_type& tv) const {
-            return tv.value();
+        Tp& operator()(ts_value_lru_entry& le) const {
+            return le.timestamped_value().value();
         }
     };
 
@@ -253,7 +273,7 @@ public:
     using value_ptr = typename ts_value_type::value_ptr;
 
     class entry_is_too_big : public std::exception {};
-    using iterator = boost::transform_iterator<value_extractor_fn, set_iterator>;
+    using iterator = boost::transform_iterator<value_extractor_fn, list_iterator>;
 
 private:
     loading_cache(size_t max_size, std::chrono::milliseconds expiry, std::chrono::milliseconds refresh, logging::logger& logger)
@@ -351,9 +371,7 @@ public:
 
         // If caching is disabled - always load in the foreground
         if (!caching_enabled()) {
-            return _load(k).then([] (Tp val) {
-                return make_ready_future<Tp>(std::move(val));
-            });
+            return _load(k);
         }
 
         return get_ptr(k).then([] (value_ptr v_ptr) {
@@ -365,16 +383,21 @@ public:
         return _timer_reads_gate.close().finally([this] { _timer.cancel(); });
     }
 
+    template<typename KeyType, typename KeyHasher, typename KeyEqual>
+    iterator find(const KeyType& key, KeyHasher key_hasher_func, KeyEqual key_equal_func) noexcept {
+        return boost::make_transform_iterator(to_list_iterator(set_find(key, std::move(key_hasher_func), std::move(key_equal_func))), _value_extractor_fn);
+    };
+
     iterator find(const Key& k) noexcept {
-        return boost::make_transform_iterator(set_find(k), _value_extractor_fn);
+        return boost::make_transform_iterator(to_list_iterator(set_find(k)), _value_extractor_fn);
     }
 
     iterator end() {
-        return boost::make_transform_iterator(_loading_values.end(), _value_extractor_fn);
+        return boost::make_transform_iterator(list_end(), _value_extractor_fn);
     }
 
     iterator begin() {
-        return boost::make_transform_iterator(_loading_values.begin(), _value_extractor_fn);
+        return boost::make_transform_iterator(list_begin(), _value_extractor_fn);
     }
 
     template <typename Pred>
@@ -388,8 +411,26 @@ public:
         });
     }
 
+    void remove(const Key& k) {
+        auto it = set_find(k);
+        if (it == set_end()) {
+            return;
+        }
+
+        _lru_list.erase_and_dispose(_lru_list.iterator_to(*it->lru_entry_ptr()), [this] (ts_value_lru_entry* p) { loading_cache::destroy_ts_value(p); });
+    }
+
+    void remove(iterator it) {
+        if (it == end()) {
+            return;
+        }
+
+        const ts_value_type& val = ts_value_type::container_of(*it);
+        _lru_list.erase_and_dispose(_lru_list.iterator_to(*val.lru_entry_ptr()), [this] (ts_value_lru_entry* p) { loading_cache::destroy_ts_value(p); });
+    }
+
     size_t size() const {
-        return _loading_values.size();
+        return _lru_list.size();
     }
 
     /// \brief returns the memory size the currently cached entries occupy according to the EntrySize predicate.
@@ -398,8 +439,16 @@ public:
     }
 
 private:
-    set_iterator set_find(const Key& k) noexcept {
-        set_iterator it = _loading_values.find(k);
+    /// Should only be called on values for which the following holds: set_it == set_end() || set_it->ready()
+    /// For instance this always holds for iterators returned by set_find(...).
+    list_iterator to_list_iterator(set_iterator set_it) {
+        if (set_it != set_end()) {
+            return _lru_list.iterator_to(*set_it->lru_entry_ptr());
+        }
+        return list_end();
+    }
+
+    set_iterator ready_entry_iterator(set_iterator it) {
         set_iterator end_it = set_end();
 
         if (it == end_it || !it->ready()) {
@@ -408,12 +457,31 @@ private:
         return it;
     }
 
+    template<typename KeyType, typename KeyHasher, typename KeyEqual>
+    set_iterator set_find(const KeyType& key, KeyHasher key_hasher_func, KeyEqual key_equal_func) noexcept {
+        return ready_entry_iterator(_loading_values.find(key, std::move(key_hasher_func), std::move(key_equal_func)));
+    }
+
+    // keep the default non-templated overloads to ease on the compiler for specifications
+    // that do not require the templated find().
+    set_iterator set_find(const Key& key) noexcept {
+        return ready_entry_iterator(_loading_values.find(key));
+    }
+
     set_iterator set_end() noexcept {
         return _loading_values.end();
     }
 
     set_iterator set_begin() noexcept {
         return _loading_values.begin();
+    }
+
+    list_iterator list_end() noexcept {
+        return _lru_list.end();
+    }
+
+    list_iterator list_begin() noexcept {
+        return _lru_list.begin();
     }
 
     bool caching_enabled() const {
@@ -425,11 +493,19 @@ private:
         Alloc().deallocate(val, 1);
     }
 
-    future<> reload(ts_value_lru_entry& lru_entry) {
-        return _load(lru_entry.key()).then_wrapped([this, key = lru_entry.key()] (auto&& f) mutable {
+    future<> reload(timestamped_val_ptr ts_value_ptr) {
+        const Key& key = loading_values_type::to_key(ts_value_ptr);
+
+        // Do nothing if the entry has been dropped before we got here (e.g. by the _load() call on another key that is
+        // also being reloaded).
+        if (!ts_value_ptr->lru_entry_ptr()) {
+            _logger.trace("{}: entry was dropped before the reload", key);
+            return make_ready_future<>();
+        }
+
+        return _load(key).then_wrapped([this, ts_value_ptr = std::move(ts_value_ptr), &key] (auto&& f) mutable {
             // if the entry has been evicted by now - simply end here
-            set_iterator it = this->set_find(key);
-            if (it == this->set_end()) {
+            if (!ts_value_ptr->lru_entry_ptr()) {
                 _logger.trace("{}: entry was dropped during the reload", key);
                 return make_ready_future<>();
             }
@@ -441,7 +517,7 @@ private:
             // will be propagated up to the user and will fail the
             // corresponding query.
             try {
-                *it = f.get0();
+                *ts_value_ptr = f.get0();
             } catch (std::exception& e) {
                 _logger.debug("{}: reload failed: {}", key, e.what());
             } catch (...) {
@@ -498,21 +574,27 @@ private:
         // check if rehashing is needed and do it if it is.
         periodic_rehash();
 
-        if (ReloadEnabled == loading_cache_reload_enabled::no) {
+        if constexpr (ReloadEnabled == loading_cache_reload_enabled::no) {
             _logger.trace("on_timer(): rearming");
             _timer.arm(loading_cache_clock_type::now() + _timer_period);
             return;
         }
 
-        // Reload all those which vlaue needs to be reloaded.
-        with_gate(_timer_reads_gate, [this] {
-            return parallel_for_each(_lru_list.begin(), _lru_list.end(), [this] (ts_value_lru_entry& lru_entry) {
-                _logger.trace("on_timer(): {}: checking the value age", lru_entry.key());
-                if (lru_entry.timestamped_value().loaded() + _refresh < loading_cache_clock_type::now()) {
-                    _logger.trace("on_timer(): {}: reloading the value", lru_entry.key());
-                    return this->reload(lru_entry);
-                }
-                return now();
+        // Reload all those which value needs to be reloaded.
+        // Future is waited on indirectly in `stop()` (via `_timer_reads_gate`).
+        // FIXME: error handling
+        (void)with_gate(_timer_reads_gate, [this] {
+            auto to_reload = boost::copy_range<utils::chunked_vector<timestamped_val_ptr>>(_lru_list
+                    | boost::adaptors::filtered([this] (ts_value_lru_entry& lru_entry) {
+                        return lru_entry.timestamped_value().loaded() + _refresh < loading_cache_clock_type::now();
+                    })
+                    | boost::adaptors::transformed([] (ts_value_lru_entry& lru_entry) {
+                        return lru_entry.timestamped_value_ptr();
+                    }));
+
+            return parallel_for_each(std::move(to_reload), [this] (timestamped_val_ptr ts_value_ptr) {
+                _logger.trace("on_timer(): {}: reloading the value", loading_values_type::to_key(ts_value_ptr));
+                return this->reload(std::move(ts_value_ptr));
             }).finally([this] {
                 _logger.trace("on_timer(): rearming");
                 _timer.arm(loading_cache_clock_type::now() + _timer_period);

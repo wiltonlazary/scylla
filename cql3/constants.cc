@@ -64,7 +64,7 @@ operator<<(std::ostream&out, constants::type t)
 }
 
 bytes
-constants::literal::parsed_value(data_type validator)
+constants::literal::parsed_value(data_type validator) const
 {
     try {
         if (_type == type::HEX && validator == bytes_type) {
@@ -82,23 +82,22 @@ constants::literal::parsed_value(data_type validator)
 }
 
 assignment_testable::test_result
-constants::literal::test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver)
+constants::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const
 {
-    auto receiver_type = receiver->type->as_cql3_type();
-    if (receiver_type->is_collection()) {
+    auto receiver_type = receiver.type->as_cql3_type();
+    if (receiver_type.is_collection() || receiver_type.is_user_type()) {
         return test_result::NOT_ASSIGNABLE;
     }
-    if (!receiver_type->is_native()) {
+    if (!receiver_type.is_native()) {
         return test_result::WEAKLY_ASSIGNABLE;
     }
-    auto kind = receiver_type.get()->get_kind();
+    auto kind = receiver_type.get_kind();
     switch (_type) {
         case type::STRING:
             if (cql3_type::kind_enum_set::frozen<
                     cql3_type::kind::ASCII,
                     cql3_type::kind::TEXT,
                     cql3_type::kind::INET,
-                    cql3_type::kind::VARCHAR,
                     cql3_type::kind::TIMESTAMP,
                     cql3_type::kind::DATE,
                     cql3_type::kind::TIME>::contains(kind)) {
@@ -156,21 +155,21 @@ constants::literal::test_assignment(database& db, const sstring& keyspace, ::sha
 }
 
 ::shared_ptr<term>
-constants::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver)
+constants::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const
 {
-    if (!is_assignable(test_assignment(db, keyspace, receiver))) {
-        throw exceptions::invalid_request_exception(sprint("Invalid %s constant (%s) for \"%s\" of type %s",
-            _type, _text, *receiver->name, receiver->type->as_cql3_type()->to_string()));
+    if (!is_assignable(test_assignment(db, keyspace, *receiver))) {
+        throw exceptions::invalid_request_exception(format("Invalid {} constant ({}) for \"{}\" of type {}",
+            _type, _text, *receiver->name, receiver->type->as_cql3_type().to_string()));
     }
     return ::make_shared<value>(cql3::raw_value::make_value(parsed_value(receiver->type)));
 }
 
 void constants::deleter::execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) {
     if (column.type->is_multi_cell()) {
-        collection_type_impl::mutation coll_m;
+        collection_mutation_description coll_m;
         coll_m.tomb = params.make_tombstone();
-        auto ctype = static_pointer_cast<const collection_type_impl>(column.type);
-        m.set_cell(prefix, column, atomic_cell_or_collection::from_collection_mutation(ctype->serialize_mutation_form(coll_m)));
+
+        m.set_cell(prefix, column, coll_m.serialize(*column.type));
     } else {
         m.set_cell(prefix, column, make_dead_cell(params));
     }

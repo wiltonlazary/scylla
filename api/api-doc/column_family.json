@@ -70,7 +70,7 @@
             {
                "method":"POST",
                "summary":"Force a major compaction of this column family",
-               "type":"string",
+               "type":"void",
                "nickname":"force_major_compaction",
                "produces":[
                   "application/json"
@@ -121,7 +121,7 @@
                      "description":"The minimum number of sstables in queue before compaction kicks off",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -172,7 +172,7 @@
                      "description":"The maximum number of sstables in queue before compaction kicks off",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -223,7 +223,7 @@
                      "description":"The maximum number of sstables in queue before compaction kicks off",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   },
                   {
@@ -231,7 +231,7 @@
                      "description":"The minimum number of sstables in queue before compaction kicks off",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -380,16 +380,54 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"check if the auto compaction disabled",
+               "summary":"check if the auto_compaction property is enabled for a given table",
                "type":"boolean",
-               "nickname":"is_auto_compaction_disabled",
+               "nickname":"get_auto_compaction",
                "produces":[
                   "application/json"
                ],
                "parameters":[
                   {
                      "name":"name",
-                     "description":"The column family name in keyspace:name format",
+                     "description":"The table name in keyspace:name format",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  }
+               ]
+            },
+            {
+               "method":"POST",
+               "summary":"Enable table auto compaction",
+               "type":"void",
+               "nickname":"enable_auto_compaction",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"name",
+                     "description":"The table name in keyspace:name format",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  }
+               ]
+            },
+            {
+               "method":"DELETE",
+               "summary":"Disable table auto compaction",
+               "type":"void",
+               "nickname":"disable_auto_compaction",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"name",
+                     "description":"The table name in keyspace:name format",
                      "required":true,
                      "allowMultiple":false,
                      "type":"string",
@@ -455,7 +493,7 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"Returns a list of filenames that contain the given key on this node",
+               "summary":"Returns a list of sstable filenames that contain the given partition key on this node",
                "type":"array",
                "items":{
                   "type":"string"
@@ -475,7 +513,7 @@
                   },
                   {
                      "name":"key",
-                     "description":"The key",
+                     "description":"The partition key. In a composite-key scenario, use ':' to separate the columns in the key.",
                      "required":true,
                      "allowMultiple":false,
                      "type":"string",
@@ -544,7 +582,7 @@
                "summary":"sstable count for each level. empty unless leveled compaction is used",
                "type":"array",
                "items":{
-                  "type":"int"
+                  "type": "long"
                },
                "nickname":"get_sstable_count_per_level",
                "produces":[
@@ -608,6 +646,54 @@
                      "paramType":"path"
                   }
                ]
+            }
+         ]
+      },
+      {
+         "path":"/column_family/toppartitions/{name}",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Toppartitions query",
+               "type":"toppartitions_query_results",
+               "nickname":"toppartitions",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"name",
+                     "description":"The column family name in keyspace:name format",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  },
+                  {
+                     "name":"duration",
+                     "description":"Duration (in milliseconds) of monitoring operation",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type": "long",
+                     "paramType":"query"
+                  },
+                  {
+                    "name":"list_size",
+                    "description":"number of the top partitions to list",
+                    "required":false,
+                    "allowMultiple":false,
+                    "type": "long",
+                    "paramType":"query"
+                 },
+                 {
+                    "name":"capacity",
+                    "description":"capacity of stream summary: determines amount of resources used in query processing",
+                    "required":false,
+                    "allowMultiple":false,
+                    "type": "long",
+                    "paramType":"query"
+                 }
+              ]
             }
          ]
       },
@@ -873,7 +959,7 @@
             {
                "method":"GET",
                "summary":"Get memtable switch count",
-               "type":"int",
+               "type": "long",
                "nickname":"get_memtable_switch_count",
                "produces":[
                   "application/json"
@@ -897,7 +983,7 @@
             {
                "method":"GET",
                "summary":"Get all memtable switch count",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_memtable_switch_count",
                "produces":[
                   "application/json"
@@ -1034,7 +1120,7 @@
             {
                "method":"GET",
                "summary":"Get read latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_read_latency",
                "produces":[
                   "application/json"
@@ -1187,7 +1273,7 @@
             {
                "method":"GET",
                "summary":"Get all read latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_read_latency",
                "produces":[
                   "application/json"
@@ -1203,7 +1289,7 @@
             {
                "method":"GET",
                "summary":"Get range latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_range_latency",
                "produces":[
                   "application/json"
@@ -1227,7 +1313,7 @@
             {
                "method":"GET",
                "summary":"Get all range latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_range_latency",
                "produces":[
                   "application/json"
@@ -1243,7 +1329,7 @@
             {
                "method":"GET",
                "summary":"Get write latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_write_latency",
                "produces":[
                   "application/json"
@@ -1396,7 +1482,7 @@
             {
                "method":"GET",
                "summary":"Get all write latency",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_write_latency",
                "produces":[
                   "application/json"
@@ -1412,7 +1498,7 @@
             {
                "method":"GET",
                "summary":"Get pending flushes",
-               "type":"int",
+               "type": "long",
                "nickname":"get_pending_flushes",
                "produces":[
                   "application/json"
@@ -1436,7 +1522,7 @@
             {
                "method":"GET",
                "summary":"Get all pending flushes",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_pending_flushes",
                "produces":[
                   "application/json"
@@ -1452,7 +1538,7 @@
             {
                "method":"GET",
                "summary":"Get pending compactions",
-               "type":"int",
+               "type": "long",
                "nickname":"get_pending_compactions",
                "produces":[
                   "application/json"
@@ -1476,7 +1562,7 @@
             {
                "method":"GET",
                "summary":"Get all pending compactions",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_pending_compactions",
                "produces":[
                   "application/json"
@@ -1492,7 +1578,7 @@
             {
                "method":"GET",
                "summary":"Get live ss table count",
-               "type":"int",
+               "type": "long",
                "nickname":"get_live_ss_table_count",
                "produces":[
                   "application/json"
@@ -1516,7 +1602,7 @@
             {
                "method":"GET",
                "summary":"Get all live ss table count",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_live_ss_table_count",
                "produces":[
                   "application/json"
@@ -1532,7 +1618,7 @@
             {
                "method":"GET",
                "summary":"Get live disk space used",
-               "type":"int",
+               "type": "long",
                "nickname":"get_live_disk_space_used",
                "produces":[
                   "application/json"
@@ -1556,7 +1642,7 @@
             {
                "method":"GET",
                "summary":"Get all live disk space used",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_live_disk_space_used",
                "produces":[
                   "application/json"
@@ -1572,7 +1658,7 @@
             {
                "method":"GET",
                "summary":"Get total disk space used",
-               "type":"int",
+               "type": "long",
                "nickname":"get_total_disk_space_used",
                "produces":[
                   "application/json"
@@ -1596,7 +1682,7 @@
             {
                "method":"GET",
                "summary":"Get all total disk space used",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_total_disk_space_used",
                "produces":[
                   "application/json"
@@ -2052,7 +2138,7 @@
             {
                "method":"GET",
                "summary":"Get speculative retries",
-               "type":"int",
+               "type": "long",
                "nickname":"get_speculative_retries",
                "produces":[
                   "application/json"
@@ -2076,7 +2162,7 @@
             {
                "method":"GET",
                "summary":"Get all speculative retries",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_speculative_retries",
                "produces":[
                   "application/json"
@@ -2156,7 +2242,7 @@
             {
                "method":"GET",
                "summary":"Get row cache hit out of range",
-               "type":"int",
+               "type": "long",
                "nickname":"get_row_cache_hit_out_of_range",
                "produces":[
                   "application/json"
@@ -2180,7 +2266,7 @@
             {
                "method":"GET",
                "summary":"Get all row cache hit out of range",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_row_cache_hit_out_of_range",
                "produces":[
                   "application/json"
@@ -2196,7 +2282,7 @@
             {
                "method":"GET",
                "summary":"Get row cache hit",
-               "type":"int",
+               "type": "long",
                "nickname":"get_row_cache_hit",
                "produces":[
                   "application/json"
@@ -2220,7 +2306,7 @@
             {
                "method":"GET",
                "summary":"Get all row cache hit",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_row_cache_hit",
                "produces":[
                   "application/json"
@@ -2236,7 +2322,7 @@
             {
                "method":"GET",
                "summary":"Get row cache miss",
-               "type":"int",
+               "type": "long",
                "nickname":"get_row_cache_miss",
                "produces":[
                   "application/json"
@@ -2260,7 +2346,7 @@
             {
                "method":"GET",
                "summary":"Get all row cache miss",
-               "type":"int",
+               "type": "long",
                "nickname":"get_all_row_cache_miss",
                "produces":[
                   "application/json"
@@ -2276,7 +2362,7 @@
             {
                "method":"GET",
                "summary":"Get cas prepare",
-               "type":"int",
+               "type": "long",
                "nickname":"get_cas_prepare",
                "produces":[
                   "application/json"
@@ -2300,7 +2386,7 @@
             {
                "method":"GET",
                "summary":"Get cas propose",
-               "type":"int",
+               "type": "long",
                "nickname":"get_cas_propose",
                "produces":[
                   "application/json"
@@ -2324,7 +2410,7 @@
             {
                "method":"GET",
                "summary":"Get cas commit",
-               "type":"int",
+               "type": "long",
                "nickname":"get_cas_commit",
                "produces":[
                   "application/json"
@@ -2814,6 +2900,52 @@
             "type":{
                "type":"string",
                "description":"The column family type"
+            }
+         }
+      },
+      "toppartitions_record":{
+         "id":"toppartitions_record",
+         "description":"nodetool toppartitions query record",
+         "properties":{
+            "partition":{
+               "type":"string",
+               "description":"Partition key"
+            },
+            "count":{
+               "type":"long",
+               "description":"Number of read/write operations"
+            },
+            "error":{
+               "type":"long",
+               "description":"Indication of inaccuracy in counting PKs"
+            }
+         }
+      },
+      "toppartitions_query_results":{
+         "id":"toppartitions_query_results",
+         "description":"nodetool toppartitions query results",
+         "properties":{
+            "read_cardinality":{
+               "type":"long",
+               "description":"Number of the unique operations in the sample set"
+            },
+            "read":{
+               "type":"array",
+               "items":{
+                  "type":"toppartitions_record"
+               },
+               "description":"Read results"
+            },
+            "write_cardinality":{
+               "type":"long",
+               "description":"Number of the unique operations in the sample set"
+            },
+            "write":{
+               "type":"array",
+               "items":{
+                  "type":"toppartitions_record"
+               },
+               "description":"Write results"
             }
          }
       }

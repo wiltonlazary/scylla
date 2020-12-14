@@ -55,17 +55,23 @@ class error_collector : public error_listener<RecognizerType, ExceptionBaseType>
     /**
      * The offset of the first token of the snippet.
      */
-    static const int32_t FIRST_TOKEN_OFFSET = 10;
+    static constexpr int32_t FIRST_TOKEN_OFFSET = 10;
 
     /**
      * The offset of the last token of the snippet.
      */
-    static const int32_t LAST_TOKEN_OFFSET = 2;
+    static constexpr int32_t LAST_TOKEN_OFFSET = 2;
 
     /**
      * The CQL query.
      */
     const sstring_view _query;
+
+    /**
+     * An empty bitset to be used as a workaround for AntLR null dereference
+     * bug.
+     */
+    static typename ExceptionBaseType::BitsetListType _empty_bit_list;
 
 public:
 
@@ -144,6 +150,14 @@ private:
             break;
         }
         default:
+            // AntLR Exception class has a bug of dereferencing a null
+            // pointer in the displayRecognitionError. The following
+            // if statement makes sure it will not be null before the
+            // call to that function (displayRecognitionError).
+            // bug reference: https://github.com/antlr/antlr3/issues/191
+            if (!ex->get_expectingSet()) {
+                ex->set_expectingSet(&_empty_bit_list);
+            }
             ex->displayRecognitionError(token_names, msg);
         }
         return msg.str();
@@ -344,5 +358,9 @@ private:
     }
 #endif
 };
+
+template<typename RecognizerType, typename TokenType, typename ExceptionBaseType>
+typename ExceptionBaseType::BitsetListType
+error_collector<RecognizerType,TokenType,ExceptionBaseType>::_empty_bit_list = typename ExceptionBaseType::BitsetListType();
 
 }

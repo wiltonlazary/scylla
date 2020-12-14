@@ -47,60 +47,55 @@
 #include "cql3/util.hh"
 #include "cql_type_parser.hh"
 #include "types.hh"
+#include "user_types_metadata.hh"
 
 static ::shared_ptr<cql3::cql3_type::raw> parse_raw(const sstring& str) {
-    return cql3::util::do_with_parser(str,  std::mem_fn(&cql3_parser::CqlParser::comparatorType));
+    return cql3::util::do_with_parser(str,
+        [] (cql3_parser::CqlParser& parser) {
+            return parser.comparator_type(true);
+        });
 }
 
-data_type db::cql_type_parser::parse(const sstring& keyspace, const sstring& str, lw_shared_ptr<user_types_metadata> user_types) {
-    static const thread_local std::unordered_map<sstring, shared_ptr<cql3::cql3_type>> native_types = []{
-        std::unordered_map<sstring, shared_ptr<cql3::cql3_type>> res;
+data_type db::cql_type_parser::parse(const sstring& keyspace, const sstring& str) {
+    static const thread_local std::unordered_map<sstring, cql3::cql3_type> native_types = []{
+        std::unordered_map<sstring, cql3::cql3_type> res;
         for (auto& nt : cql3::cql3_type::values()) {
-            res.emplace(nt->to_string(), nt);
+            res.emplace(nt.to_string(), nt);
         }
         return res;
     }();
 
     auto i = native_types.find(str);
     if (i != native_types.end()) {
-        return i->second->get_type();
+        return i->second.get_type();
     }
 
-    if (!user_types && service::get_storage_proxy().local_is_initialized()) {
-        user_types = service::get_storage_proxy().local().get_db().local().find_keyspace(keyspace).metadata()->user_types();
-    }
-    // special-case top-level UDTs
-    if (user_types) {
-        auto& map = user_types->get_all_types();
-        auto i = map.find(utf8_type->decompose(str));
-        if (i != map.end()) {
-            return i->second;
-        }
-    }
-
+    const auto& sp = service::get_storage_proxy();
+    const user_types_metadata& user_types =
+            sp.local_is_initialized() ? sp.local().get_db().local().find_keyspace(keyspace).metadata()->user_types()
+                                      : user_types_metadata{};
     auto raw = parse_raw(str);
-    auto cql = raw->prepare_internal(keyspace, user_types);
-    return cql->get_type();
+    return raw->prepare_internal(keyspace, user_types).get_type();
 }
 
 class db::cql_type_parser::raw_builder::impl {
 public:
-    impl(sstring ks_name)
-        : _ks_name(std::move(ks_name))
+    impl(keyspace_metadata &ks)
+        : _ks(ks)
     {}
 
-//    static shared_ptr<user_type_impl> get_instance(sstring keyspace, bytes name, std::vector<bytes> field_names, std::vector<data_type> field_types) {
+//    static shared_ptr<user_type_impl> get_instance(sstring keyspace, bytes name, std::vector<bytes> field_names, std::vector<data_type> field_types, bool is_multi_cell) {
 
     struct entry {
         sstring name;
         std::vector<sstring> field_names;
         std::vector<::shared_ptr<cql3::cql3_type::raw>> field_types;
 
-        user_type prepare(const sstring& keyspace, lw_shared_ptr<user_types_metadata> user_types) const {
+        user_type prepare(const sstring& keyspace, user_types_metadata& user_types) const {
             std::vector<data_type> fields;
             fields.reserve(field_types.size());
             std::transform(field_types.begin(), field_types.end(), std::back_inserter(fields), [&](auto& r) {
-                return r->prepare_internal(keyspace, user_types)->get_type();
+                return r->prepare_internal(keyspace, user_types).get_type();
             });
             std::vector<bytes> names;
             names.reserve(field_names.size());
@@ -108,7 +103,7 @@ public:
                 return to_bytes(s);
             });
 
-            return user_type_impl::get_instance(keyspace, to_bytes(name), std::move(names), std::move(fields));
+            return user_type_impl::get_instance(keyspace, to_bytes(name), std::move(names), std::move(fields), true);
         }
 
     };
@@ -148,12 +143,18 @@ public:
 
         std::deque<entry *> resolvable_types;
         for (auto& e : _definitions) {
-            if (!vertices.count(&e)) {
+            if (!vertices.contains(&e)) {
                 resolvable_types.emplace_back(&e);
             }
         }
 
-        auto types = ::make_lw_shared<user_types_metadata>();
+        // Create a copy of the existing types, so that we don't
+        // modify the one in the keyspace. It is up to the caller to
+        // do that.
+        user_types_metadata types = _ks.user_types();
+
+        const auto &ks_name = _ks.name();
+        std::vector<user_type> created;
 
         while (!resolvable_types.empty()) {
             auto* e =  resolvable_types.front();
@@ -167,23 +168,24 @@ public:
                 ++r.first;
             }
 
-            types->add_type(e->prepare(_ks_name, types));
+            created.push_back(e->prepare(ks_name, types));
+            types.add_type(created.back());
             resolvable_types.pop_front();
         }
 
-        if (types->get_all_types().size() != _definitions.size()) {
-            throw exceptions::configuration_exception(sprint("Cannot resolve UDTs for keyspace %s: some types are missing", _ks_name));
+        if (created.size() != _definitions.size()) {
+            throw exceptions::configuration_exception(format("Cannot resolve UDTs for keyspace {}: some types are missing", ks_name));
         }
 
-        return boost::copy_range<std::vector<user_type>>(types->get_all_types() | boost::adaptors::map_values);
+        return created;
     }
 private:
-    sstring _ks_name;
+    keyspace_metadata& _ks;
     std::vector<entry> _definitions;
 };
 
-db::cql_type_parser::raw_builder::raw_builder(sstring ks_name)
-    : _impl(std::make_unique<impl>(std::move(ks_name)))
+db::cql_type_parser::raw_builder::raw_builder(keyspace_metadata &ks)
+    : _impl(std::make_unique<impl>(ks))
 {}
 
 db::cql_type_parser::raw_builder::~raw_builder()

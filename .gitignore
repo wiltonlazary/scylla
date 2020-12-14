@@ -18,3 +18,12 @@ CMakeLists.txt.user
 *.egg-info
 __pycache__CMakeLists.txt.user
 .gdbinit
+resources
+.pytest_cache
+/expressions.tokens
+tags
+testlog
+test/*/*.reject
+.vscode
+docs/_build
+docs/poetry.lock

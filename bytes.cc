@@ -20,7 +20,7 @@
  */
 
 #include "bytes.hh"
-#include "core/print.hh"
+#include <seastar/core/print.hh>
 
 static inline int8_t hex_to_int(unsigned char c) {
     switch (c) {
@@ -55,7 +55,7 @@ bytes from_hex(sstring_view s) {
         auto half_byte1 = hex_to_int(s[i * 2]);
         auto half_byte2 = hex_to_int(s[i * 2 + 1]);
         if (half_byte1 == -1 || half_byte2 == -1) {
-            throw std::invalid_argument(sprint("Non-hex characters in %s", s));
+            throw std::invalid_argument(format("Non-hex characters in {}", s));
         }
         out[i] = (half_byte1 << 4) | half_byte2;
     }
@@ -64,7 +64,7 @@ bytes from_hex(sstring_view s) {
 
 sstring to_hex(bytes_view b) {
     static char digits[] = "0123456789abcdef";
-    sstring out(sstring::initialized_later(), b.size() * 2);
+    sstring out = uninitialized_string(b.size() * 2);
     unsigned end = b.size();
     for (unsigned i = 0; i != end; ++i) {
         uint8_t x = b[i];
@@ -99,4 +99,8 @@ std::ostream& operator<<(std::ostream& os, const bytes_view& b) {
     return os << to_hex(b);
 }
 
+}
+
+std::ostream& operator<<(std::ostream& os, const fmt_hex& b) {
+    return os << to_hex(b.v);
 }

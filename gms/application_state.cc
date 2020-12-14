@@ -63,6 +63,12 @@ static const std::map<application_state, sstring> application_state_names = {
     {application_state::SUPPORTED_FEATURES,     "SUPPORTED_FEATURES"},
     {application_state::CACHE_HITRATES,         "CACHE_HITRATES"},
     {application_state::SCHEMA_TABLES_VERSION,  "SCHEMA_TABLES_VERSION"},
+    {application_state::RPC_READY,              "RPC_READY"},
+    {application_state::VIEW_BACKLOG,           "VIEW_BACKLOG"},
+    {application_state::SHARD_COUNT,            "SHARD_COUNT"},
+    {application_state::IGNORE_MSB_BITS,        "IGNOR_MSB_BITS"},
+    {application_state::CDC_STREAMS_TIMESTAMP,  "CDC_STREAMS_TIMESTAMP"},
+    {application_state::SNITCH_NAME,            "SNITCH_NAME"},
 };
 
 std::ostream& operator<<(std::ostream& os, const application_state& m) {

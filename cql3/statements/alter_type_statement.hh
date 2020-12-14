@@ -57,20 +57,20 @@ public:
 
     virtual void prepare_keyspace(const service::client_state& state) override;
 
-    virtual future<> check_access(const service::client_state& state) override;
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
-    virtual void validate(service::storage_proxy& proxy, const service::client_state& state) override;
+    virtual void validate(service::storage_proxy& proxy, const service::client_state& state) const override;
 
     virtual const sstring& keyspace() const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy, bool is_local_only) const override;
 
     class add_or_alter;
     class renames;
 protected:
     virtual user_type make_updated_type(database& db, user_type to_update) const = 0;
 private:
-    void do_announce_migration(database& db, ::keyspace& ks, bool is_local_only);
+    void do_announce_migration(database& db, ::keyspace& ks, bool is_local_only) const;
 };
 
 class alter_type_statement::add_or_alter : public alter_type_statement {
@@ -82,7 +82,7 @@ public:
                  const shared_ptr<column_identifier> field_name,
                  const shared_ptr<cql3_type::raw> field_type);
     virtual user_type make_updated_type(database& db, user_type to_update) const override;
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 private:
     user_type do_add(database& db, user_type to_update) const;
     user_type do_alter(database& db, user_type to_update) const;
@@ -99,7 +99,7 @@ public:
     void add_rename(shared_ptr<column_identifier> previous_name, shared_ptr<column_identifier> new_name);
 
     virtual user_type make_updated_type(database& db, user_type to_update) const override;
-    virtual std::unique_ptr<prepared> prepare(database& db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 };
 
 }

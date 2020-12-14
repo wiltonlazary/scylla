@@ -458,7 +458,7 @@
             {
                "method":"GET",
                "summary":"Return the generation value for this node.",
-               "type":"int",
+               "type": "long",
                "nickname":"get_current_generation_number",
                "produces":[
                   "application/json"
@@ -508,6 +508,21 @@
                      "paramType":"query"
                   }
                ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/cdc_streams_check_and_repair",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Checks that CDC streams reflect current cluster topology and regenerates them if not.",
+               "type":"void",
+               "nickname":"cdc_streams_check_and_repair",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
             }
          ]
       },
@@ -582,7 +597,15 @@
                   },
                   {
                      "name":"kn",
-                     "description":"Comma seperated keyspaces name to snapshot",
+                     "description":"Comma seperated keyspaces name that their snapshot will be deleted",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"an optional table name that its snapshot will be deleted",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -646,7 +669,7 @@
             {
                "method":"POST",
                "summary":"Trigger a cleanup of keys on a single keyspace",
-               "type":"int",
+               "type": "long",
                "nickname":"force_keyspace_cleanup",
                "produces":[
                   "application/json"
@@ -678,7 +701,7 @@
             {
                "method":"GET",
                "summary":"Scrub (deserialize + reserialize at the latest version, skipping bad rows if any) the given keyspace. If columnFamilies array is empty, all CFs are scrubbed. Scrubbed CFs will be snapshotted first, if disableSnapshot is false",
-               "type":"int",
+               "type": "long",
                "nickname":"scrub",
                "produces":[
                   "application/json"
@@ -726,7 +749,7 @@
             {
                "method":"GET",
                "summary":"Rewrite all sstables to the latest version. Unlike scrub, it doesn't skip bad rows and do not snapshot sstables first.",
-               "type":"int",
+               "type": "long",
                "nickname":"upgrade_sstables",
                "produces":[
                   "application/json"
@@ -800,7 +823,7 @@
                "summary":"Return an array with the ids of the currently active repairs",
                "type":"array",
                "items":{
-                  "type":"int"
+                  "type": "long"
                },
                "nickname":"get_active_repair_async",
                "produces":[
@@ -811,12 +834,49 @@
          ]
       },
       {
+         "path":"/storage_service/repair_status/",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Query the repair status and return when the repair is finished or timeout",
+               "type":"string",
+               "enum":[
+                  "RUNNING",
+                  "SUCCESSFUL",
+                  "FAILED"
+               ],
+               "nickname":"repair_await_completion",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"id",
+                     "description":"The repair ID to check for status",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type": "long",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"timeout",
+                     "description":"Seconds to wait before the query returns even if the repair is not finished. The value -1 or not providing this parameter means no timeout",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type": "long",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
          "path":"/storage_service/repair_async/{keyspace}",
          "operations":[
             {
                "method":"POST",
                "summary":"Invoke repair asynchronously. You can track repair progress by using the get supplying id",
-               "type":"int",
+               "type": "long",
                "nickname":"repair_async",
                "produces":[
                   "application/json"
@@ -947,7 +1007,7 @@
                      "description":"The repair ID to check for status",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -1042,6 +1102,14 @@
                      "name":"host_id",
                      "description":"Remove the node with host_id from the cluster",
                      "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"ignore_nodes",
+                     "description":"List of dead nodes to ingore in removenode operation",
+                     "required":false,
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
@@ -1277,18 +1345,18 @@
                   },
                   {
                      "name":"dynamic_update_interval",
-                     "description":"integer, in ms (default 100)",
+                     "description":"interval in ms (default 100)",
                      "required":false,
                      "allowMultiple":false,
-                     "type":"integer",
+                     "type":"long",
                      "paramType":"query"
                   },
                   {
                      "name":"dynamic_reset_interval",
-                     "description":"integer, in ms (default 600,000)",
+                     "description":"interval in ms (default 600,000)",
                      "required":false,
                      "allowMultiple":false,
-                     "type":"integer",
+                     "type":"long",
                      "paramType":"query"
                   },
                   {
@@ -1493,7 +1561,7 @@
                      "description":"Stream throughput",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -1501,7 +1569,7 @@
             {
                "method":"GET",
                "summary":"Get stream throughput mb per sec",
-               "type":"int",
+               "type": "long",
                "nickname":"get_stream_throughput_mb_per_sec",
                "produces":[
                   "application/json"
@@ -1517,7 +1585,7 @@
             {
                "method":"GET",
                "summary":"get compaction throughput mb per sec",
-               "type":"int",
+               "type": "long",
                "nickname":"get_compaction_throughput_mb_per_sec",
                "produces":[
                   "application/json"
@@ -1539,7 +1607,7 @@
                      "description":"compaction throughput",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -1943,7 +2011,7 @@
             {
                "method":"GET",
                "summary":"Returns the threshold for warning of queries with many tombstones",
-               "type":"int",
+               "type": "long",
                "nickname":"get_tombstone_warn_threshold",
                "produces":[
                   "application/json"
@@ -1965,7 +2033,7 @@
                      "description":"tombstone debug threshold",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -1978,7 +2046,7 @@
             {
                "method":"GET",
                "summary":"",
-               "type":"int",
+               "type": "long",
                "nickname":"get_tombstone_failure_threshold",
                "produces":[
                   "application/json"
@@ -2000,7 +2068,7 @@
                      "description":"tombstone debug threshold",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -2013,7 +2081,7 @@
             {
                "method":"GET",
                "summary":"Returns the threshold for rejecting queries due to a large batch size",
-               "type":"int",
+               "type": "long",
                "nickname":"get_batch_size_failure_threshold",
                "produces":[
                   "application/json"
@@ -2035,7 +2103,7 @@
                      "description":"batch size debug threshold",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -2059,7 +2127,7 @@
                      "description":"throttle in kb",
                      "required":true,
                      "allowMultiple":false,
-                     "type":"int",
+                     "type": "long",
                      "paramType":"query"
                   }
                ]
@@ -2072,7 +2140,7 @@
             {
                "method":"GET",
                "summary":"Get load",
-               "type":"int",
+               "type": "long",
                "nickname":"get_metrics_load",
                "produces":[
                   "application/json"
@@ -2088,7 +2156,7 @@
             {
                "method":"GET",
                "summary":"Get exceptions",
-               "type":"int",
+               "type": "long",
                "nickname":"get_exceptions",
                "produces":[
                   "application/json"
@@ -2104,7 +2172,7 @@
             {
                "method":"GET",
                "summary":"Get total hints in progress",
-               "type":"int",
+               "type": "long",
                "nickname":"get_total_hints_in_progress",
                "produces":[
                   "application/json"
@@ -2120,7 +2188,7 @@
             {
                "method":"GET",
                "summary":"Get total hints",
-               "type":"int",
+               "type": "long",
                "nickname":"get_total_hints",
                "produces":[
                   "application/json"
@@ -2164,7 +2232,42 @@
                ]
             }
          ]
-      }
+      },
+      {
+         "path":"/storage_service/sstable_info",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"SSTable information",
+               "type":"array",
+               "items":{
+                  "type":"table_sstables"
+               },
+               "nickname":"sstable_info",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"The keyspace",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"column family name",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      }      
    ],
    "models":{
       "mapper":{
@@ -2228,11 +2331,11 @@
                "description":"The column family"
             },
             "total":{
-               "type":"int",
+               "type":"long",
                "description":"The total snapshot size"
             },
             "live":{
-               "type":"int",
+               "type":"long",
                "description":"The live snapshot size"
             }
          }
@@ -2324,6 +2427,92 @@
                "description":"The endpoint details"
             }
          }
+      },
+      "named_maps":{
+        "id":"named_maps",
+        "properties":{
+            "group":{
+                "type":"string"
+            },
+            "attributes":{
+                "type":"array",
+                "items":{
+                    "type":"mapper"
+                }
+            }
+        }
+      },
+      "sstable":{
+        "id":"sstable",
+        "properties":{
+            "size":{
+               "type":"long",
+               "description":"Total size in bytes of sstable"
+            },
+            "data_size":{
+                "type":"long",
+                "description":"The size in bytes on disk of data"
+            },
+            "index_size":{
+               "type":"long",
+               "description":"The size in bytes on disk of index"
+            },
+            "filter_size":{
+               "type":"long",
+               "description":"The size in bytes on disk of filter"
+            },
+            "timestamp":{
+                "type":"datetime",
+                "description":"File creation time"
+            },
+            "generation":{
+                "type":"long",
+                "description":"SSTable generation"
+            },
+            "level":{
+               "type":"long",
+               "description":"SSTable level"
+            },
+            "version":{
+               "type":"string",
+               "enum":[
+                  "ka", "la", "mc", "md"
+               ],
+               "description":"SSTable version"
+            },
+            "properties":{
+                "type":"array",
+                "description":"SSTable attributes",
+                "items":{
+                    "type":"mapper"
+                }
+            },
+            "extended_properties":{
+                "type":"array",
+                "description":"SSTable extended attributes",
+                "items":{
+                    "type":"named_maps"
+                }
+            }
+        }
+      },
+      "table_sstables":{
+        "id":"table_sstables",
+        "description":"Per-table SSTable info and attributes",
+        "properties":{
+            "keyspace":{
+                "type":"string"
+            },
+            "table":{
+                "type":"string"
+            },
+            "sstables":{
+                "type":"array",
+                "items":{
+                    "$ref":"sstable"
+                }
+            }
+        }
       }
    }
 }

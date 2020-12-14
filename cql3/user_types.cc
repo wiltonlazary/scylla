@@ -41,21 +41,24 @@
 #include "cql3/user_types.hh"
 
 #include "cql3/cql3_type.hh"
+#include "cql3/constants.hh"
 
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include <boost/range/algorithm/count.hpp>
 
+#include "types/user.hh"
+
 namespace cql3 {
 
-shared_ptr<column_specification> user_types::field_spec_of(shared_ptr<column_specification> column, size_t field) {
-    auto&& ut = static_pointer_cast<const user_type_impl>(column->type);
+lw_shared_ptr<column_specification> user_types::field_spec_of(const column_specification& column, size_t field) {
+    auto&& ut = static_pointer_cast<const user_type_impl>(column.type);
     auto&& name = ut->field_name(field);
     auto&& sname = sstring(reinterpret_cast<const char*>(name.data()), name.size());
-    return make_shared<column_specification>(
-                                   column->ks_name,
-                                   column->cf_name,
-                                   make_shared<column_identifier>(column->name->to_string() + "." + sname, true),
+    return make_lw_shared<column_specification>(
+                                   column.ks_name,
+                                   column.cf_name,
+                                   ::make_shared<column_identifier>(column.name->to_string() + "." + sname, true),
                                    ut->field_type(field));
 }
 
@@ -63,8 +66,8 @@ user_types::literal::literal(elements_map_type entries)
         : _entries(std::move(entries)) {
 }
 
-shared_ptr<term> user_types::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
-    validate_assignable_to(db, keyspace, receiver);
+shared_ptr<term> user_types::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
+    validate_assignable_to(db, keyspace, *receiver);
     auto&& ut = static_pointer_cast<const user_type_impl>(receiver->type);
     bool all_terminal = true;
     std::vector<shared_ptr<term>> values;
@@ -80,7 +83,7 @@ shared_ptr<term> user_types::literal::prepare(database& db, const sstring& keysp
             raw = iraw->second;
             ++found_values;
         }
-        auto&& value = raw->prepare(db, keyspace, field_spec_of(receiver, i));
+        auto&& value = raw->prepare(db, keyspace, field_spec_of(*receiver, i));
 
         if (dynamic_cast<non_terminal*>(value.get())) {
             all_terminal = false;
@@ -93,7 +96,7 @@ shared_ptr<term> user_types::literal::prepare(database& db, const sstring& keysp
         for (auto&& id_val : _entries) {
             auto&& id = id_val.first;
             if (!boost::range::count(ut->field_names(), id.bytes_)) {
-                throw exceptions::invalid_request_exception(sprint("Unknown field '%s' in value of user defined type %s", id, ut->get_name_as_string()));
+                throw exceptions::invalid_request_exception(format("Unknown field '{}' in value of user defined type {}", id, ut->get_name_as_string()));
             }
         }
     }
@@ -102,30 +105,30 @@ shared_ptr<term> user_types::literal::prepare(database& db, const sstring& keysp
     if (all_terminal) {
         return value.bind(query_options::DEFAULT);
     } else {
-        return make_shared(std::move(value));
+        return make_shared<delayed_value>(std::move(value));
     }
 }
 
-void user_types::literal::validate_assignable_to(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
-    auto&& ut = dynamic_pointer_cast<const user_type_impl>(receiver->type);
-    if (!ut) {
-        throw exceptions::invalid_request_exception(sprint("Invalid user type literal for %s of type %s", receiver->name, receiver->type->as_cql3_type()));
+void user_types::literal::validate_assignable_to(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!receiver.type->is_user_type()) {
+        throw exceptions::invalid_request_exception(format("Invalid user type literal for {} of type {}", receiver.name, receiver.type->as_cql3_type()));
     }
 
+    auto ut = static_pointer_cast<const user_type_impl>(receiver.type);
     for (size_t i = 0; i < ut->size(); i++) {
         column_identifier field(to_bytes(ut->field_name(i)), utf8_type);
-        if (_entries.count(field) == 0) {
+        if (!_entries.contains(field)) {
             continue;
         }
-        shared_ptr<term::raw> value = _entries[field];
+        const shared_ptr<term::raw>& value = _entries.at(field);
         auto&& field_spec = field_spec_of(receiver, i);
-        if (!assignment_testable::is_assignable(value->test_assignment(db, keyspace, field_spec))) {
-            throw exceptions::invalid_request_exception(sprint("Invalid user type literal for %s: field %s is not of type %s", receiver->name, field, field_spec->type->as_cql3_type()));
+        if (!assignment_testable::is_assignable(value->test_assignment(db, keyspace, *field_spec))) {
+            throw exceptions::invalid_request_exception(format("Invalid user type literal for {}: field {} is not of type {}", receiver.name, field, field_spec->type->as_cql3_type()));
         }
     }
 }
 
-assignment_testable::test_result user_types::literal::test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
+assignment_testable::test_result user_types::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
     try {
         validate_assignable_to(db, keyspace, receiver);
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
@@ -139,53 +142,184 @@ sstring user_types::literal::assignment_testable_source_context() const {
 }
 
 sstring user_types::literal::to_string() const {
-    auto kv_to_str = [] (auto&& kv) { return sprint("%s:%s", kv.first, kv.second); };
-    return sprint("{%s}", ::join(", ", _entries | boost::adaptors::transformed(kv_to_str)));
+    auto kv_to_str = [] (auto&& kv) { return format("{}:{}", kv.first, kv.second); };
+    return format("{{{}}}", ::join(", ", _entries | boost::adaptors::transformed(kv_to_str)));
+}
+
+user_types::value::value(std::vector<bytes_opt> elements)
+        : _elements(std::move(elements)) {
+}
+
+user_types::value::value(std::vector<bytes_view_opt> elements)
+    : value(to_bytes_opt_vec(std::move(elements))) {
+}
+
+user_types::value user_types::value::from_serialized(const fragmented_temporary_buffer::view& v, const user_type_impl& type) {
+    return with_linearized(v, [&] (bytes_view val) {
+        auto elements = type.split(val);
+        if (elements.size() > type.size()) {
+            throw exceptions::invalid_request_exception(
+                    format("User Defined Type value contained too many fields (expected {}, got {})", type.size(), elements.size()));
+        }
+
+        return value(elements);
+    });
+}
+
+cql3::raw_value user_types::value::get(const query_options&) {
+    return cql3::raw_value::make_value(tuple_type_impl::build_value(_elements));
+}
+
+const std::vector<bytes_opt>& user_types::value::get_elements() const {
+    return _elements;
+}
+
+sstring user_types::value::to_string() const {
+    return format("({})", join(", ", _elements));
 }
 
 user_types::delayed_value::delayed_value(user_type type, std::vector<shared_ptr<term>> values)
         : _type(std::move(type)), _values(std::move(values)) {
 }
-bool user_types::delayed_value::uses_function(const sstring& ks_name, const sstring& function_name) const {
-    return boost::algorithm::any_of(_values,
-                std::bind(&term::uses_function, std::placeholders::_1, std::cref(ks_name), std::cref(function_name)));
-}
 bool user_types::delayed_value::contains_bind_marker() const {
     return boost::algorithm::any_of(_values, std::mem_fn(&term::contains_bind_marker));
 }
 
-void user_types::delayed_value::collect_marker_specification(shared_ptr<variable_specifications> bound_names) {
+void user_types::delayed_value::collect_marker_specification(variable_specifications& bound_names) const {
     for (auto&& v : _values) {
         v->collect_marker_specification(bound_names);
     }
 }
 
-std::vector<cql3::raw_value> user_types::delayed_value::bind_internal(const query_options& options) {
+std::vector<bytes_opt> user_types::delayed_value::bind_internal(const query_options& options) {
     auto sf = options.get_cql_serialization_format();
-    std::vector<cql3::raw_value> buffers;
+
+    // user_types::literal::prepare makes sure that every field gets a corresponding value.
+    // For missing fields the values become nullopts.
+    assert(_type->size() == _values.size());
+
+    std::vector<bytes_opt> buffers;
     for (size_t i = 0; i < _type->size(); ++i) {
         const auto& value = _values[i]->bind_and_get(options);
         if (!_type->is_multi_cell() && value.is_unset_value()) {
-            throw exceptions::invalid_request_exception(sprint("Invalid unset value for field '%s' of user defined type %s", _type->field_name_as_string(i), _type->get_name_as_string()));
+            throw exceptions::invalid_request_exception(format("Invalid unset value for field '{}' of user defined type {}",
+                        _type->field_name_as_string(i), _type->get_name_as_string()));
         }
-        buffers.push_back(cql3::raw_value::make_value(value));
+
+        buffers.push_back(to_bytes_opt(value));
+
         // Inside UDT values, we must force the serialization of collections to v3 whatever protocol
         // version is in use since we're going to store directly that serialized value.
         if (!sf.collection_format_unchanged() && _type->field_type(i)->is_collection() && buffers.back()) {
             auto&& ctype = static_pointer_cast<const collection_type_impl>(_type->field_type(i));
-            buffers.back() = cql3::raw_value::make_value(
-                    ctype->reserialize(sf, cql_serialization_format::latest(), bytes_view(*buffers.back())));
+            buffers.back() = ctype->reserialize(sf, cql_serialization_format::latest(), bytes_view(*buffers.back()));
         }
     }
     return buffers;
 }
 
 shared_ptr<terminal> user_types::delayed_value::bind(const query_options& options) {
-    return ::make_shared<constants::value>(cql3::raw_value::make_value((bind_and_get(options))));
+    return ::make_shared<user_types::value>(bind_internal(options));
 }
 
 cql3::raw_value_view user_types::delayed_value::bind_and_get(const query_options& options) {
-    return options.make_temporary(cql3::raw_value::make_value(user_type_impl::build_value(bind_internal(options))));
+    return cql3::raw_value_view::make_temporary(cql3::raw_value::make_value(user_type_impl::build_value(bind_internal(options))));
+}
+
+shared_ptr<terminal> user_types::marker::bind(const query_options& options) {
+    auto value = options.get_value_at(_bind_index);
+    if (value.is_null()) {
+        return nullptr;
+    }
+    if (value.is_unset_value()) {
+        return constants::UNSET_VALUE;
+    }
+    return make_shared<user_types::value>(value::from_serialized(*value, static_cast<const user_type_impl&>(*_receiver->type)));
+}
+
+void user_types::setter::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) {
+    auto value = _t->bind(params._options);
+    execute(m, row_key, params, column, std::move(value));
+}
+
+void user_types::setter::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params, const column_definition& column, ::shared_ptr<terminal> value) {
+    if (value == constants::UNSET_VALUE) {
+        return;
+    }
+
+    auto& type = static_cast<const user_type_impl&>(*column.type);
+    if (type.is_multi_cell()) {
+        // Non-frozen user defined type.
+
+        collection_mutation_description mut;
+
+        // Setting a non-frozen (multi-cell) UDT means overwriting all cells.
+        // We start by deleting all existing cells.
+
+        // TODO? (kbraun): is this the desired behaviour?
+        // This is how C* does it, but consider the following scenario:
+        // create type ut (a int, b int);
+        // create table cf (a int primary key, b ut);
+        // insert into cf json '{"a": 1, "b":{"a":1, "b":2}}';
+        // insert into cf json '{"a": 1, "b":{"a":1}}' default unset;
+        // currently this would set b.b to null. However, by specifying 'default unset',
+        // perhaps the user intended to leave b.a unchanged.
+        mut.tomb = params.make_tombstone_just_before();
+
+        if (value) {
+            auto ut_value = static_pointer_cast<multi_item_terminal>(value);
+
+            const auto& elems = ut_value->get_elements();
+            // There might be fewer elements given than fields in the type
+            // (e.g. when the user uses a short tuple literal), but never more.
+            assert(elems.size() <= type.size());
+
+            for (size_t i = 0; i < elems.size(); ++i) {
+                if (!elems[i]) {
+                    // This field was not specified or was specified as null.
+                    continue;
+                }
+
+                mut.cells.emplace_back(serialize_field_index(i),
+                        params.make_cell(*type.type(i), *elems[i], atomic_cell::collection_member::yes));
+            }
+        }
+
+        m.set_cell(row_key, column, mut.serialize(type));
+    } else {
+        if (value) {
+            m.set_cell(row_key, column, make_cell(type, *value->get(params._options), params));
+        } else {
+            m.set_cell(row_key, column, make_dead_cell(params));
+        }
+    }
+}
+
+void user_types::setter_by_field::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) {
+    assert(column.type->is_user_type() && column.type->is_multi_cell());
+
+    auto value = _t->bind_and_get(params._options);
+    if (value.is_unset_value()) {
+        return;
+    }
+
+    auto& type = static_cast<const user_type_impl&>(*column.type);
+
+    collection_mutation_description mut;
+    mut.cells.emplace_back(serialize_field_index(_field_idx), value
+                ? params.make_cell(*type.type(_field_idx), *value, atomic_cell::collection_member::yes)
+                : make_dead_cell(params));
+
+    m.set_cell(row_key, column, mut.serialize(type));
+}
+
+void user_types::deleter_by_field::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) {
+    assert(column.type->is_user_type() && column.type->is_multi_cell());
+
+    collection_mutation_description mut;
+    mut.cells.emplace_back(serialize_field_index(_field_idx), make_dead_cell(params));
+
+    m.set_cell(row_key, column, mut.serialize(*column.type));
 }
 
 }

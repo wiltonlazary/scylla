@@ -61,10 +61,12 @@ public:
         : _role(name.to_string()), _grantee(grantee.to_string()) {
     }
 
-    virtual future<> check_access(const service::client_state&) override;
+    std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
+
+    virtual future<> check_access(service::storage_proxy& proxy, const service::client_state&) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(service::storage_proxy&, service::query_state&, const query_options&) override;
+    execute(service::storage_proxy&, service::query_state&, const query_options&) const override;
 };
 
 }

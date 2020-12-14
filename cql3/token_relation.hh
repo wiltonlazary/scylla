@@ -42,13 +42,14 @@
 
 #include <vector>
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 #include "to_string.hh"
 
 #include "relation.hh"
 #include "column_identifier.hh"
 #include "term.hh"
 #include "restrictions/restriction.hh"
+#include "expr/expression.hh"
 
 namespace cql3 {
 
@@ -72,7 +73,7 @@ private:
      * @return the definition of the columns to which apply the token restriction.
      * @throws InvalidRequestException if the entity cannot be resolved
      */
-    std::vector<const column_definition*> get_column_definitions(schema_ptr s);
+    std::vector<const column_definition*> get_column_definitions(const schema& s);
 
     /**
      * Returns the receivers for this relation.
@@ -82,11 +83,11 @@ private:
      * @return the receivers for the specified relation.
      * @throws InvalidRequestException if the relation is invalid
      */
-    std::vector<::shared_ptr<column_specification>> to_receivers(schema_ptr schema, const std::vector<const column_definition*>& column_defs);
+    std::vector<lw_shared_ptr<column_specification>> to_receivers(const schema& schema, const std::vector<const column_definition*>& column_defs) const;
 
 public:
     token_relation(std::vector<::shared_ptr<column_identifier::raw>> entities,
-            const operator_type& type, ::shared_ptr<term::raw> value)
+            expr::oper_t type, ::shared_ptr<term::raw> value)
             : relation(type), _entities(std::move(entities)), _value(
                     std::move(value)) {
     }
@@ -97,33 +98,36 @@ public:
 
     ::shared_ptr<restrictions::restriction> new_EQ_restriction(database& db,
             schema_ptr schema,
-            ::shared_ptr<variable_specifications> bound_names) override;
+            variable_specifications& bound_names) override;
 
     ::shared_ptr<restrictions::restriction> new_IN_restriction(database& db,
             schema_ptr schema,
-            ::shared_ptr<variable_specifications> bound_names) override;
+            variable_specifications& bound_names) override;
 
     ::shared_ptr<restrictions::restriction> new_slice_restriction(database& db,
             schema_ptr schema,
-            ::shared_ptr<variable_specifications> bound_names,
+            variable_specifications& bound_names,
             statements::bound bound,
             bool inclusive) override;
 
     ::shared_ptr<restrictions::restriction> new_contains_restriction(
             database& db, schema_ptr schema,
-            ::shared_ptr<variable_specifications> bound_names, bool isKey)
-                    override;
+            variable_specifications& bound_names, bool isKey) override;
+
+    ::shared_ptr<restrictions::restriction> new_LIKE_restriction(database& db,
+            schema_ptr schema,
+            variable_specifications& bound_names) override;
 
     ::shared_ptr<relation> maybe_rename_identifier(const column_identifier::raw& from, column_identifier::raw to) override;
 
     sstring to_string() const override;
 
 protected:
-    ::shared_ptr<term> to_term(const std::vector<::shared_ptr<column_specification>>& receivers,
-                                       ::shared_ptr<term::raw> raw,
+    ::shared_ptr<term> to_term(const std::vector<lw_shared_ptr<column_specification>>& receivers,
+                                       const term::raw& raw,
                                        database& db,
                                        const sstring& keyspace,
-                                       ::shared_ptr<variable_specifications> bound_names) override;
+                                       variable_specifications& bound_names) const override;
 };
 
 }

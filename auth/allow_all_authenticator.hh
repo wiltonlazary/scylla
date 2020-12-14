@@ -37,7 +37,7 @@ class migration_manager;
 
 namespace auth {
 
-const sstring& allow_all_authenticator_name();
+extern const std::string_view allow_all_authenticator_name;
 
 class allow_all_authenticator final : public authenticator {
 public:
@@ -52,8 +52,8 @@ public:
         return make_ready_future<>();
     }
 
-    virtual const sstring& qualified_java_name() const override {
-        return allow_all_authenticator_name();
+    virtual std::string_view qualified_java_name() const override {
+        return allow_all_authenticator_name;
     }
 
     virtual bool require_authentication() const override {
@@ -72,19 +72,19 @@ public:
         return make_ready_future<authenticated_user>(anonymous_user());
     }
 
-    virtual future<> create(stdx::string_view, const authentication_options& options) const override {
+    virtual future<> create(std::string_view, const authentication_options& options) const override {
         return make_ready_future();
     }
 
-    virtual future<> alter(stdx::string_view, const authentication_options& options) const override {
+    virtual future<> alter(std::string_view, const authentication_options& options) const override {
         return make_ready_future();
     }
 
-    virtual future<> drop(stdx::string_view) const override {
+    virtual future<> drop(std::string_view) const override {
         return make_ready_future();
     }
 
-    virtual future<custom_options> query_custom_options(stdx::string_view role_name) const override {
+    virtual future<custom_options> query_custom_options(std::string_view role_name) const override {
         return make_ready_future<custom_options>();
     }
 

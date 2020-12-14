@@ -41,13 +41,13 @@
 
 #pragma once
 
-#include "core/shared_ptr.hh"
+#include <seastar/core/shared_ptr.hh>
 #include "exceptions/exceptions.hh"
 #include "database_fwd.hh"
 #include "term.hh"
 #include "update_parameters.hh"
 
-#include <experimental/optional>
+#include <optional>
 
 namespace cql3 {
 
@@ -91,16 +91,16 @@ public:
         return params.make_dead_cell();
     }
 
-    static atomic_cell make_cell(bytes_view value, const update_parameters& params) {
-        return params.make_cell(value);
+    static atomic_cell make_cell(const abstract_type& type, bytes_view value, const update_parameters& params) {
+        return params.make_cell(type, fragmented_temporary_buffer::view(value));
+    }
+
+    static atomic_cell make_cell(const abstract_type& type, const fragmented_temporary_buffer::view& value, const update_parameters& params) {
+        return params.make_cell(type, value);
     }
 
     static atomic_cell make_counter_update_cell(int64_t delta, const update_parameters& params) {
         return params.make_counter_update_cell(delta);
-    }
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const {
-        return _t && _t->uses_function(ks_name, function_name);
     }
 
     virtual bool is_raw_counter_shard_write() const {
@@ -111,7 +111,7 @@ public:
     * @return whether the operation requires a read of the previous value to be executed
     * (only lists setterByIdx, discard and discardByIdx requires that).
     */
-    virtual bool requires_read() {
+    virtual bool requires_read() const {
         return false;
     }
 
@@ -121,7 +121,7 @@ public:
      * @param bound_names the list of column specification where to collect the
      * bind variables of this term in.
      */
-    virtual void collect_marker_specification(::shared_ptr<variable_specifications> bound_names) {
+    virtual void collect_marker_specification(variable_specifications& bound_names) const {
         if (_t) {
             _t->collect_marker_specification(bound_names);
         }
@@ -138,6 +138,7 @@ public:
      * This can be one of:
      *   - Setting a value: c = v
      *   - Setting an element of a collection: c[x] = v
+     *   - Setting a field of a user-defined type: c.x = v
      *   - An addition/subtraction to a variable: c = c +/- v (where v can be a collection literal)
      *   - An prepend operation: c = v + c
      */
@@ -157,13 +158,13 @@ public:
          * be a true column.
          * @return the prepared update operation.
          */
-        virtual ::shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) = 0;
+        virtual ::shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const = 0;
 
         /**
          * @return whether this operation can be applied alongside the {@code
          * other} update (in the same UPDATE statement for the same column).
          */
-        virtual bool is_compatible_with(::shared_ptr<raw_update> other) = 0;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const = 0;
     };
 
     /**
@@ -172,15 +173,16 @@ public:
      * This can be one of:
      *   - Deleting a column
      *   - Deleting an element of a collection
+     *   - Deleting a field of a user-defined type
      */
     class raw_deletion {
     public:
-        ~raw_deletion() {}
+        virtual ~raw_deletion() = default;
 
         /**
          * The name of the column affected by this delete operation.
          */
-        virtual ::shared_ptr<column_identifier::raw> affected_column() = 0;
+        virtual const column_identifier::raw& affected_column() const = 0;
 
         /**
          * This method validates the operation (i.e. validate it is well typed)
@@ -193,7 +195,7 @@ public:
          * @param receiver the "column" this operation applies to.
          * @return the prepared delete operation.
          */
-        virtual ::shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) = 0;
+        virtual ::shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const = 0;
     };
 
     class set_value;
@@ -210,9 +212,40 @@ public:
             : _selector(std::move(selector)), _value(std::move(value)), _by_uuid(by_uuid) {
         }
 
-        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver);
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
+    };
+
+    // Set a single field inside a user-defined type.
+    class set_field : public raw_update {
+        const shared_ptr<column_identifier> _field;
+        const shared_ptr<term::raw> _value;
+    private:
+        sstring to_string(const column_definition& receiver) const;
+    public:
+        set_field(shared_ptr<column_identifier> field, shared_ptr<term::raw> value)
+            : _field(std::move(field)), _value(std::move(value)) {
+        }
+
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
+
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
+    };
+
+    // Delete a single field inside a user-defined type.
+    // Equivalent to setting the field to null.
+    class field_deletion : public raw_deletion {
+        const shared_ptr<column_identifier::raw> _id;
+        const shared_ptr<column_identifier> _field;
+    public:
+        field_deletion(shared_ptr<column_identifier::raw> id, shared_ptr<column_identifier> field)
+                : _id(std::move(id)), _field(std::move(field)) {
+        }
+
+        virtual const column_identifier::raw& affected_column() const override;
+
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
     };
 
     class addition : public raw_update {
@@ -224,9 +257,9 @@ public:
                 : _value(value) {
         }
 
-        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) override;
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     class subtraction : public raw_update {
@@ -238,9 +271,9 @@ public:
                 : _value(value) {
         }
 
-        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) override;
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     class prepend : public raw_update {
@@ -252,9 +285,9 @@ public:
                 : _value(std::move(value)) {
         }
 
-        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) override;
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     class column_deletion;
@@ -266,8 +299,8 @@ public:
         element_deletion(shared_ptr<column_identifier::raw> id, shared_ptr<term::raw> element)
                 : _id(std::move(id)), _element(std::move(element)) {
         }
-        virtual shared_ptr<column_identifier::raw> affected_column() override;
-        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) override;
+        virtual const column_identifier::raw& affected_column() const override;
+        virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
     };
 };
 

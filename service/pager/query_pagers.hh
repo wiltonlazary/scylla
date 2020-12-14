@@ -44,7 +44,7 @@
 #include <vector>
 #include <seastar/core/shared_ptr.hh>
 
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "query-result.hh"
 #include "query-request.hh"
 #include "service/query_state.hh"
@@ -58,19 +58,16 @@ namespace pager {
 
 class query_pagers {
 public:
-    static bool may_need_paging(uint32_t page_size, const query::read_command&,
+    static bool may_need_paging(const schema& s, uint32_t page_size, const query::read_command&,
             const dht::partition_range_vector&);
     static ::shared_ptr<query_pager> pager(schema_ptr,
-            ::shared_ptr<cql3::selection::selection>,
+            shared_ptr<const cql3::selection::selection>,
             service::query_state&,
             const cql3::query_options&,
-            db::timeout_clock::duration timeout,
             lw_shared_ptr<query::read_command>,
-            dht::partition_range_vector);
-private:
-    class impl;
+            dht::partition_range_vector,
+            ::shared_ptr<cql3::restrictions::statement_restrictions> filtering_restrictions = nullptr);
 };
 
 }
 }
-

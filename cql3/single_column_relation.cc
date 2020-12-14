@@ -45,86 +45,100 @@
 #include "cql3/cql3_type.hh"
 #include "cql3/lists.hh"
 #include "unimplemented.hh"
+#include "types/map.hh"
+#include "types/list.hh"
 
-using namespace cql3::restrictions;
+using namespace cql3::expr;
 
 namespace cql3 {
 
 ::shared_ptr<term>
-single_column_relation::to_term(const std::vector<::shared_ptr<column_specification>>& receivers,
-                                ::shared_ptr<term::raw> raw,
+single_column_relation::to_term(const std::vector<lw_shared_ptr<column_specification>>& receivers,
+                                const term::raw& raw,
                                 database& db,
                                 const sstring& keyspace,
-                                ::shared_ptr<variable_specifications> bound_names) {
+                                variable_specifications& bound_names) const {
     // TODO: optimize vector away, accept single column_specification
     assert(receivers.size() == 1);
-    auto term = raw->prepare(db, keyspace, receivers[0]);
+    auto term = raw.prepare(db, keyspace, receivers[0]);
     term->collect_marker_specification(bound_names);
     return term;
 }
 
 ::shared_ptr<restrictions::restriction>
-single_column_relation::new_EQ_restriction(database& db, schema_ptr schema, ::shared_ptr<variable_specifications> bound_names) {
-    const column_definition& column_def = to_column_definition(schema, _entity);
+single_column_relation::new_EQ_restriction(database& db, schema_ptr schema, variable_specifications& bound_names) {
+    const column_definition& column_def = to_column_definition(*schema, *_entity);
     if (!_map_key) {
-        auto term = to_term(to_receivers(schema, column_def), _value, db, schema->ks_name(), bound_names);
-        return ::make_shared<single_column_restriction::EQ>(column_def, std::move(term));
+        auto r = ::make_shared<restrictions::single_column_restriction>(column_def);
+        auto term = to_term(to_receivers(*schema, column_def), *_value, db, schema->ks_name(), bound_names);
+        r->expression = binary_operator{&column_def, expr::oper_t::EQ, std::move(term)};
+        return r;
     }
-    auto&& receivers = to_receivers(schema, column_def);
-    auto&& entry_key = to_term({receivers[0]}, _map_key, db, schema->ks_name(), bound_names);
-    auto&& entry_value = to_term({receivers[1]}, _value, db, schema->ks_name(), bound_names);
-    return make_shared<single_column_restriction::contains>(column_def, std::move(entry_key), std::move(entry_value));
+    auto&& receivers = to_receivers(*schema, column_def);
+    auto&& entry_key = to_term({receivers[0]}, *_map_key, db, schema->ks_name(), bound_names);
+    auto&& entry_value = to_term({receivers[1]}, *_value, db, schema->ks_name(), bound_names);
+    auto r = make_shared<restrictions::single_column_restriction>(column_def);
+    r->expression = binary_operator{
+        column_value(&column_def, std::move(entry_key)), oper_t::EQ, std::move(entry_value)};
+    return r;
 }
 
 ::shared_ptr<restrictions::restriction>
-single_column_relation::new_IN_restriction(database& db, schema_ptr schema, ::shared_ptr<variable_specifications> bound_names) {
-    const column_definition& column_def = to_column_definition(schema, _entity);
-    auto receivers = to_receivers(schema, column_def);
+single_column_relation::new_IN_restriction(database& db, schema_ptr schema, variable_specifications& bound_names) {
+    using namespace restrictions;
+    const column_definition& column_def = to_column_definition(*schema, *_entity);
+    auto receivers = to_receivers(*schema, column_def);
     assert(_in_values.empty() || !_value);
     if (_value) {
-        auto term = to_term(receivers, _value, db, schema->ks_name(), bound_names);
-        return make_shared<single_column_restriction::IN_with_marker>(column_def, dynamic_pointer_cast<lists::marker>(term));
+        auto term = to_term(receivers, *_value, db, schema->ks_name(), bound_names);
+        auto r = ::make_shared<single_column_restriction>(column_def);
+        r->expression = binary_operator{&column_def, expr::oper_t::IN, std::move(term)};
+        return r;
     }
     auto terms = to_terms(receivers, _in_values, db, schema->ks_name(), bound_names);
-    return ::make_shared<single_column_restriction::IN_with_values>(column_def, std::move(terms));
+    // Convert a single-item IN restriction to an EQ restriction
+    if (terms.size() == 1) {
+        auto r = ::make_shared<single_column_restriction>(column_def);
+        r->expression = binary_operator{&column_def, expr::oper_t::EQ, std::move(terms[0])};
+        return r;
+    }
+    auto r = ::make_shared<single_column_restriction>(column_def);
+    r->expression = binary_operator{
+            &column_def, expr::oper_t::IN, ::make_shared<lists::delayed_value>(std::move(terms))};
+    return r;
 }
 
-std::vector<::shared_ptr<column_specification>>
-single_column_relation::to_receivers(schema_ptr schema, const column_definition& column_def)
+::shared_ptr<restrictions::restriction>
+single_column_relation::new_LIKE_restriction(
+        database& db, schema_ptr schema, variable_specifications& bound_names) {
+    const column_definition& column_def = to_column_definition(*schema, *_entity);
+    if (!column_def.type->is_string()) {
+        throw exceptions::invalid_request_exception(
+                format("LIKE is allowed only on string types, which {} is not", column_def.name_as_text()));
+    }
+    auto term = to_term(to_receivers(*schema, column_def), *_value, db, schema->ks_name(), bound_names);
+    auto r = ::make_shared<restrictions::single_column_restriction>(column_def);
+    r->expression = binary_operator{&column_def, expr::oper_t::LIKE, std::move(term)};
+    return r;
+}
+
+std::vector<lw_shared_ptr<column_specification>>
+single_column_relation::to_receivers(const schema& schema, const column_definition& column_def) const
 {
     using namespace statements::request_validations;
     auto receiver = column_def.column_specification;
 
-    if (schema->is_dense() && column_def.is_regular()) {
-        throw exceptions::invalid_request_exception(sprint(
-            "Predicates on the non-primary-key column (%s) of a COMPACT table are not yet supported", column_def.name_as_text()));
-    }
-
-    if (is_IN()) {
-        // For partition keys we only support IN for the last name so far
-        if (column_def.is_partition_key() && !schema->is_last_partition_key(column_def)) {
-            throw exceptions::invalid_request_exception(sprint(
-                "Partition KEY part %s cannot be restricted by IN relation (only the last part of the partition key can)",
-                column_def.name_as_text()));
-        }
-
-        // We only allow IN on the row key and the clustering key so far, never on non-PK columns, and this even if
-        // there's an index
-        // Note: for backward compatibility reason, we conside a IN of 1 value the same as a EQ, so we let that
-        // slide.
-        if (!column_def.is_primary_key() && !can_have_only_one_value()) {
-            throw exceptions::invalid_request_exception(sprint(
-                   "IN predicates on non-primary-key columns (%s) is not yet supported", column_def.name_as_text()));
-        }
+    if (schema.is_dense() && column_def.is_regular()) {
+        throw exceptions::invalid_request_exception(format("Predicates on the non-primary-key column ({}) of a COMPACT table are not yet supported", column_def.name_as_text()));
     }
 
     if (is_contains() && !receiver->type->is_collection()) {
-        throw exceptions::invalid_request_exception(sprint("Cannot use CONTAINS on non-collection column \"%s\"", receiver->name));
+        throw exceptions::invalid_request_exception(format("Cannot use CONTAINS on non-collection column \"{}\"", receiver->name));
     }
 
     if (is_contains_key()) {
         if (!dynamic_cast<const map_type_impl*>(receiver->type.get())) {
-            throw exceptions::invalid_request_exception(sprint("Cannot use CONTAINS KEY on non-map column %s", receiver->name));
+            throw exceptions::invalid_request_exception(format("Cannot use CONTAINS KEY on non-map column {}", receiver->name));
         }
     }
 

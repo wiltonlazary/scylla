@@ -47,14 +47,14 @@
 #include "cql3/query_options.hh"
 #include "cql3/role_name.hh"
 #include "cql3/selection/selection.hh"
-#include "service/storage_service.hh"
+#include "gms/feature_service.hh"
 
 static auth::permission_set filter_applicable_permissions(const auth::permission_set& ps, const auth::resource& r) {
     auto const filtered_permissions = auth::permission_set::from_mask(ps.mask() & r.applicable_permissions().mask());
 
     if (!filtered_permissions) {
         throw exceptions::invalid_request_exception(
-                sprint("Resource %s does not support any of the requested permissions.", r));
+                format("Resource {} does not support any of the requested permissions.", r));
     }
 
     return filtered_permissions;
@@ -68,25 +68,21 @@ cql3::statements::permission_altering_statement::permission_altering_statement(
                 , _role_name(rn.to_string()) {
 }
 
-void cql3::statements::permission_altering_statement::validate(service::storage_proxy& proxy, const service::client_state& state) {
-    if (!service::get_local_storage_service().cluster_supports_roles()) {
-        throw exceptions::invalid_request_exception(
-                "You cannot modify access-control information until the cluster has fully upgraded.");
-    }
+void cql3::statements::permission_altering_statement::validate(service::storage_proxy&, const service::client_state&) const {
 }
 
-future<> cql3::statements::permission_altering_statement::check_access(const service::client_state& state) {
+future<> cql3::statements::permission_altering_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
     state.ensure_not_anonymous();
     maybe_correct_resource(_resource, state);
 
     return state.ensure_exists(_resource).then([this, &state] {
         // check that the user has AUTHORIZE permission on the resource or its parents, otherwise reject
         // GRANT/REVOKE.
-        return state.ensure_has_permission(auth::permission::AUTHORIZE, _resource).then([this, &state] {
+        return state.ensure_has_permission({auth::permission::AUTHORIZE, _resource}).then([this, &state] {
             return do_for_each(_permissions, [this, &state](auth::permission p) {
                 // TODO: how about we re-write the access check to check a set
                 // right away.
-                return state.ensure_has_permission(p, _resource);
+                return state.ensure_has_permission({p, _resource});
             });
         });
     });

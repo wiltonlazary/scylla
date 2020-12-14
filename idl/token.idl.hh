@@ -6,6 +6,12 @@ class token {
         after_all_keys,
     };
     dht::token::kind _kind;
-    bytes _data;
+    bytes data();
 };
+
+class decorated_key {
+    dht::token token();
+    partition_key key();
+};
+
 }

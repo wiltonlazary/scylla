@@ -48,7 +48,6 @@
 
 #include "batchlog_manager.hh"
 #include "canonical_mutation.hh"
-#include "service/storage_service.hh"
 #include "service/storage_proxy.hh"
 #include "system_keyspace.hh"
 #include "utils/rate_limiter.hh"
@@ -57,27 +56,29 @@
 #include "db_clock.hh"
 #include "database.hh"
 #include "unimplemented.hh"
-#include "db/config.hh"
 #include "gms/failure_detector.hh"
-#include "service/storage_service.hh"
 #include "schema_registry.hh"
 #include "idl/uuid.dist.hh"
 #include "idl/frozen_schema.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
+#include "db/schema_tables.hh"
 #include "idl/uuid.dist.impl.hh"
 #include "idl/frozen_schema.dist.impl.hh"
 #include "message/messaging_service.hh"
 #include "cql3/untyped_result_set.hh"
+#include "service_permit.hh"
 
 static logging::logger blogger("batchlog_manager");
 
 const uint32_t db::batchlog_manager::replay_interval;
 const uint32_t db::batchlog_manager::page_size;
 
-db::batchlog_manager::batchlog_manager(cql3::query_processor& qp)
+db::batchlog_manager::batchlog_manager(cql3::query_processor& qp, batchlog_manager_config config)
         : _qp(qp)
-        , _e1(_rd()) {
+        , _write_request_timeout(std::chrono::duration_cast<db_clock::duration>(config.write_request_timeout))
+        , _replay_rate(config.replay_rate)
+        , _delay(config.delay) {
     namespace sm = seastar::metrics;
 
     _metrics.add_group("batchlog_manager", {
@@ -115,16 +116,17 @@ future<> db::batchlog_manager::start() {
     // we use the _timer and _sem on shard zero only. Replaying batchlog can
     // generate a lot of work, so we distrute the real work on all cpus with
     // round-robin scheduling.
-    if (engine().cpu_id() == 0) {
+    if (this_shard_id() == 0) {
         _timer.set_callback([this] {
-            return do_batch_log_replay().handle_exception([] (auto ep) {
+            // Do it in the background.
+            (void)do_batch_log_replay().handle_exception([] (auto ep) {
                 blogger.error("Exception in batch replay: {}", ep);
             }).finally([this] {
                 _timer.arm(lowres_clock::now() + std::chrono::milliseconds(replay_interval));
             });
         });
-        auto ring_delay = service::get_local_storage_service().get_ring_delay();
-        _timer.arm(lowres_clock::now() + ring_delay);
+
+        _timer.arm(lowres_clock::now() + _delay);
     }
     return make_ready_future<>();
 }
@@ -139,7 +141,7 @@ future<> db::batchlog_manager::stop() {
 }
 
 future<size_t> db::batchlog_manager::count_all_batches() const {
-    sstring query = sprint("SELECT count(*) FROM %s.%s", system_keyspace::NAME, system_keyspace::BATCHLOG);
+    sstring query = format("SELECT count(*) FROM {}.{}", system_keyspace::NAME, system_keyspace::BATCHLOG);
     return _qp.execute_internal(query).then([](::shared_ptr<cql3::untyped_result_set> rs) {
        return size_t(rs->one().get_as<int64_t>("count"));
     });
@@ -150,7 +152,7 @@ mutation db::batchlog_manager::get_batch_log_mutation_for(const std::vector<muta
 }
 
 mutation db::batchlog_manager::get_batch_log_mutation_for(const std::vector<mutation>& mutations, const utils::UUID& id, int32_t version, db_clock::time_point now) {
-    auto schema = _qp.db().local().find_schema(system_keyspace::NAME, system_keyspace::BATCHLOG);
+    auto schema = _qp.db().find_schema(system_keyspace::NAME, system_keyspace::BATCHLOG);
     auto key = partition_key::from_singular(*schema, id);
     auto timestamp = api::new_timestamp();
     auto data = [this, &mutations] {
@@ -172,7 +174,7 @@ mutation db::batchlog_manager::get_batch_log_mutation_for(const std::vector<muta
 
 db_clock::duration db::batchlog_manager::get_batch_log_timeout() const {
     // enough time for the actual write + BM removal mutation
-    return db_clock::duration(_qp.db().local().get_config().write_request_timeout_in_ms()) * 2;
+    return _write_request_timeout * 2;
 }
 
 future<> db::batchlog_manager::replay_all_failed_batches() {
@@ -180,8 +182,8 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
 
     // rate limit is in bytes per second. Uses Double.MAX_VALUE if disabled (set to 0 in cassandra.yaml).
     // max rate is scaled by the number of nodes in the cluster (same as for HHOM - see CASSANDRA-5272).
-    auto throttle_in_kb = _qp.db().local().get_config().batchlog_replay_throttle_in_kb() / service::get_storage_service().local().get_token_metadata().get_all_endpoints().size();
-    auto limiter = make_lw_shared<utils::rate_limiter>(throttle_in_kb * 1000);
+    auto throttle = _replay_rate / _qp.proxy().get_token_metadata_ptr()->get_all_endpoints_count();
+    auto limiter = make_lw_shared<utils::rate_limiter>(throttle);
 
     auto batch = [this, limiter](const cql3::untyped_result_set::row& row) {
         auto written_at = row.get_as<db_clock::time_point>("written_at");
@@ -219,7 +221,7 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
 
         return map_reduce(*fms, [this, written_at] (canonical_mutation& fm) {
             return system_keyspace::get_truncated_at(fm.column_family_id()).then([written_at, &fm] (db_clock::time_point t) ->
-                    std::experimental::optional<std::reference_wrapper<canonical_mutation>> {
+                    std::optional<std::reference_wrapper<canonical_mutation>> {
                 if (written_at > t) {
                     return { std::ref(fm) };
                 } else {
@@ -228,9 +230,9 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
             });
         },
         std::vector<mutation>(),
-        [this] (std::vector<mutation> mutations, std::experimental::optional<std::reference_wrapper<canonical_mutation>> fm) {
+        [this] (std::vector<mutation> mutations, std::optional<std::reference_wrapper<canonical_mutation>> fm) {
             if (fm) {
-                schema_ptr s = _qp.db().local().find_schema(fm.value().get().column_family_id());
+                schema_ptr s = _qp.db().find_schema(fm.value().get().column_family_id());
                 mutations.emplace_back(fm.value().get().to_mutation(s));
             }
             return mutations;
@@ -268,7 +270,7 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
                 // send to partially or wholly fail in actually sending stuff. Since we don't
                 // have hints (yet), send with CL=ALL, and hope we can re-do this soon.
                 // See below, we use retry on write failure.
-                return _qp.proxy().mutate(mutations, db::consistency_level::ALL, nullptr);
+                return _qp.proxy().mutate(mutations, db::consistency_level::ALL, db::no_timeout, nullptr, empty_service_permit());
             });
         }).then_wrapped([this, id](future<> batch_result) {
             try {
@@ -283,20 +285,20 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
                 return make_ready_future<>();
             }
             // delete batch
-            auto schema = _qp.db().local().find_schema(system_keyspace::NAME, system_keyspace::BATCHLOG);
+            auto schema = _qp.db().find_schema(system_keyspace::NAME, system_keyspace::BATCHLOG);
             auto key = partition_key::from_singular(*schema, id);
             mutation m(schema, key);
             auto now = service::client_state(service::client_state::internal_tag()).get_timestamp();
             m.partition().apply_delete(*schema, clustering_key_prefix::make_empty(), tombstone(now, gc_clock::now()));
-            return _qp.proxy().mutate_locally(m);
+            return _qp.proxy().mutate_locally(m, tracing::trace_state_ptr(), db::commitlog::force_sync::no);
         });
     };
 
     return seastar::with_gate(_gate, [this, batch = std::move(batch)] {
-        blogger.debug("Started replayAllFailedBatches (cpu {})", engine().cpu_id());
+        blogger.debug("Started replayAllFailedBatches (cpu {})", this_shard_id());
 
         typedef ::shared_ptr<cql3::untyped_result_set> page_ptr;
-        sstring query = sprint("SELECT id, data, written_at, version FROM %s.%s LIMIT %d", system_keyspace::NAME, system_keyspace::BATCHLOG, page_size);
+        sstring query = format("SELECT id, data, written_at, version FROM {}.{} LIMIT {:d}", system_keyspace::NAME, system_keyspace::BATCHLOG, page_size);
         return _qp.execute_internal(query).then([this, batch = std::move(batch)](page_ptr page) {
             return do_with(std::move(page), [this, batch = std::move(batch)](page_ptr & page) mutable {
                 return repeat([this, &page, batch = std::move(batch)]() mutable {
@@ -308,7 +310,7 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
                         if (page->size() < page_size) {
                             return make_ready_future<stop_iteration>(stop_iteration::yes); // we've exhausted the batchlog, next query would be empty.
                         }
-                        sstring query = sprint("SELECT id, data, written_at, version FROM %s.%s WHERE token(id) > token(?) LIMIT %d",
+                        sstring query = format("SELECT id, data, written_at, version FROM {}.{} WHERE token(id) > token(?) LIMIT {:d}",
                                 system_keyspace::NAME,
                                 system_keyspace::BATCHLOG,
                                 page_size);
@@ -349,7 +351,7 @@ std::unordered_set<gms::inet_address> db::batchlog_manager::endpoint_filter(cons
 
     auto is_valid = [](gms::inet_address input) {
         return input != utils::fb_utilities::get_broadcast_address()
-            && gms::get_local_failure_detector().is_alive(input)
+            && gms::get_local_gossiper().is_alive(input)
             ;
     };
 
@@ -396,10 +398,8 @@ std::unordered_set<gms::inet_address> db::batchlog_manager::endpoint_filter(cons
 
     // grab a random member of up to two racks
     for (auto& rack : racks) {
-        auto rack_members = validated.bucket(rack);
-        auto n = validated.bucket_size(rack_members);
         auto cpy = boost::copy_range<std::vector<gms::inet_address>>(validated.equal_range(rack) | boost::adaptors::map_values);
-        std::uniform_int_distribution<size_t> rdist(0, n - 1);
+        std::uniform_int_distribution<size_t> rdist(0, cpy.size() - 1);
         result.emplace(cpy[rdist(_e1)]);
     }
 

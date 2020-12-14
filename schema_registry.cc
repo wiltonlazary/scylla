@@ -30,11 +30,11 @@ static logging::logger slogger("schema_registry");
 static thread_local schema_registry registry;
 
 schema_version_not_found::schema_version_not_found(table_schema_version v)
-        : std::runtime_error{sprint("Schema version %s not found", v)}
+        : std::runtime_error{format("Schema version {} not found", v)}
 { }
 
 schema_version_loading_failed::schema_version_loading_failed(table_schema_version v)
-        : std::runtime_error{sprint("Failed to load schema version %s", v)}
+        : std::runtime_error{format("Failed to load schema version {}", v)}
 { }
 
 schema_registry_entry::~schema_registry_entry() {
@@ -91,6 +91,10 @@ schema_registry_entry& schema_registry::get_entry(table_schema_version v) const 
         throw schema_version_not_found(v);
     }
     return e;
+}
+
+schema_registry_entry::erase_clock::duration schema_registry::grace_period() const {
+    return std::chrono::seconds(_ctxt->schema_registry_grace_period());
 }
 
 schema_ptr schema_registry::get(table_schema_version v) const {
@@ -161,7 +165,8 @@ future<schema_ptr> schema_registry_entry::start_loading(async_schema_loader load
     auto sf = _schema_promise.get_shared_future();
     _state = state::LOADING;
     slogger.trace("Loading {}", _version);
-    f.then_wrapped([self = shared_from_this(), this] (future<frozen_schema>&& f) {
+    // Move to background.
+    (void)f.then_wrapped([self = shared_from_this(), this] (future<frozen_schema>&& f) {
         _loader = {};
         if (_state != state::LOADING) {
             slogger.trace("Loading of {} aborted", _version);
@@ -187,7 +192,7 @@ schema_ptr schema_registry_entry::get_schema() {
         slogger.trace("Activating {}", _version);
         auto s = _frozen_schema->unfreeze(*_registry._ctxt);
         if (s->version() != _version) {
-            throw std::runtime_error(sprint("Unfrozen schema version doesn't match entry version (%s): %s", _version, *s));
+            throw std::runtime_error(format("Unfrozen schema version doesn't match entry version ({}): {}", _version, *s));
         }
         _erase_timer.cancel();
         s->_registry_entry = this;
@@ -223,7 +228,8 @@ future<> schema_registry_entry::maybe_sync(std::function<future<>()> syncer) {
             });
             auto sf = _synced_promise.get_shared_future();
             _sync_state = schema_registry_entry::sync_state::SYNCING;
-            f.then_wrapped([this, self = shared_from_this()] (auto&& f) {
+            // Move to background.
+            (void)f.then_wrapped([this, self = shared_from_this()] (auto&& f) {
                 if (_sync_state != sync_state::SYNCING) {
                     return;
                 }
@@ -263,17 +269,15 @@ global_schema_ptr::global_schema_ptr(const global_schema_ptr& o)
     : global_schema_ptr(o.get())
 { }
 
-global_schema_ptr::global_schema_ptr(global_schema_ptr&& o) {
-    auto current = engine().cpu_id();
-    if (o._cpu_of_origin != current) {
-        throw std::runtime_error("Attempted to move global_schema_ptr across shards");
-    }
+global_schema_ptr::global_schema_ptr(global_schema_ptr&& o) noexcept {
+    auto current = this_shard_id();
+    assert(o._cpu_of_origin == current);
     _ptr = std::move(o._ptr);
     _cpu_of_origin = current;
 }
 
 schema_ptr global_schema_ptr::get() const {
-    if (engine().cpu_id() == _cpu_of_origin) {
+    if (this_shard_id() == _cpu_of_origin) {
         return _ptr;
     } else {
         // 'e' points to a foreign entry, but we know it won't be evicted
@@ -304,5 +308,5 @@ global_schema_ptr::global_schema_ptr(const schema_ptr& ptr)
                 return frozen_schema(ptr);
             });
         }())
-    , _cpu_of_origin(engine().cpu_id())
+    , _cpu_of_origin(this_shard_id())
 { }

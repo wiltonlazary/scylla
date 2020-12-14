@@ -29,6 +29,7 @@
 #include <unordered_map>
 #include <type_traits>
 #include <deque>
+#include "atomic_cell.hh"
 
 namespace sstables {
 
@@ -52,9 +53,24 @@ struct disk_string {
     }
 };
 
+struct disk_string_vint_size {
+    bytes value;
+    explicit operator bytes_view() const {
+        return value;
+    }
+    bool operator==(const disk_string_vint_size& rhs) const {
+        return value == rhs.value;
+    }
+};
+
 template <typename Size>
 struct disk_string_view {
     bytes_view value;
+};
+
+template<typename SizeType>
+struct disk_data_value_view {
+    atomic_cell_value_view value;
 };
 
 template <typename Size, typename Members>
@@ -71,9 +87,8 @@ struct vint {
 };
 
 // Same as disk_array but with its size serialized as variable-length integer
-template <typename Size, typename Members>
+template <typename Members>
 struct disk_array_vint_size {
-    static_assert(std::is_integral<Size>::value, "Length type must be convertible to integer");
     utils::chunked_vector<Members> elements;
 };
 

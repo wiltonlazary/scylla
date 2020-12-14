@@ -51,8 +51,6 @@
 
 namespace auth {
 
-const sstring& default_authorizer_name();
-
 class default_authorizer : public authorizer {
     cql3::query_processor& _qp;
 
@@ -71,19 +69,17 @@ public:
 
     virtual future<> stop() override;
 
-    virtual const sstring& qualified_java_name() const override {
-        return default_authorizer_name();
-    }
+    virtual std::string_view qualified_java_name() const override;
 
     virtual future<permission_set> authorize(const role_or_anonymous&, const resource&) const override;
 
-    virtual future<> grant(stdx::string_view, permission_set, const resource&) const override;
+    virtual future<> grant(std::string_view, permission_set, const resource&) const override;
 
-    virtual future<> revoke( stdx::string_view, permission_set, const resource&) const override;
+    virtual future<> revoke( std::string_view, permission_set, const resource&) const override;
 
     virtual future<std::vector<permission_details>> list_all() const override;
 
-    virtual future<> revoke_all(stdx::string_view) const override;
+    virtual future<> revoke_all(std::string_view) const override;
 
     virtual future<> revoke_all(const resource&) const override;
 
@@ -96,7 +92,7 @@ private:
 
     future<> migrate_legacy_metadata() const;
 
-    future<> modify(stdx::string_view, permission_set, const resource&, stdx::string_view) const;
+    future<> modify(std::string_view, permission_set, const resource&, std::string_view) const;
 };
 
 } /* namespace auth */

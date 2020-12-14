@@ -21,22 +21,25 @@
  */
 
 #include "table_helper.hh"
+#include "cql3/query_processor.hh"
 #include "cql3/statements/create_table_statement.hh"
+#include "cql3/statements/modification_statement.hh"
+#include "database.hh"
 
-future<> table_helper::setup_table() const {
-    auto& qp = cql3::get_local_query_processor();
-    auto& db = qp.db().local();
+future<> table_helper::setup_table(cql3::query_processor& qp) const {
+    auto& db = qp.db();
 
     if (db.has_schema(_keyspace, _name)) {
         return make_ready_future<>();
     }
 
-    ::shared_ptr<cql3::statements::raw::cf_statement> parsed = static_pointer_cast<
-                    cql3::statements::raw::cf_statement>(cql3::query_processor::parse_statement(_create_cql));
-    parsed->prepare_keyspace(_keyspace);
+    auto parsed = cql3::query_processor::parse_statement(_create_cql);
+
+    cql3::statements::raw::cf_statement* parsed_cf_stmt = static_cast<cql3::statements::raw::cf_statement*>(parsed.get());
+    parsed_cf_stmt->prepare_keyspace(_keyspace);
     ::shared_ptr<cql3::statements::create_table_statement> statement =
                     static_pointer_cast<cql3::statements::create_table_statement>(
-                                    parsed->prepare(db, qp.get_cql_stats())->statement);
+                                    parsed_cf_stmt->prepare(db, qp.get_cql_stats())->statement);
     auto schema = statement->get_cf_meta_data(db);
 
     // Generate the CF UUID based on its KF names. This is needed to ensure that
@@ -54,21 +57,41 @@ future<> table_helper::setup_table() const {
     return service::get_local_migration_manager().announce_new_column_family(b.build(), false).discard_result().handle_exception([this] (auto ep) {});;
 }
 
-future<> table_helper::cache_table_info(service::query_state& qs) {
-    if (_prepared_stmt) {
-        return now();
-    } else {
+future<> table_helper::cache_table_info(cql3::query_processor& qp, service::query_state& qs) {
+    if (!_prepared_stmt) {
         // if prepared statement has been invalidated - drop cached pointers
         _insert_stmt = nullptr;
+    } else if (!_is_fallback_stmt) {
+        // we've already prepared the non-fallback statement
+        return now();
     }
 
-    return cql3::get_local_query_processor().prepare(_insert_cql, qs.get_client_state(), false).then([this] (shared_ptr<cql_transport::messages::result_message::prepared> msg_ptr) {
+    return qp.prepare(_insert_cql, qs.get_client_state(), false)
+            .then([this] (shared_ptr<cql_transport::messages::result_message::prepared> msg_ptr) noexcept {
         _prepared_stmt = std::move(msg_ptr->get_prepared());
         shared_ptr<cql3::cql_statement> cql_stmt = _prepared_stmt->statement;
         _insert_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(cql_stmt);
-    }).handle_exception([this] (auto eptr) {
+        _is_fallback_stmt = false;
+    }).handle_exception_type([this, &qs, &qp] (exceptions::invalid_request_exception& eptr) {
+        // the non-fallback statement can't be prepared
+        if (!_insert_cql_fallback) {
+            return make_exception_future(eptr);
+        }
+        if (_is_fallback_stmt && _prepared_stmt) {
+            // we have already prepared the fallback statement
+            return now();
+        }
+        return qp.prepare(_insert_cql_fallback.value(), qs.get_client_state(), false)
+                .then([this] (shared_ptr<cql_transport::messages::result_message::prepared> msg_ptr) noexcept {
+            _prepared_stmt = std::move(msg_ptr->get_prepared());
+            shared_ptr<cql3::cql_statement> cql_stmt = _prepared_stmt->statement;
+            _insert_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(cql_stmt);
+            _is_fallback_stmt = true;
+        });
+    }).handle_exception([this, &qp] (auto eptr) {
         // One of the possible causes for an error here could be the table that doesn't exist.
-        this->setup_table().discard_result();
+        //FIXME: discarded future.
+        (void)this->setup_table(qp).discard_result();
 
         // We throw the bad_column_family exception because the caller
         // expects and accounts this type of errors.
@@ -80,4 +103,47 @@ future<> table_helper::cache_table_info(service::query_state& qs) {
             throw bad_column_family(_keyspace, _name);
         }
     });
+}
+
+future<> table_helper::insert(cql3::query_processor& qp, service::query_state& qs, noncopyable_function<cql3::query_options ()> opt_maker) {
+    return cache_table_info(qp, qs).then([this, &qs, opt_maker = std::move(opt_maker)] () mutable {
+        return do_with(opt_maker(), [this, &qs] (auto& opts) {
+            opts.prepare(_prepared_stmt->bound_names);
+            return _insert_stmt->execute(service::get_storage_proxy().local(), qs, opts);
+        });
+    }).discard_result();
+}
+
+future<> table_helper::setup_keyspace(cql3::query_processor& qp, const sstring& keyspace_name, sstring replication_factor, service::query_state& qs, std::vector<table_helper*> tables) {
+    if (this_shard_id() == 0) {
+        size_t n = tables.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (tables[i]->_keyspace != keyspace_name) {
+                throw std::invalid_argument("setup_keyspace called with table_helper for different keyspace");
+            }
+        }
+        return seastar::async([&qp, &keyspace_name, replication_factor, &qs, tables] {
+            database& db = qp.db();
+
+            // Create a keyspace
+            if (!db.has_keyspace(keyspace_name)) {
+                std::map<sstring, sstring> opts;
+                opts["replication_factor"] = replication_factor;
+                auto ksm = keyspace_metadata::new_keyspace(keyspace_name, "org.apache.cassandra.locator.SimpleStrategy", std::move(opts), true);
+                // We use min_timestamp so that default keyspace metadata will loose with any manual adjustments. See issue #2129.
+                service::get_local_migration_manager().announce_new_keyspace(ksm, api::min_timestamp, false).get();
+            }
+
+            qs.get_client_state().set_keyspace(db, keyspace_name);
+
+
+            // Create tables
+            size_t n = tables.size();
+            for (size_t i = 0; i < n; ++i) {
+                tables[i]->setup_table(qp).get();
+            }
+        });
+    } else {
+        return make_ready_future<>();
+    }
 }

@@ -26,8 +26,10 @@
 #include <seastar/core/shared_ptr.hh>
 #include "shared_sstable.hh"
 #include "sstables/progress_monitor.hh"
+#include "timestamp.hh"
 
 class compaction_backlog_manager;
+class compaction_controller;
 
 // Read and write progress are provided by structures present in progress_manager.hh
 // However, we don't want to be tied to their lifetimes and for that reason we will not
@@ -54,6 +56,8 @@ class compaction_backlog_manager;
 // will certainly be gone by then.
 struct backlog_write_progress_manager {
     virtual uint64_t written() const = 0;
+    virtual api::timestamp_type maximum_timestamp() const = 0;
+    virtual unsigned level() const = 0;
     virtual ~backlog_write_progress_manager() {}
 };
 
@@ -88,6 +92,15 @@ public:
     void transfer_ongoing_charges(compaction_backlog_tracker& new_bt, bool move_read_charges = true);
     void revert_charges(sstables::shared_sstable sst);
 private:
+    // Returns true if this SSTable can be added or removed from the tracker.
+    bool sstable_belongs_to_tracker(const sstables::shared_sstable& sst);
+
+    void disable() {
+        _disabled = true;
+        _ongoing_writes = {};
+        _ongoing_compactions = {};
+    }
+    bool _disabled = false;
     std::unique_ptr<impl> _impl;
     // We keep track of this so that we can transfer to a new tracker if the compaction strategy is
     // changed in the middle of a compaction.
@@ -112,9 +125,11 @@ private:
 class compaction_backlog_manager {
     std::unordered_set<compaction_backlog_tracker*> _backlog_trackers;
     void remove_backlog_tracker(compaction_backlog_tracker* tracker);
+    compaction_controller* _compaction_controller;
     friend class compaction_backlog_tracker;
 public:
     ~compaction_backlog_manager();
+    compaction_backlog_manager(compaction_controller& controller) : _compaction_controller(&controller) {}
     double backlog() const;
     void register_backlog_tracker(compaction_backlog_tracker& tracker);
 };

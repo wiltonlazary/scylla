@@ -24,7 +24,11 @@
 #include "bytes.hh"
 #include "utils/serialization.hh"
 
-#include <xxHash/xxhash.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#include <xxhash.h>
+#pragma GCC diagnostic pop
+
 #include <array>
 
 class xx_hasher {
@@ -32,11 +36,11 @@ class xx_hasher {
     XXH64_state_t _state;
 
 public:
-    xx_hasher() noexcept {
-        XXH64_reset(&_state, 0);
+    explicit xx_hasher(uint64_t seed = 0) noexcept {
+        XXH64_reset(&_state, seed);
     }
 
-    void update(const char* ptr, size_t length) {
+    void update(const char* ptr, size_t length) noexcept {
         XXH64_update(&_state, ptr, length);
     }
 
@@ -62,4 +66,11 @@ private:
         serialize_int64(out, 0);
         serialize_int64(out, finalize_uint64());
     }
+};
+
+// Used to specialize templates in order to fix a bug
+// in handling null values: #4567
+class legacy_xx_hasher_without_null_digest : public xx_hasher {
+public:
+    explicit legacy_xx_hasher_without_null_digest(uint64_t seed = 0) noexcept : xx_hasher(seed) {}
 };

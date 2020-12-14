@@ -22,8 +22,10 @@
 
 #pragma once
 
-#include "core/abort_source.hh"
-#include "core/sleep.hh"
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/do_with.hh>
+#include <seastar/core/future-util.hh>
 #include "seastarx.hh"
 #include <chrono>
 
@@ -66,8 +68,8 @@ private:
     struct retry_type_helper;
 
     template <typename T>
-    struct retry_type_helper<future<stdx::optional<T>>> {
-        using optional_type = stdx::optional<T>;
+    struct retry_type_helper<future<std::optional<T>>> {
+        using optional_type = std::optional<T>;
         using future_type = future<optional_type>;
     };
 

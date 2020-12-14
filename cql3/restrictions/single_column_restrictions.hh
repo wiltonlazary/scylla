@@ -43,7 +43,7 @@
 
 #include "cql3/restrictions/restrictions.hh"
 #include "cql3/restrictions/single_column_restriction.hh"
-#include "schema.hh"
+#include "schema_fwd.hh"
 #include "types.hh"
 
 namespace cql3 {
@@ -102,13 +102,15 @@ public:
         return r;
     }
 
-    virtual std::vector<bytes_opt> values(const query_options& options) const override {
-        std::vector<bytes_opt> r;
-        for (auto&& e : _restrictions) {
-            auto&& value = e.second->value(options);
-            r.emplace_back(value);
+    virtual bytes_opt value_for(const column_definition& cdef, const query_options& options) const override {
+        auto it = _restrictions.find(std::addressof(cdef));
+        if (it == _restrictions.end()) {
+            return bytes_opt{};
+        } else {
+            const auto values = std::get<expr::value_list>(possible_lhs_values(&cdef, it->second->expression, options));
+            assert(values.size() == 1);
+            return values.front();
         }
-        return r;
     }
 
     /**
@@ -117,21 +119,12 @@ public:
      * @param column_def the column definition
      * @return the restriction associated to the specified column
      */
-    ::shared_ptr<restriction> get_restriction(const column_definition& column_def) const {
+    ::shared_ptr<single_column_restriction> get_restriction(const column_definition& column_def) const {
         auto i = _restrictions.find(&column_def);
         if (i == _restrictions.end()) {
             return {};
         }
         return i->second;
-    }
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override {
-        for (auto&& e : _restrictions) {
-            if (e.second->uses_function(ks_name, function_name)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     virtual bool empty() const override {
@@ -149,19 +142,23 @@ public:
      * @throws InvalidRequestException if the new restriction cannot be added
      */
     void add_restriction(::shared_ptr<single_column_restriction> restriction) {
-        _is_all_eq &= restriction->is_EQ();
+        if (!find(restriction->expression, expr::oper_t::EQ)) {
+            _is_all_eq = false;
+        }
 
         auto i = _restrictions.find(&restriction->get_column_def());
         if (i == _restrictions.end()) {
             _restrictions.emplace_hint(i, &restriction->get_column_def(), std::move(restriction));
         } else {
-            i->second->merge_with(restriction);
+            auto& e = i->second->expression;
+            e = make_conjunction(std::move(e), restriction->expression);
         }
     }
 
-    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager) const override {
+    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager,
+                                      expr::allow_local_index allow_local) const override {
         for (auto&& e : _restrictions) {
-            if (e.second->has_supporting_index(index_manager)) {
+            if (expr::has_supporting_index(e.second->expression, index_manager, allow_local)) {
                 return true;
             }
         }
@@ -227,11 +224,9 @@ public:
     bool has_multiple_contains() const {
         uint32_t number_of_contains = 0;
         for (auto&& e : _restrictions) {
-            if (e.second->is_contains()) {
-                auto contains_ = static_pointer_cast<single_column_restriction::contains>(e.second);
-                number_of_contains += contains_->number_of_values();
-                number_of_contains += contains_->number_of_keys();
-                number_of_contains += contains_->number_of_entries();
+            number_of_contains += count_if(e.second->expression, expr::is_on_collection);
+            if (number_of_contains > 1) {
+                return true;
             }
         }
         return number_of_contains > 1;

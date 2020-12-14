@@ -33,6 +33,7 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/backtrace.hh>
 
@@ -41,56 +42,150 @@
 #include "utils/dynamic_bitset.hh"
 #include "utils/log_heap.hh"
 
+#include <random>
+
+#ifdef SEASTAR_ASAN_ENABLED
+#include "sanitizer/asan_interface.h"
+// For each aligned 8 byte segment, the algorithm used by address
+// sanitizer can represent any addressable prefix followd by a
+// poisoned suffix. The details are at:
+// https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm
+// For us this means that:
+// * The descriptor must be 8 byte aligned. If it was not, making the
+//   descriptor addressable would also make the end of the previous
+//   value addressable.
+// * Each value must be at least 8 byte aligned. If it was not, making
+//   the value addressable would also make the end of the descriptor
+//   addressable.
+namespace debug {
+constexpr size_t logalloc_alignment = 8;
+}
+template<typename T>
+[[nodiscard]] static T align_up_for_asan(T val) {
+    return align_up(val, size_t(8));
+}
+template<typename T>
+void poison(const T* addr, size_t size) {
+    // Both values and descriptors must be aligned.
+    assert(uintptr_t(addr) % 8 == 0);
+    // This can be followed by
+    // * 8 byte aligned descriptor (this is a value)
+    // * 8 byte aligned value
+    // * dead value
+    // * end of segment
+    // In all cases, we can align up the size to guarantee that asan
+    // is able to poison this.
+    ASAN_POISON_MEMORY_REGION(addr, align_up_for_asan(size));
+}
+void unpoison(const char *addr, size_t size) {
+    ASAN_UNPOISON_MEMORY_REGION(addr, size);
+}
+#else
+namespace debug {
+constexpr size_t logalloc_alignment = 1;
+}
+template<typename T>
+[[nodiscard]] static T align_up_for_asan(T val) { return val; }
+template<typename T>
+void poison(const T* addr, size_t size) { }
+void unpoison(const char *addr, size_t size) { }
+#endif
+
 namespace bi = boost::intrusive;
 
 standard_allocation_strategy standard_allocation_strategy_instance;
 
 namespace {
 
-class migrators : public enable_lw_shared_from_this<migrators> {
+class migrators_base {
+protected:
     std::vector<const migrate_fn_type*> _migrators;
-    std::deque<uint32_t> _unused_ids;
+};
+
 #ifdef DEBUG_LSA_SANITIZER
-    static constexpr uint32_t offset = 0x00ab'1234;
-#else
-    static constexpr uint32_t offset = 0;
-#endif
+
+class migrators : public migrators_base, public enable_lw_shared_from_this<migrators> {
+private:
+    struct backtrace_entry {
+        saved_backtrace _registration;
+        saved_backtrace _deregistration;
+    };
+    std::vector<std::unique_ptr<backtrace_entry>> _backtraces;
+
+    static logging::logger _logger;
+private:
+    void on_error() { abort(); }
 public:
     uint32_t add(const migrate_fn_type* m) {
-#ifndef DEBUG_LSA_SANITIZER
-        if (!_unused_ids.empty()) {
-            auto idx = _unused_ids.front();
-            _unused_ids.pop_front();
-            _migrators[idx - offset] = m;
-            return idx;
-        }
-#endif
         _migrators.push_back(m);
-        return _migrators.size() - 1 + offset;
+        _backtraces.push_back(std::make_unique<backtrace_entry>(backtrace_entry{current_backtrace(), {}}));
+        return _migrators.size() - 1;
     }
     void remove(uint32_t idx) {
-#ifdef DEBUG_LSA_SANITIZER
-        assert(idx >= offset);
-        assert(idx - offset < _migrators.size());
-        assert(_migrators[idx - offset]);
-        _migrators[idx - offset] = nullptr;
-#else
-        _unused_ids.push_back(idx);
-#endif
+        if (idx >= _migrators.size()) {
+            _logger.error("Attempting to deregister migrator id {} which was never registered:\n{}",
+                          idx, current_backtrace());
+            on_error();
+        }
+        if (!_migrators[idx]) {
+            _logger.error("Attempting to double deregister migrator id {}:\n{}\n"
+                          "Previously deregistered at:\n{}\nRegistered at:\n{}",
+                          idx, current_backtrace(), _backtraces[idx]->_deregistration,
+                          _backtraces[idx]->_registration);
+            on_error();
+        }
+        _migrators[idx] = nullptr;
+        _backtraces[idx]->_deregistration = current_backtrace();
     }
     const migrate_fn_type*& operator[](uint32_t idx) {
-#ifdef DEBUG_LSA_SANITIZER
-        assert(idx >= offset);
-        assert(idx - offset < _migrators.size());
-        assert(_migrators[idx - offset]);
-#endif
-        return _migrators[idx - offset];
+        if (idx >= _migrators.size()) {
+            _logger.error("Attempting to use migrator id {} that was never registered:\n{}",
+                          idx, current_backtrace());
+            on_error();
+        }
+        if (!_migrators[idx]) {
+            _logger.error("Attempting to use deregistered migrator id {}:\n{}\n"
+                          "Deregistered at:\n{}\nRegistered at:\n{}",
+                          idx, current_backtrace(), _backtraces[idx]->_deregistration,
+                          _backtraces[idx]->_registration);
+            on_error();
+        }
+        return _migrators[idx];
     }
 };
 
+logging::logger migrators::_logger("lsa-migrator-sanitizer");
+
+#else
+
+class migrators : public migrators_base, public enable_lw_shared_from_this<migrators> {
+    std::vector<uint32_t> _unused_ids;
+
+public:
+    uint32_t add(const migrate_fn_type* m) {
+        if (!_unused_ids.empty()) {
+            uint32_t idx = _unused_ids.back();
+            _unused_ids.pop_back();
+            _migrators[idx] = m;
+            return idx;
+        }
+        _migrators.push_back(m);
+        return _migrators.size() - 1;
+    }
+    void remove(uint32_t idx) {
+        _unused_ids.push_back(idx);
+    }
+    const migrate_fn_type*& operator[](uint32_t idx) {
+        return _migrators[idx];
+    }
+};
+
+#endif
+
 static
 migrators&
-static_migrators() {
+static_migrators() noexcept {
+    memory::scoped_critical_alloc_section dfg;
     static thread_local lw_shared_ptr<migrators> obj = make_lw_shared<migrators>();
     return *obj;
 }
@@ -134,6 +229,7 @@ private:
 private:
     template<typename Function>
     void run_and_handle_errors(Function&& fn) noexcept {
+        memory::scoped_critical_alloc_section dfg;
         if (_broken) {
             return;
         }
@@ -253,7 +349,14 @@ struct segment;
 
 static logging::logger llogger("lsa");
 static logging::logger timing_logger("lsa-timing");
-static thread_local tracker tracker_instance;
+
+static tracker& get_tracker_instance() noexcept {
+    memory::scoped_critical_alloc_section dfg;
+    static thread_local tracker obj;
+    return obj;
+}
+
+static thread_local tracker& tracker_instance = get_tracker_instance();
 
 using clock = std::chrono::steady_clock;
 
@@ -287,18 +390,28 @@ public:
     void register_region(region::impl*);
     void unregister_region(region::impl*) noexcept;
     size_t reclaim(size_t bytes);
-    reactor::idle_cpu_handler_result compact_on_idle(reactor::work_waiting_on_reactor check_for_work);
-    size_t compact_and_evict(size_t bytes);
-    size_t compact_and_evict_locked(size_t bytes);
+    // Compacts one segment at a time from sparsest segment to least sparse until work_waiting_on_reactor returns true
+    // or there are no more segments to compact.
+    idle_cpu_handler_result compact_on_idle(work_waiting_on_reactor check_for_work);
+    // Releases whole segments back to the segment pool.
+    // After the call, if there is enough evictable memory, the amount of free segments in the pool
+    // will be at least reserve_segments + div_ceil(bytes, segment::size).
+    // Returns the amount by which segment_pool.total_memory_in_use() has decreased.
+    size_t compact_and_evict(size_t reserve_segments, size_t bytes);
     void full_compaction();
     void reclaim_all_free_segments();
     occupancy_stats region_occupancy();
     occupancy_stats occupancy();
     size_t non_lsa_used_space();
+    // Set the minimum number of segments reclaimed during single reclamation cycle.
     void set_reclamation_step(size_t step_in_segments) { _reclamation_step = step_in_segments; }
     size_t reclamation_step() const { return _reclamation_step; }
+    // Abort on allocation failure from LSA
     void enable_abort_on_bad_alloc() { _abort_on_bad_alloc = true; }
     bool should_abort_on_bad_alloc() const { return _abort_on_bad_alloc; }
+private:
+    // Like compact_and_evict() but assumes that reclaim_lock is held around the operation.
+    size_t compact_and_evict_locked(size_t reserve_segments, size_t bytes);
 };
 
 class tracker_reclaimer_lock {
@@ -309,7 +422,7 @@ public:
 
 tracker::tracker()
     : _impl(std::make_unique<impl>())
-    , _reclaimer([this] { return reclaim(); }, memory::reclaimer_scope::sync)
+    , _reclaimer([this] (seastar::memory::reclaimer::request r) { return reclaim(r); }, memory::reclaimer_scope::sync)
 { }
 
 tracker::~tracker() {
@@ -317,10 +430,6 @@ tracker::~tracker() {
 
 size_t tracker::reclaim(size_t bytes) {
     return _impl->reclaim(bytes);
-}
-
-reactor::idle_cpu_handler_result tracker::compact_on_idle(reactor::work_waiting_on_reactor check_for_work) {
-    return _impl->compact_on_idle(check_for_work);
 }
 
 occupancy_stats tracker::region_occupancy() {
@@ -347,7 +456,7 @@ tracker& shard_tracker() {
     return tracker_instance;
 }
 
-struct segment {
+struct alignas(segment_size) segment {
     static constexpr int size_shift = segment_size_shift;
     using size_type = std::conditional_t<(size_shift < 16), uint16_t, uint32_t>;
     static constexpr size_t size = segment_size;
@@ -366,16 +475,14 @@ struct segment {
         return reinterpret_cast<T*>(data + offset);
     }
 
-    bool is_empty() const;
+    bool is_empty();
     void record_alloc(size_type size);
     void record_free(size_type size);
-    occupancy_stats occupancy() const;
+    occupancy_stats occupancy();
 
-#ifndef SEASTAR_DEFAULT_ALLOCATOR
     static void* operator new(size_t size) = delete;
     static void* operator new(size_t, void* ptr) noexcept { return ptr; }
     static void operator delete(void* ptr) = delete;
-#endif
 };
 
 static constexpr size_t max_managed_object_size = segment_size * 0.1;
@@ -419,6 +526,91 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
 using segment_descriptor_hist = log_heap<segment_descriptor, segment_descriptor_hist_options>;
 
 #ifndef SEASTAR_DEFAULT_ALLOCATOR
+class segment_store {
+    memory::memory_layout _layout;
+    uintptr_t _segments_base; // The address of the first segment
+
+public:
+    size_t non_lsa_reserve = 0;
+    segment_store()
+        : _layout(memory::get_memory_layout())
+        , _segments_base(align_down(_layout.start, (uintptr_t)segment::size)) {
+    }
+    segment* segment_from_idx(size_t idx) const {
+        return reinterpret_cast<segment*>(_segments_base) + idx;
+    }
+    size_t idx_from_segment(segment* seg) const {
+        return seg - reinterpret_cast<segment*>(_segments_base);
+    }
+    size_t new_idx_for_segment(segment* seg) {
+        return idx_from_segment(seg);
+    }
+    void free_segment(segment *seg) { }
+    size_t max_segments() const {
+        return (_layout.end - _segments_base) / segment::size;
+    }
+    bool can_allocate_more_segments() {
+        return memory::stats().free_memory() >= non_lsa_reserve + segment::size;
+    }
+};
+#else
+class segment_store {
+    std::vector<segment*> _segments;
+    std::unordered_map<segment*, size_t> _segment_indexes;
+    static constexpr size_t _std_memory_available = size_t(1) << 30; // emulate 1GB per shard
+    std::vector<segment*>::iterator find_empty() {
+        // segment 0 is a marker for no segment
+        return std::find(_segments.begin() + 1, _segments.end(), nullptr);
+    }
+
+public:
+    size_t non_lsa_reserve = 0;
+    segment_store() : _segments(max_segments()) {
+        _segment_indexes.reserve(max_segments());
+    }
+    segment* segment_from_idx(size_t idx) const {
+        assert(idx < _segments.size());
+        return _segments[idx];
+    }
+    size_t idx_from_segment(segment* seg) {
+        // segment 0 is a marker for no segment
+        auto i = _segment_indexes.find(seg);
+        if (i == _segment_indexes.end()) {
+            return 0;
+        }
+        return i->second;
+    }
+    size_t new_idx_for_segment(segment* seg) {
+        auto i = find_empty();
+        assert(i != _segments.end());
+        *i = seg;
+        size_t ret = i - _segments.begin();
+        _segment_indexes[seg] = ret;
+        return ret;
+    }
+    void free_segment(segment *seg) {
+        size_t i = idx_from_segment(seg);
+        assert(i != 0);
+        _segment_indexes.erase(seg);
+        _segments[i] = nullptr;
+    }
+    ~segment_store() {
+        for (segment *seg : _segments) {
+            if (seg) {
+                seg->~segment();
+                free(seg);
+            }
+        }
+    }
+    size_t max_segments() const {
+        return _std_memory_available / segment::size;
+    }
+    bool can_allocate_more_segments() {
+        auto i = find_empty();
+        return i != _segments.end();
+    }
+};
+#endif
 
 // Segment pool implementation for the seastar allocator.
 // Stores segment descriptors in a vector which is indexed using most significant
@@ -427,8 +619,7 @@ using segment_descriptor_hist = log_heap<segment_descriptor, segment_descriptor_
 // We prefer using high-address segments, and returning low-address segments to the seastar
 // allocator in order to segregate lsa and non-lsa memory, to reduce fragmentation.
 class segment_pool {
-    memory::memory_layout _layout;
-    uintptr_t _segments_base; // The address of the first segment
+    segment_store _store;
     std::vector<segment_descriptor> _segments;
     size_t _segments_in_use{};
     utils::dynamic_bitset _lsa_owned_segments_bitmap; // owned by this
@@ -437,8 +628,23 @@ class segment_pool {
     size_t _current_emergency_reserve_goal = 1;
     size_t _emergency_reserve_max = 30;
     bool _allocation_failure_flag = false;
+    bool _allocation_enabled = true;
+
+    struct allocation_lock {
+        segment_pool& _pool;
+        bool _prev;
+        allocation_lock(segment_pool& p)
+            : _pool(p)
+            , _prev(p._allocation_enabled)
+        {
+            _pool._allocation_enabled = false;
+        }
+        ~allocation_lock() {
+            _pool._allocation_enabled = _prev;
+        }
+    };
+
     size_t _non_lsa_memory_in_use = 0;
-    size_t _non_lsa_reserve = 0;
     // Invariants - a segment is in one of the following states:
     //   In use by some region
     //     - set in _lsa_owned_segments_bitmap
@@ -452,8 +658,6 @@ class segment_pool {
     //     - clear everywhere
 private:
     segment* allocate_segment(size_t reserve);
-    // reclamation_step is in segment units
-    segment* allocate_segment(size_t reserve, size_t reclamation_step);
     void deallocate_segment(segment* seg);
     friend void* segment::operator new(size_t);
     friend void segment::operator delete(void*);
@@ -461,24 +665,25 @@ private:
     segment* allocate_or_fallback_to_reserve();
     void free_or_restore_to_reserve(segment* seg) noexcept;
     segment* segment_from_idx(size_t idx) const {
-        return reinterpret_cast<segment*>(_segments_base) + idx;
+        return _store.segment_from_idx(idx);
     }
-    size_t idx_from_segment(segment* seg) const {
-        return seg - reinterpret_cast<segment*>(_segments_base);
+    size_t idx_from_segment(segment* seg) {
+        return _store.idx_from_segment(seg);
     }
     size_t max_segments() const {
-        return (_layout.end - _segments_base) / segment::size;
+        return _store.max_segments();
     }
-    bool can_allocate_more_memory(size_t size) {
-        return memory::stats().free_memory() >= _non_lsa_reserve + size;
+    bool can_allocate_more_segments() {
+        return _allocation_enabled && _store.can_allocate_more_segments();
     }
+    bool compact_segment(segment* seg);
 public:
     segment_pool();
-    void prime();
+    void prime(size_t available_memory, size_t min_free_memory);
     segment* new_segment(region::impl* r);
-    segment_descriptor& descriptor(const segment*);
+    segment_descriptor& descriptor(segment*);
     // Returns segment containing given object or nullptr.
-    segment* containing_segment(const void* obj) const;
+    segment* containing_segment(const void* obj);
     segment* segment_from(const segment_descriptor& desc);
     void free_segment(segment*) noexcept;
     void free_segment(segment*, segment_descriptor&) noexcept;
@@ -499,21 +704,22 @@ public:
     size_t total_memory_in_use() const {
         return _non_lsa_memory_in_use + _segments_in_use * segment::size;
     }
+    size_t total_free_memory() const {
+        return _free_segments * segment::size;
+    }
     struct reservation_goal;
-    void set_region(const segment* seg, region::impl* r) {
+    void set_region(segment* seg, region::impl* r) {
         set_region(descriptor(seg), r);
     }
     void set_region(segment_descriptor& desc, region::impl* r) {
         desc._region = r;
     }
-    bool migrate_segment(segment* src, segment* dst);
     size_t reclaim_segments(size_t target);
     void reclaim_all_free_segments() {
         reclaim_segments(std::numeric_limits<size_t>::max());
     }
 
     struct stats {
-        size_t segments_migrated;
         size_t segments_compacted;
         uint64_t memory_allocated;
         uint64_t memory_compacted;
@@ -522,7 +728,6 @@ private:
     stats _stats{};
 public:
     const stats& statistics() const { return _stats; }
-    void on_segment_migration() { _stats.segments_migrated++; }
     void on_segment_compaction(size_t used_size);
     void on_memory_allocation(size_t size);
     size_t unreserved_free_segments() const { return _free_segments - std::min(_free_segments, _emergency_reserve_max); }
@@ -558,13 +763,7 @@ size_t segment_pool::reclaim_segments(size_t target) {
             src_idx = _lsa_owned_segments_bitmap.find_next_set(src_idx)) {
         auto src = segment_from_idx(src_idx);
         if (!_lsa_free_segments_bitmap.test(src_idx)) {
-            auto dst_idx = _lsa_free_segments_bitmap.find_last_set();
-            if (dst_idx == utils::dynamic_bitset::npos || dst_idx <= src_idx) {
-                break;
-            }
-            assert(_lsa_owned_segments_bitmap.test(dst_idx));
-            auto could_migrate = migrate_segment(src, segment_from_idx(dst_idx));
-            if (!could_migrate) {
+            if (!compact_segment(src)) {
                 if (--failed_reclaims_allowance == 0) {
                     break;
                 }
@@ -573,6 +772,7 @@ size_t segment_pool::reclaim_segments(size_t target) {
         }
         _lsa_free_segments_bitmap.clear(src_idx);
         _lsa_owned_segments_bitmap.clear(src_idx);
+        _store.free_segment(src);
         src->~segment();
         ::free(src);
         ++reclaimed_segments;
@@ -583,11 +783,7 @@ size_t segment_pool::reclaim_segments(size_t target) {
     return reclaimed_segments;
 }
 
-segment* segment_pool::allocate_segment(size_t reserve) {
-    return allocate_segment(reserve, shard_tracker().reclamation_step());
-}
-
-segment* segment_pool::allocate_segment(size_t reserve, size_t reclamation_step)
+segment* segment_pool::allocate_segment(size_t reserve)
 {
     //
     // When allocating a segment we want to avoid:
@@ -611,21 +807,19 @@ segment* segment_pool::allocate_segment(size_t reserve, size_t reclamation_step)
             --_free_segments;
             return seg;
         }
-        if (can_allocate_more_memory(segment::size)) {
+        if (can_allocate_more_segments()) {
+            memory::disable_abort_on_alloc_failure_temporarily dfg;
             auto p = aligned_alloc(segment::size, segment::size);
             if (!p) {
                 continue;
             }
             auto seg = new (p) segment;
-            auto idx = idx_from_segment(seg);
+            poison(seg, sizeof(segment));
+            auto idx = _store.new_idx_for_segment(seg);
             _lsa_owned_segments_bitmap.set(idx);
             return seg;
         }
-    } while (shard_tracker().get_impl().compact_and_evict(reclamation_step * segment::size));
-    if (shard_tracker().should_abort_on_bad_alloc()) {
-        llogger.error("Aborting due to segment allocation failure");
-        abort();
-    }
+    } while (shard_tracker().get_impl().compact_and_evict(reserve, shard_tracker().reclamation_step() * segment::size));
     return nullptr;
 }
 
@@ -638,7 +832,7 @@ void segment_pool::deallocate_segment(segment* seg)
 
 void segment_pool::refill_emergency_reserve() {
     while (_free_segments < _emergency_reserve_max) {
-        auto seg = allocate_segment(_emergency_reserve_max, _emergency_reserve_max - _free_segments);
+        auto seg = allocate_segment(_emergency_reserve_max);
         if (!seg) {
             throw std::bad_alloc();
         }
@@ -648,20 +842,20 @@ void segment_pool::refill_emergency_reserve() {
 }
 
 segment_descriptor&
-segment_pool::descriptor(const segment* seg) {
-    uintptr_t seg_addr = reinterpret_cast<uintptr_t>(seg);
-    uintptr_t index = (seg_addr - _segments_base) >> segment::size_shift;
+segment_pool::descriptor(segment* seg) {
+    uintptr_t index = idx_from_segment(seg);
     return _segments[index];
 }
 
 segment*
-segment_pool::containing_segment(const void* obj) const {
+segment_pool::containing_segment(const void* obj) {
     auto addr = reinterpret_cast<uintptr_t>(obj);
     auto offset = addr & (segment::size - 1);
-    auto index = (addr - _segments_base) >> segment::size_shift;
+    auto seg = reinterpret_cast<segment*>(addr - offset);
+    auto index = idx_from_segment(seg);
     auto& desc = _segments[index];
     if (desc._region) {
-        return reinterpret_cast<segment*>(addr - offset);
+        return seg;
     } else {
         return nullptr;
     }
@@ -671,7 +865,7 @@ segment*
 segment_pool::segment_from(const segment_descriptor& desc) {
     assert(desc._region);
     auto index = &desc - &_segments[0];
-    return reinterpret_cast<segment*>(_segments_base + (index << segment::size_shift));
+    return segment_from_idx(index);
 }
 
 segment*
@@ -699,28 +893,25 @@ void segment_pool::free_segment(segment* seg) noexcept {
 }
 
 void segment_pool::free_segment(segment* seg, segment_descriptor& desc) noexcept {
-    llogger.trace("Releasing segment {}", seg);
+    llogger.trace("Releasing segment {}", fmt::ptr(seg));
     desc._region = nullptr;
     deallocate_segment(seg);
     --_segments_in_use;
 }
 
 segment_pool::segment_pool()
-    : _layout(memory::get_memory_layout())
-    , _segments_base(align_down(_layout.start, (uintptr_t)segment::size))
-    , _segments(max_segments())
+    : _segments(max_segments())
     , _lsa_owned_segments_bitmap(max_segments())
     , _lsa_free_segments_bitmap(max_segments())
 {
-    prime();
 }
 
-void segment_pool::prime() {
+void segment_pool::prime(size_t available_memory, size_t min_free_memory) {
     auto old_emergency_reserve = std::exchange(_emergency_reserve_max, std::numeric_limits<size_t>::max());
     try {
         // Allocate all of memory so that we occupy the top part. Afterwards, we'll start
         // freeing from the bottom.
-        _non_lsa_reserve = 0;
+        _store.non_lsa_reserve = 0;
         refill_emergency_reserve();
     } catch (std::bad_alloc&) {
         _emergency_reserve_max = old_emergency_reserve;
@@ -729,149 +920,11 @@ void segment_pool::prime() {
     // the frequency of expensive segment-migrating reclaim() called by the seastar allocator.
     size_t min_gap = 1 * 1024 * 1024;
     size_t max_gap = 64 * 1024 * 1024;
-    size_t gap = std::min(max_gap, std::max(memory::stats().total_memory() / 16, min_gap));
-    _non_lsa_reserve = memory::min_free_memory() + gap;
+    size_t gap = std::min(max_gap, std::max(available_memory / 16, min_gap));
+    _store.non_lsa_reserve = min_free_memory + gap;
     // Since the reclaimer is not yet in place, free some low memory for general use
-    reclaim_segments(_non_lsa_reserve / segment::size);
+    reclaim_segments(_store.non_lsa_reserve / segment::size);
 }
-
-#else
-
-// Segment pool version for the standard allocator. Slightly less efficient
-// than the version for seastar's allocator.
-class segment_pool {
-    class segment_deleter {
-        segment_pool* _pool;
-    public:
-        explicit segment_deleter(segment_pool* pool) : _pool(pool) {}
-        void operator()(segment* seg) const noexcept {
-            if (seg) {
-                ::free(seg);
-                _pool->_std_memory_available += segment::size;
-            }
-        }
-    };
-    std::unordered_map<const segment*, segment_descriptor> _segments;
-    std::unordered_map<const segment_descriptor*, segment*> _segment_descs;
-    std::stack<std::unique_ptr<segment, segment_deleter>> _free_segments;
-    size_t _segments_in_use{};
-    size_t _non_lsa_memory_in_use = 0;
-    size_t _std_memory_available = size_t(1) << 30; // emulate 1GB per shard
-    friend segment_deleter;
-public:
-    void prime() {}
-    segment* new_segment(region::impl* r) {
-        if (_free_segments.empty()) {
-            if (_std_memory_available < segment::size) {
-                throw std::bad_alloc();
-            }
-            std::unique_ptr<segment, segment_deleter> seg{new (with_alignment(segment::size)) segment, segment_deleter(this)};
-            _std_memory_available -= segment::size;
-            _free_segments.push(std::move(seg));
-        }
-        ++_segments_in_use;
-        auto seg = _free_segments.top().release();
-        _free_segments.pop();
-        assert((reinterpret_cast<uintptr_t>(seg) & (sizeof(segment) - 1)) == 0);
-        segment_descriptor& desc = _segments[seg];
-        desc._free_space = segment::size;
-        desc._region = r;
-        _segment_descs[&desc] = seg;
-        return seg;
-    }
-    segment_descriptor& descriptor(const segment* seg) {
-        auto i = _segments.find(seg);
-        if (i != _segments.end()) {
-            return i->second;
-        } else {
-            segment_descriptor& desc = _segments[seg];
-            desc._region = nullptr;
-            return desc;
-        }
-    }
-    segment* segment_from(segment_descriptor& desc) {
-        auto i = _segment_descs.find(&desc);
-        assert(i != _segment_descs.end());
-        return i->second;
-    }
-    void free_segment(segment* seg, segment_descriptor& desc) {
-        free_segment(seg);
-    }
-    void free_segment(segment* seg) {
-        --_segments_in_use;
-        auto i = _segments.find(seg);
-        assert(i != _segments.end());
-        _segment_descs.erase(&i->second);
-        _segments.erase(i);
-        std::unique_ptr<segment, segment_deleter> useg{seg, segment_deleter(this)};
-        _free_segments.push(std::move(useg));
-    }
-    segment* containing_segment(const void* obj) const {
-        uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
-        auto seg = reinterpret_cast<segment*>(align_down(addr, static_cast<uintptr_t>(segment::size)));
-        auto i = _segments.find(seg);
-        if (i == _segments.end()) {
-            return nullptr;
-        }
-        return seg;
-    }
-    size_t segments_in_use() const;
-    size_t current_emergency_reserve_goal() const { return 0; }
-    void set_current_emergency_reserve_goal(size_t goal) { }
-    void set_emergency_reserve_max(size_t new_size) { }
-    size_t emergency_reserve_max() { return 0; }
-    void clear_allocation_failure_flag() { }
-    bool allocation_failure_flag() { return false; }
-    void refill_emergency_reserve() {}
-    void update_non_lsa_memory_in_use(ssize_t n) {
-        _non_lsa_memory_in_use += n;
-    }
-    size_t non_lsa_memory_in_use() const {
-        return _non_lsa_memory_in_use;
-    }
-    size_t total_memory_in_use() const {
-        return _non_lsa_memory_in_use + _segments_in_use * segment::size;
-    }
-    size_t unreserved_free_segments() const {
-        return 0;
-    }
-    void set_region(const segment* seg, region::impl* r) {
-        set_region(descriptor(seg), r);
-    }
-    void set_region(segment_descriptor& desc, region::impl* r) {
-        desc._region = r;
-    }
-    size_t reclaim_segments(size_t target) {
-        size_t reclaimed = 0;
-        while (reclaimed < target && !_free_segments.empty()) {
-            _free_segments.pop();
-            ++reclaimed;
-        }
-        return reclaimed;
-    }
-    void reclaim_all_free_segments() {
-        reclaim_segments(std::numeric_limits<size_t>::max());
-    }
-
-    struct stats {
-        size_t segments_migrated;
-        size_t segments_compacted;
-        uint64_t memory_allocated;
-        uint64_t memory_compacted;
-    };
-private:
-    stats _stats{};
-public:
-    const stats& statistics() const { return _stats; }
-    void on_segment_migration() { _stats.segments_migrated++; }
-    void on_segment_compaction(size_t used_space);
-    void on_memory_allocation(size_t size);
-    size_t free_segments() const { return 0; }
-public:
-    class reservation_goal;
-};
-
-#endif
 
 void segment_pool::on_segment_compaction(size_t used_size) {
     _stats.segments_compacted++;
@@ -900,7 +953,13 @@ size_t segment_pool::segments_in_use() const {
     return _segments_in_use;
 }
 
-static thread_local segment_pool shard_segment_pool;
+static segment_pool& get_shard_segment_pool() noexcept {
+    memory::scoped_critical_alloc_section dfg;
+    static thread_local segment_pool obj;
+    return obj;
+}
+
+static thread_local segment_pool& shard_segment_pool = get_shard_segment_pool();
 
 void segment::record_alloc(segment::size_type size) {
     shard_segment_pool.descriptor(this).record_alloc(size);
@@ -910,12 +969,12 @@ void segment::record_free(segment::size_type size) {
     shard_segment_pool.descriptor(this).record_free(size);
 }
 
-bool segment::is_empty() const {
+bool segment::is_empty() {
     return shard_segment_pool.descriptor(this).is_empty();
 }
 
 occupancy_stats
-segment::occupancy() const {
+segment::occupancy() {
     return { shard_segment_pool.descriptor(this)._free_space, segment::size };
 }
 
@@ -998,21 +1057,26 @@ class region_impl final : public basic_region_impl {
         void encode(char*& pos) const {
             uint64_t b = 64;
             auto n = _n;
+            auto start = pos;
             do {
                 b |= n & 63;
                 n >>= 6;
                 if (!n) {
                     b |= 128;
                 }
+                unpoison(pos, 1);
                 *pos++ = b;
                 b = 0;
             } while (n);
+            poison(start, pos - start);
         }
 
         // non-canonical encoding to allow padding (for alignment); encoded_size must be
         // sufficient (greater than this->encoded_size())
         void encode(char*& pos, size_t encoded_size) const {
             uint64_t b = 64;
+            auto start = pos;
+            unpoison(start, encoded_size);
             auto n = _n;
             do {
                 b |= n & 63;
@@ -1023,6 +1087,7 @@ class region_impl final : public basic_region_impl {
                 *pos++ = b;
                 b = 0;
             } while (encoded_size);
+            poison(start, pos - start);
         }
 
         static object_descriptor decode_forwards(const char*& pos) {
@@ -1031,6 +1096,7 @@ class region_impl final : public basic_region_impl {
             auto p = pos; // avoid aliasing; p++ doesn't touch memory
             uint8_t b;
             do {
+                unpoison(p, 1);
                 b = *p++;
                 if (shift < 32) {
                     // non-canonical encoding can cause large shift; undefined in C++
@@ -1038,6 +1104,7 @@ class region_impl final : public basic_region_impl {
                 }
                 shift += 6;
             } while ((b & 128) == 0);
+            poison(pos, p - pos);
             pos = p;
             return object_descriptor(n);
         }
@@ -1047,22 +1114,25 @@ class region_impl final : public basic_region_impl {
             uint8_t b;
             auto p = pos; // avoid aliasing; --p doesn't touch memory
             do {
-                b = *--p;
+                --p;
+                unpoison(p, 1);
+                b = *p;
                 n = (n << 6) | (b & 63);
             } while ((b & 64) == 0);
+            poison(p, pos - p);
             pos = p;
             return object_descriptor(n);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const object_descriptor& desc) {
             if (!desc.is_live()) {
-                return out << sprint("{free %d}", desc.dead_size());
+                return out << format("{{free {:d}}}", desc.dead_size());
             } else {
                 auto m = desc.migrator();
                 auto x = reinterpret_cast<uintptr_t>(&desc) + sizeof(desc);
                 x = align_up(x, m->align());
                 auto obj = reinterpret_cast<const void*>(x);
-                return out << sprint("{migrator=%p, alignment=%d, size=%d}",
+                return out << format("{{migrator={:p}, alignment={:d}, size={:d}}}",
                                       (void*)m, m->align(), m->size(obj));
             }
         }
@@ -1082,6 +1152,9 @@ private:
     // occupancy. We could actually just present this as a scalar as well and never use occupancies,
     // but consistency is good.
     size_t _evictable_space = 0;
+    // This is a mask applied to _evictable_space with bitwise-and before it's returned from evictable_space().
+    // Used for forcing the result to zero without using conditionals.
+    size_t _evictable_space_mask = std::numeric_limits<size_t>::max();
     bool _evictable = false;
     region_sanitizer _sanitizer;
     uint64_t _id;
@@ -1103,26 +1176,29 @@ private:
         }
     };
 
-    void* alloc_small(allocation_strategy::migrate_fn migrator, segment::size_type size, size_t alignment) {
+    void* alloc_small(const object_descriptor& desc, segment::size_type size, size_t alignment) {
         if (!_active) {
             _active = new_segment();
             _active_offset = 0;
         }
 
-        auto desc = object_descriptor(migrator);
         auto desc_encoded_size = desc.encoded_size();
 
-        size_t obj_offset = align_up(_active_offset + desc_encoded_size, alignment);
+        size_t obj_offset = align_up_for_asan(align_up(_active_offset + desc_encoded_size, alignment));
         if (obj_offset + size > segment::size) {
             close_and_open();
-            return alloc_small(migrator, size, alignment);
+            return alloc_small(desc, size, alignment);
         }
 
         auto old_active_offset = _active_offset;
         auto pos = _active->at<char>(_active_offset);
         // Use non-canonical encoding to allow for alignment pad
         desc.encode(pos, obj_offset - _active_offset);
+        unpoison(pos, size);
         _active_offset = obj_offset + size;
+
+        // Align the end of the value so that the next descriptor is aligned
+        _active_offset = align_up_for_asan(_active_offset);
         _active->record_alloc(_active_offset - old_active_offset);
         return pos;
     }
@@ -1131,19 +1207,20 @@ private:
     void for_each_live(segment* seg, Func&& func) {
         // scylla-gdb.py:scylla_lsa_segment is coupled with this implementation.
 
-        static_assert(std::is_same<void, std::result_of_t<Func(const object_descriptor*, void*)>>::value, "bad Func signature");
+        static_assert(std::is_same<void, std::result_of_t<Func(const object_descriptor*, void*, size_t)>>::value, "bad Func signature");
 
-        auto pos = seg->at<const char>(0);
+        auto pos = align_up_for_asan(seg->at<const char>(0));
         while (pos < seg->at<const char>(segment::size)) {
             auto old_pos = pos;
             const auto desc = object_descriptor::decode_forwards(pos);
             if (desc.is_live()) {
                 auto size = desc.live_size(pos);
-                func(&desc, const_cast<char*>(pos));
+                func(&desc, const_cast<char*>(pos), size);
                 pos += size;
             } else {
                 pos = old_pos + desc.dead_size();
             }
+            pos = align_up_for_asan(pos);
         }
     }
 
@@ -1156,7 +1233,7 @@ private:
             auto pos =_active->at<char>(_active_offset);
             desc.encode(pos);
         }
-        llogger.trace("Closing segment {}, used={}, waste={} [B]", _active, _active->occupancy(), segment::size - _active_offset);
+        llogger.trace("Closing segment {}, used={}, waste={} [B]", fmt::ptr(_active), _active->occupancy(), segment::size - _active_offset);
         _closed_occupancy += _active->occupancy();
 
         _segment_descs.push(shard_segment_pool.descriptor(_active));
@@ -1188,17 +1265,20 @@ private:
         return seg;
     }
 
-    void compact(segment* seg, segment_descriptor& desc) {
+    void compact_segment_locked(segment* seg, segment_descriptor& desc) {
+        auto seg_occupancy = desc.occupancy();
+        llogger.debug("Compacting segment {} from region {}, {}", fmt::ptr(seg), id(), seg_occupancy);
+
         ++_invalidate_counter;
 
-        for_each_live(seg, [this] (const object_descriptor* desc, void* obj) {
-            auto size = desc->live_size(obj);
-            auto dst = alloc_small(desc->migrator(), size, desc->alignment());
+        for_each_live(seg, [this] (const object_descriptor* desc, void* obj, size_t size) {
+            auto dst = alloc_small(*desc, size, desc->alignment());
             _sanitizer.on_migrate(obj, size, dst);
             desc->migrator()->migrate(obj, dst, size);
         });
 
         free_segment(seg, desc);
+        shard_segment_pool.on_segment_compaction(seg_occupancy.used_space());
     }
 
     void close_and_open() {
@@ -1291,8 +1371,16 @@ public:
     }
 
     occupancy_stats evictable_occupancy() const {
-        return occupancy_stats(_evictable_space, _evictable_space);
+        return occupancy_stats(0, _evictable_space & _evictable_space_mask);
     }
+
+    void ground_evictable_occupancy() {
+        _evictable_space_mask = 0;
+        if (_group) {
+            _group->decrease_evictable_usage(_heap_handle);
+        }
+    }
+
     //
     // Returns true if this region can be compacted and compact() will make forward progress,
     // so that this will eventually stop:
@@ -1327,7 +1415,7 @@ public:
             shard_segment_pool.update_non_lsa_memory_in_use(allocated_size);
             return ptr;
         } else {
-            auto ptr = alloc_small(migrator, (segment::size_type) size, alignment);
+            auto ptr = alloc_small(object_descriptor(migrator), (segment::size_type) size, alignment);
             _sanitizer.on_allocation(ptr, size);
             return ptr;
         }
@@ -1375,10 +1463,11 @@ public:
         auto pos = reinterpret_cast<const char*>(obj);
         auto old_pos = pos;
         auto desc = object_descriptor::decode_backwards(pos);
-        auto dead_size = size + (old_pos - pos);
+        auto dead_size = align_up_for_asan(size + (old_pos - pos));
         desc = object_descriptor::make_dead(dead_size);
         auto npos = const_cast<char*>(pos);
         desc.encode(npos);
+        poison(pos, dead_size);
 
         if (seg != _active) {
             _closed_occupancy -= seg->occupancy();
@@ -1416,7 +1505,7 @@ public:
         // degroup_temporarily allocates via binomial_heap::push(), which should not
         // fail, because we have a matching deallocation before that and we don't
         // allocate between them.
-        memory::disable_failure_guard dfg;
+        memory::scoped_critical_alloc_section dfg;
 
         compaction_lock dct1(*this);
         compaction_lock dct2(other);
@@ -1464,54 +1553,14 @@ public:
         return _segment_descs.one_of_largest().occupancy();
     }
 
-    void compact_single_segment_locked() {
+    // Compacts a single segment, most appropriate for it
+    void compact() {
+        compaction_lock _(*this);
         auto& desc = _segment_descs.one_of_largest();
         _segment_descs.pop_one_of_largest();
         _closed_occupancy -= desc.occupancy();
         segment* seg = shard_segment_pool.segment_from(desc);
-        auto seg_occupancy = desc.occupancy();
-        llogger.debug("Compacting segment {} from region {}, {}", seg, id(), seg_occupancy);
-        compact(seg, desc);
-        shard_segment_pool.on_segment_compaction(seg_occupancy.used_space());
-    }
-
-    // Compacts a single segment
-    void compact() {
-        compaction_lock _(*this);
-        compact_single_segment_locked();
-    }
-
-    void migrate_segment(segment* src, segment_descriptor& src_desc, segment* dst, segment_descriptor& dst_desc) {
-        ++_invalidate_counter;
-        size_t segment_size;
-        if (src != _active) {
-            _segment_descs.erase(src_desc);
-            _segment_descs.push(dst_desc);
-            segment_size = segment::size;
-        } else {
-            _active = dst;
-            segment_size = _active_offset;
-        }
-
-        size_t offset = 0;
-        while (offset < segment_size) {
-            auto pos = src->at<const char>(offset);
-            auto dpos = dst->at<char>(offset);
-            auto old_pos = pos;
-            auto desc = object_descriptor::decode_forwards(pos);
-            // Keep same size as before to maintain alignment
-            desc.encode(dpos, pos - old_pos);
-            if (desc.is_live()) {
-                offset += pos - old_pos;
-                auto size = desc.live_size(pos);
-                offset += size;
-                _sanitizer.on_migrate(pos, size, dpos);
-                desc.migrator()->migrate(const_cast<char*>(pos), dpos, size);
-            } else {
-                offset += desc.dead_size();
-            }
-        }
-        shard_segment_pool.on_segment_migration();
+        compact_segment_locked(seg, desc);
     }
 
     // Compacts everything. Mainly for testing.
@@ -1526,9 +1575,19 @@ public:
         while (!all.empty()) {
             auto& desc = all.one_of_largest();
             all.pop_one_of_largest();
-            compact(shard_segment_pool.segment_from(desc), desc);
+            compact_segment_locked(shard_segment_pool.segment_from(desc), desc);
         }
         llogger.debug("Done, {}", occupancy());
+    }
+
+    void compact_segment(segment* seg, segment_descriptor& desc) {
+        compaction_lock _(*this);
+        if (_active == seg) {
+            close_active();
+        }
+        _segment_descs.erase(desc);
+        _closed_occupancy -= desc.occupancy();
+        compact_segment_locked(seg, desc);
     }
 
     allocation_strategy& allocator() {
@@ -1595,24 +1654,29 @@ region_group_binomial_group_sanity_check(const region_group::region_heap& bh) {
 #endif
 }
 
-void tracker::set_reclamation_step(size_t step_in_segments) {
-    _impl->set_reclamation_step(step_in_segments);
-}
-
 size_t tracker::reclamation_step() const {
     return _impl->reclamation_step();
-}
-
-void tracker::enable_abort_on_bad_alloc() {
-    return _impl->enable_abort_on_bad_alloc();
 }
 
 bool tracker::should_abort_on_bad_alloc() {
     return _impl->should_abort_on_bad_alloc();
 }
 
-memory::reclaiming_result tracker::reclaim() {
-    return reclaim(_impl->reclamation_step() * segment::size)
+void tracker::configure(const config& cfg) {
+    if (cfg.defragment_on_idle) {
+        engine().set_idle_cpu_handler([this] (reactor::work_waiting_on_reactor check_for_work) {
+            return _impl->compact_on_idle(check_for_work);
+        });
+    }
+
+    _impl->set_reclamation_step(cfg.lsa_reclamation_step);
+    if (cfg.abort_on_lsa_bad_alloc) {
+        _impl->enable_abort_on_bad_alloc();
+    }
+}
+
+memory::reclaiming_result tracker::reclaim(seastar::memory::reclaimer::request r) {
+    return reclaim(std::max(r.bytes_to_reclaim, _impl->reclamation_step() * segment::size))
            ? memory::reclaiming_result::reclaimed_something
            : memory::reclaiming_result::reclaimed_nothing;
 }
@@ -1681,12 +1745,20 @@ void region::make_evictable(eviction_fn fn) {
     get_impl().make_evictable(std::move(fn));
 }
 
+void region::ground_evictable_occupancy() {
+    get_impl().ground_evictable_occupancy();
+}
+
+occupancy_stats region::evictable_occupancy() {
+    return get_impl().evictable_occupancy();
+}
+
 const eviction_fn& region::evictor() const {
     return get_impl().evictor();
 }
 
 std::ostream& operator<<(std::ostream& out, const occupancy_stats& stats) {
-    return out << sprint("%.2f%%, %d / %d [B]",
+    return out << format("{:.2f}%, {:d} / {:d} [B]",
         stats.used_fraction() * 100, stats.used_space(), stats.total_space());
 }
 
@@ -1710,8 +1782,12 @@ occupancy_stats tracker::impl::occupancy() {
 }
 
 size_t tracker::impl::non_lsa_used_space() {
+#ifdef SEASTAR_DEFAULT_ALLOCATOR
+    return 0;
+#else
     auto free_space_in_lsa = shard_segment_pool.free_segments() * segment_size;
     return memory::stats().allocated_memory() - region_occupancy().total_space() - free_space_in_lsa;
+#endif
 }
 
 void tracker::impl::reclaim_all_free_segments()
@@ -1794,18 +1870,18 @@ struct reclaim_timer {
             auto bytes_per_second = static_cast<float>(released) / std::chrono::duration_cast<std::chrono::duration<float>>(duration).count();
             timing_logger.debug("Reclamation cycle took {} us. Reclamation rate = {} MiB/s",
                                 std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(duration).count(),
-                                sprint("%.3f", bytes_per_second / (1024*1024)));
+                                format("{:.3f}", bytes_per_second / (1024*1024)));
         }
     }
 };
 
-reactor::idle_cpu_handler_result tracker::impl::compact_on_idle(reactor::work_waiting_on_reactor check_for_work) {
+idle_cpu_handler_result tracker::impl::compact_on_idle(work_waiting_on_reactor check_for_work) {
     if (!_reclaiming_enabled) {
-        return reactor::idle_cpu_handler_result::no_more_work;
+        return idle_cpu_handler_result::no_more_work;
     }
     reclaiming_lock rl(*this);
     if (_regions.empty()) {
-        return reactor::idle_cpu_handler_result::no_more_work;
+        return idle_cpu_handler_result::no_more_work;
     }
     segment_pool::reservation_goal open_emergency_pool(shard_segment_pool, 0);
 
@@ -1823,14 +1899,14 @@ reactor::idle_cpu_handler_result tracker::impl::compact_on_idle(reactor::work_wa
         region::impl* r = _regions.back();
 
         if (!r->is_idle_compactible()) {
-            return reactor::idle_cpu_handler_result::no_more_work;
+            return idle_cpu_handler_result::no_more_work;
         }
 
         r->compact();
 
         boost::range::push_heap(_regions, cmp);
     }
-    return reactor::idle_cpu_handler_result::interrupted_by_higher_priority_task;
+    return idle_cpu_handler_result::interrupted_by_higher_priority_task;
 }
 
 size_t tracker::impl::reclaim(size_t memory_to_release) {
@@ -1844,36 +1920,35 @@ size_t tracker::impl::reclaim(size_t memory_to_release) {
     reclaiming_lock rl(*this);
     reclaim_timer timing_guard;
 
-    size_t mem_released;
-    {
-        reclaiming_lock rl(*this);
-        constexpr auto max_bytes = std::numeric_limits<size_t>::max() - segment::size;
-        auto segments_to_release = align_up(std::min(max_bytes, memory_to_release), segment::size) >> segment::size_shift;
-        auto nr_released = shard_segment_pool.reclaim_segments(segments_to_release);
-        mem_released = nr_released * segment::size;
-        if (mem_released > memory_to_release) {
-            return memory_to_release;
-        }
+    constexpr auto max_bytes = std::numeric_limits<size_t>::max() - segment::size;
+    auto segments_to_release = align_up(std::min(max_bytes, memory_to_release), segment::size) >> segment::size_shift;
+    auto nr_released = shard_segment_pool.reclaim_segments(segments_to_release);
+    size_t mem_released = nr_released * segment::size;
+    if (mem_released >= memory_to_release) {
+        return memory_to_release;
     }
-    auto compacted = compact_and_evict_locked(memory_to_release - mem_released);
+
+    auto compacted = compact_and_evict_locked(shard_segment_pool.current_emergency_reserve_goal(), memory_to_release - mem_released);
 
     // compact_and_evict_locked() will not return segments to the standard allocator,
     // so do it here:
-    auto nr_released = shard_segment_pool.reclaim_segments(compacted / segment::size);
+    nr_released = shard_segment_pool.reclaim_segments(compacted / segment::size);
 
     return mem_released + nr_released * segment::size;
 }
 
-size_t tracker::impl::compact_and_evict(size_t memory_to_release) {
+size_t tracker::impl::compact_and_evict(size_t reserve_segments, size_t memory_to_release) {
     if (!_reclaiming_enabled) {
         return 0;
     }
     reclaiming_lock rl(*this);
     reclaim_timer timing_guard;
-    return compact_and_evict_locked(memory_to_release);
+    size_t released = compact_and_evict_locked(reserve_segments, memory_to_release);
+    timing_guard.stop(released);
+    return released;
 }
 
-size_t tracker::impl::compact_and_evict_locked(size_t memory_to_release) {
+size_t tracker::impl::compact_and_evict_locked(size_t reserve_segments, size_t memory_to_release) {
     //
     // Algorithm outline.
     //
@@ -1896,6 +1971,7 @@ size_t tracker::impl::compact_and_evict_locked(size_t memory_to_release) {
     size_t mem_released = 0;
 
     size_t mem_in_use = shard_segment_pool.total_memory_in_use();
+    memory_to_release += (reserve_segments - std::min(reserve_segments, shard_segment_pool.free_segments())) * segment::size;
     auto target_mem = mem_in_use - std::min(mem_in_use, memory_to_release - mem_released);
 
     llogger.debug("Compacting, requested {} bytes, {} bytes in use, target is {}",
@@ -1965,39 +2041,21 @@ size_t tracker::impl::compact_and_evict_locked(size_t memory_to_release) {
     return mem_released;
 }
 
-#ifndef SEASTAR_DEFAULT_ALLOCATOR
-
-bool segment_pool::migrate_segment(segment* src, segment* dst)
-{
-    auto& src_desc = descriptor(src);
-    auto& dst_desc = descriptor(dst);
-
-    llogger.debug("Migrating segment {} to {} (region @{})",
-        src, dst, src_desc._region);
-
-    {
-        if (!src_desc._region->reclaiming_enabled()) {
-            llogger.trace("Cannot move segment {}", src);
-            return false;
-        }
-        assert(!dst_desc._region);
-        dst_desc._free_space = src_desc._free_space;
-        src_desc._region->migrate_segment(src, src_desc, dst, dst_desc);
-        assert(_lsa_owned_segments_bitmap.test(idx_from_segment(src)));
-    }
-    _lsa_free_segments_bitmap.set(idx_from_segment(src));
-    _lsa_free_segments_bitmap.clear(idx_from_segment(dst));
-    dst_desc._region = src_desc._region;
-    src_desc._region = nullptr;
-    return true;
-}
-
-#endif
-
 void tracker::impl::register_region(region::impl* r) {
+    // If needed, increase capacity of regions before taking the reclaim lock,
+    // to avoid failing an allocation when push_back() tries to increase
+    // capacity.
+    //
+    // The capacity increase is atomic (wrt _regions) so it cannot be
+    // observed
+    if (_regions.size() == _regions.capacity()) {
+        auto copy = _regions;
+        copy.reserve(copy.capacity() * 2);
+        _regions = std::move(copy);
+    }
     reclaiming_lock _(*this);
     _regions.push_back(r);
-    llogger.debug("Registered region @{} with id={}", r, r->id());
+    llogger.debug("Registered region @{} with id={}", fmt::ptr(r), r->id());
 }
 
 void tracker::impl::unregister_region(region::impl* r) noexcept {
@@ -2034,9 +2092,6 @@ tracker::impl::impl() {
         sm::make_gauge("occupancy", [this] { return region_occupancy().used_fraction() * 100; },
                        sm::description("Holds a current portion (in percents) of the used memory.")),
 
-        sm::make_derive("segments_migrated", [this] { return shard_segment_pool.statistics().segments_migrated; },
-                        sm::description("Counts a number of migrated segments.")),
-
         sm::make_derive("segments_compacted", [this] { return shard_segment_pool.statistics().segments_compacted; },
                         sm::description("Counts a number of compacted segments.")),
 
@@ -2055,6 +2110,23 @@ tracker::impl::~impl() {
         }
         abort();
     }
+}
+
+bool segment_pool::compact_segment(segment* seg) {
+    auto& desc = descriptor(seg);
+    if (!desc._region->reclaiming_enabled()) {
+        return false;
+    }
+
+    // Called with emergency reserve, open one for
+    // region::alloc_small not to throw if it needs
+    // one more segment
+    reservation_goal open_emergency_pool(*this, 0);
+    allocation_lock no_alloc(*this);
+    tracker_reclaimer_lock no_reclaim;
+
+    desc._region->compact_segment(seg, desc);
+    return true;
 }
 
 region_group_reclaimer region_group::no_reclaimer;
@@ -2104,34 +2176,38 @@ region_group::execution_permitted() noexcept {
 }
 
 future<>
-region_group::start_releaser() {
-    return later().then([this] {
-        return repeat([this] () noexcept {
-            if (_shutdown_requested) {
-                return make_ready_future<stop_iteration>(stop_iteration::yes);
-            }
+region_group::start_releaser(scheduling_group deferred_work_sg) {
+    return with_scheduling_group(deferred_work_sg, [this] {
+        return later().then([this] {
+            return repeat([this] () noexcept {
+                if (_shutdown_requested) {
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+                }
 
-            if (!_blocked_requests.empty() && execution_permitted()) {
-                auto req = std::move(_blocked_requests.front());
-                _blocked_requests.pop_front();
-                req->allocate();
-                return make_ready_future<stop_iteration>(stop_iteration::no);
-            } else {
-                // Block reclaiming to prevent signal() from being called by reclaimer inside wait()
-                // FIXME: handle allocation failures (not very likely) like allocating_section does
-                tracker_reclaimer_lock rl;
-                return _relief.wait().then([] {
-                    return stop_iteration::no;
-                });
-            }
+                if (!_blocked_requests.empty() && execution_permitted()) {
+                    auto req = std::move(_blocked_requests.front());
+                    _blocked_requests.pop_front();
+                    req->allocate();
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                } else {
+                    // Block reclaiming to prevent signal() from being called by reclaimer inside wait()
+                    // FIXME: handle allocation failures (not very likely) like allocating_section does
+                    tracker_reclaimer_lock rl;
+                    return _relief.wait().then([] {
+                        return stop_iteration::no;
+                    });
+                }
+            });
         });
     });
 }
 
-region_group::region_group(region_group *parent, region_group_reclaimer& reclaimer)
+region_group::region_group(sstring name, region_group *parent,
+        region_group_reclaimer& reclaimer, scheduling_group deferred_work_sg)
     : _parent(parent)
     , _reclaimer(reclaimer)
-    , _releaser(reclaimer_can_block() ? start_releaser() : make_ready_future<>())
+    , _blocked_requests(on_request_expiry{std::move(name)})
+    , _releaser(reclaimer_can_block() ? start_releaser(deferred_work_sg) : make_ready_future<>())
 {
     if (_parent) {
         _parent->add(this);
@@ -2186,9 +2262,36 @@ allocating_section::guard::~guard() {
     shard_segment_pool.set_emergency_reserve_max(_prev);
 }
 
-#ifndef SEASTAR_DEFAULT_ALLOCATOR
+void allocating_section::maybe_decay_reserve() {
+    // The decay rate is inversely proportional to the reserve
+    // (every (s_segments_per_decay/_lsa_reserve) allocations).
+    //
+    // If the reserve is high, it is expensive since we may need to
+    // evict a lot of memory to satisfy the reserve. Hence, we are
+    // willing to risk a more frequent bad_alloc in order to decay it.
+    // The cost of a bad_alloc is also lower compared to maintaining
+    // the reserve.
+    //
+    // If the reserve is low, it is not expensive to maintain, so we
+    // decay it at a lower rate.
+
+    _remaining_lsa_segments_until_decay -= _lsa_reserve;
+    if (_remaining_lsa_segments_until_decay < 0) {
+        _remaining_lsa_segments_until_decay = s_segments_per_decay;
+        _lsa_reserve = std::max(s_min_lsa_reserve, _lsa_reserve / 2);
+        llogger.debug("Decaying LSA reserve in section {} to {} segments", static_cast<void*>(this), _lsa_reserve);
+    }
+
+    _remaining_std_bytes_until_decay -= _std_reserve;
+    if (_remaining_std_bytes_until_decay < 0) {
+        _remaining_std_bytes_until_decay = s_bytes_per_decay;
+        _std_reserve = std::max(s_min_std_reserve, _std_reserve / 2);
+        llogger.debug("Decaying standard allocator head-room in section {} to {} [B]", static_cast<void*>(this), _std_reserve);
+    }
+}
 
 void allocating_section::reserve() {
+  try {
     shard_segment_pool.set_emergency_reserve_max(std::max(_lsa_reserve, _minimum_lsa_emergency_reserve));
     shard_segment_pool.refill_emergency_reserve();
 
@@ -2203,30 +2306,26 @@ void allocating_section::reserve() {
     }
 
     shard_segment_pool.clear_allocation_failure_flag();
+  } catch (const std::bad_alloc&) {
+        if (shard_tracker().should_abort_on_bad_alloc()) {
+            llogger.error("Aborting due to allocation failure");
+            abort();
+        }
+        throw;
+  }
 }
 
 void allocating_section::on_alloc_failure(logalloc::region& r) {
     r.allocator().invalidate_references();
     if (shard_segment_pool.allocation_failure_flag()) {
-        _lsa_reserve *= 2; // FIXME: decay?
-        llogger.debug("LSA allocation failure, increasing reserve in section {} to {} segments", this, _lsa_reserve);
+        _lsa_reserve *= 2;
+        llogger.debug("LSA allocation failure, increasing reserve in section {} to {} segments", fmt::ptr(this), _lsa_reserve);
     } else {
-        _std_reserve *= 2; // FIXME: decay?
-        llogger.debug("Standard allocator failure, increasing head-room in section {} to {} [B]", this, _std_reserve);
+        _std_reserve *= 2;
+        llogger.debug("Standard allocator failure, increasing head-room in section {} to {} [B]", fmt::ptr(this), _std_reserve);
     }
     reserve();
 }
-
-#else
-
-void allocating_section::reserve() {
-}
-
-void allocating_section::on_alloc_failure(logalloc::region&) {
-    throw std::bad_alloc();
-}
-
-#endif
 
 void allocating_section::set_lsa_reserve(size_t reserve) {
     _lsa_reserve = reserve;
@@ -2237,11 +2336,13 @@ void allocating_section::set_std_reserve(size_t reserve) {
 }
 
 void region_group::on_request_expiry::operator()(std::unique_ptr<allocating_function>& func) noexcept {
-    func->fail(std::make_exception_ptr(timed_out_error()));
+    func->fail(std::make_exception_ptr(blocked_requests_timed_out_error{_name}));
 }
 
-void prime_segment_pool() {
-    shard_segment_pool.prime();
+future<> prime_segment_pool(size_t available_memory, size_t min_free_memory) {
+    return smp::invoke_on_all([=] {
+        shard_segment_pool.prime(available_memory, min_free_memory);
+    });
 }
 
 uint64_t memory_allocated() {
@@ -2250,6 +2351,10 @@ uint64_t memory_allocated() {
 
 uint64_t memory_compacted() {
     return shard_segment_pool.statistics().memory_compacted;
+}
+
+occupancy_stats lsa_global_occupancy_stats() {
+    return occupancy_stats(shard_segment_pool.total_free_memory(), shard_segment_pool.total_memory_in_use());
 }
 
 }

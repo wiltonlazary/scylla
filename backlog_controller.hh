@@ -23,7 +23,11 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/file.hh>
 #include <chrono>
+#include <cmath>
+
+#include "seastarx.hh"
 
 // Simple proportional controller to adjust shares for processes for which a backlog can be clearly
 // defined.
@@ -77,7 +81,7 @@ protected:
         , _io_priority(iop)
         , _interval(interval)
         , _update_timer([this] { adjust(); })
-        , _control_points({{0,0}})
+        , _control_points()
         , _current_backlog(std::move(backlog))
         , _inflight_update(make_ready_future<>())
     {
@@ -96,6 +100,12 @@ protected:
     }
 
     virtual ~backlog_controller() {}
+public:
+    backlog_controller(backlog_controller&&) = default;
+    float backlog_of_shares(float shares) const;
+    seastar::scheduling_group sg() {
+        return _scheduling_group;
+    }
 };
 
 // memtable flush CPU controller.
@@ -119,7 +129,7 @@ public:
     flush_controller(seastar::scheduling_group sg, const ::io_priority_class& iop, float static_shares) : backlog_controller(sg, iop, static_shares) {}
     flush_controller(seastar::scheduling_group sg, const ::io_priority_class& iop, std::chrono::milliseconds interval, float soft_limit, std::function<float()> current_dirty)
         : backlog_controller(sg, iop, std::move(interval),
-          std::vector<backlog_controller::control_point>({{soft_limit, 10}, {soft_limit + (hard_dirty_limit - soft_limit) / 2, 200} , {hard_dirty_limit, 1000}}),
+          std::vector<backlog_controller::control_point>({{0.0, 0.0}, {soft_limit, 10}, {soft_limit + (hard_dirty_limit - soft_limit) / 2, 200} , {hard_dirty_limit, 1000}}),
           std::move(current_dirty)
         )
     {}
@@ -127,11 +137,13 @@ public:
 
 class compaction_controller : public backlog_controller {
 public:
-    static constexpr unsigned normalization_factor = 10;
+    static constexpr unsigned normalization_factor = 30;
+    static constexpr float disable_backlog = std::numeric_limits<double>::infinity();
+    static constexpr float backlog_disabled(float backlog) { return std::isinf(backlog); }
     compaction_controller(seastar::scheduling_group sg, const ::io_priority_class& iop, float static_shares) : backlog_controller(sg, iop, static_shares) {}
     compaction_controller(seastar::scheduling_group sg, const ::io_priority_class& iop, std::chrono::milliseconds interval, std::function<float()> current_backlog)
         : backlog_controller(sg, iop, std::move(interval),
-          std::vector<backlog_controller::control_point>({{0.5, 10}, {1.5, 100} , {normalization_factor, 1000}}),
+          std::vector<backlog_controller::control_point>({{0.0, 50}, {1.5, 100} , {normalization_factor, 1000}}),
           std::move(current_backlog)
         )
     {}

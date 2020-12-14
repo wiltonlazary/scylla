@@ -41,7 +41,7 @@
 
 #pragma once
 
-#include <experimental/optional>
+#include <optional>
 #include "variable_specifications.hh"
 #include "cql3/assignment_testable.hh"
 #include "cql3/query_options.hh"
@@ -72,7 +72,7 @@ public:
      * @param boundNames the variables specification where to collect the
      * bind variables of this term in.
      */
-    virtual void collect_marker_specification(::shared_ptr<variable_specifications> bound_names) = 0;
+    virtual void collect_marker_specification(variable_specifications& bound_names) const = 0;
 
     /**
      * Bind the values in this term to the values contained in {@code values}.
@@ -101,10 +101,8 @@ public:
      */
     virtual bool contains_bind_marker() const = 0;
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const = 0;
-
     virtual sstring to_string() const {
-        return sprint("term@%p", static_cast<const void*>(this));
+        return format("term@{:p}", static_cast<const void*>(this));
     }
 
     friend std::ostream& operator<<(std::ostream& out, const term& t) {
@@ -132,7 +130,7 @@ public:
          * case this RawTerm describe a list index or a map key, etc...
          * @return the prepared term.
          */
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) = 0;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const = 0;
 
         virtual sstring to_string() const = 0;
 
@@ -141,14 +139,13 @@ public:
         }
 
         friend std::ostream& operator<<(std::ostream& os, const raw& r) {
-            // FIXME: kill const_cast
-            return os << const_cast<raw&>(r).to_string();
+            return os << r.to_string();
         }
     };
 
     class multi_column_raw : public virtual raw {
     public:
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, const std::vector<shared_ptr<column_specification>>& receiver) = 0;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, const std::vector<lw_shared_ptr<column_specification>>& receiver) const = 0;
     };
 };
 
@@ -168,15 +165,11 @@ public:
  */
 class terminal : public term {
 public:
-    virtual void collect_marker_specification(::shared_ptr<variable_specifications> bound_names) {
+    virtual void collect_marker_specification(variable_specifications& bound_names) const {
     }
 
     virtual ::shared_ptr<terminal> bind(const query_options& options) override {
         return static_pointer_cast<terminal>(this->shared_from_this());
-    }
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override {
-        return false;
     }
 
     // While some NonTerminal may not have bind markers, no Term can be Terminal
@@ -191,7 +184,7 @@ public:
     virtual cql3::raw_value get(const query_options& options) = 0;
 
     virtual cql3::raw_value_view bind_and_get(const query_options& options) override {
-        return options.make_temporary(get(options));
+        return raw_value_view::make_temporary(get(options));
     }
 
     virtual sstring to_string() const = 0;
@@ -199,7 +192,7 @@ public:
 
 class multi_item_terminal : public terminal {
 public:
-    virtual std::vector<bytes_opt> get_elements() = 0;
+    virtual const std::vector<bytes_opt>& get_elements() const = 0;
 };
 
 class collection_terminal {
@@ -221,14 +214,10 @@ public:
  */
 class non_terminal : public term {
 public:
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override {
-        return false;
-    }
-
     virtual cql3::raw_value_view bind_and_get(const query_options& options) override {
         auto t = bind(options);
         if (t) {
-            return options.make_temporary(t->get(options));
+            return cql3::raw_value_view::make_temporary(t->get(options));
         }
         return cql3::raw_value_view::make_null();
     };

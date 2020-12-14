@@ -43,6 +43,7 @@
 #include "prepared_statement.hh"
 #include "service/migration_manager.hh"
 #include "db/system_keyspace.hh"
+#include "database.hh"
 
 bool is_system_keyspace(const sstring& keyspace);
 
@@ -55,13 +56,13 @@ const sstring& cql3::statements::alter_keyspace_statement::keyspace() const {
     return _name;
 }
 
-future<> cql3::statements::alter_keyspace_statement::check_access(const service::client_state& state) {
+future<> cql3::statements::alter_keyspace_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
     return state.has_keyspace_access(_name, auth::permission::ALTER);
 }
 
-void cql3::statements::alter_keyspace_statement::validate(service::storage_proxy& proxy, const service::client_state& state) {
+void cql3::statements::alter_keyspace_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const {
     try {
-        service::get_local_storage_proxy().get_db().local().find_keyspace(_name); // throws on failure
+        proxy.get_db().local().find_keyspace(_name); // throws on failure
         auto tmp = _name;
         std::transform(tmp.begin(), tmp.end(), tmp.begin(), ::tolower);
         if (is_system_keyspace(tmp)) {
@@ -90,12 +91,14 @@ void cql3::statements::alter_keyspace_statement::validate(service::storage_proxy
     }
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> cql3::statements::alter_keyspace_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) {
-    auto old_ksm = service::get_local_storage_proxy().get_db().local().find_keyspace(_name).metadata();
-    return service::get_local_migration_manager().announce_keyspace_update(_attrs->as_ks_metadata_update(old_ksm), is_local_only).then([this] {
+future<shared_ptr<cql_transport::event::schema_change>> cql3::statements::alter_keyspace_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const {
+    auto old_ksm = proxy.get_db().local().find_keyspace(_name).metadata();
+    const auto& tm = *proxy.get_token_metadata_ptr();
+    return service::get_local_migration_manager().announce_keyspace_update(_attrs->as_ks_metadata_update(old_ksm, tm), is_local_only).then([this] {
         using namespace cql_transport;
-        return make_shared<event::schema_change>(
+        return ::make_shared<event::schema_change>(
                 event::schema_change::change_type::UPDATED,
+                event::schema_change::target_type::KEYSPACE,
                 keyspace());
     });
 }

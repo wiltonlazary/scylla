@@ -33,35 +33,34 @@
 #include "idl/query.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
-#include "idl/query.dist.impl.hh"
-#include "idl/keys.dist.impl.hh"
 #include "idl/uuid.dist.impl.hh"
+#include "idl/keys.dist.impl.hh"
+#include "idl/query.dist.impl.hh"
 
 namespace query {
 
+using result_bytes_view = ser::buffer_view<bytes_ostream::fragment_iterator>;
+
 class result_atomic_cell_view {
-    api::timestamp_type _timestamp;
-    expiry_opt _expiry;
-    ttl_opt _ttl;
-    bytes_view _value;
+    ser::qr_cell_view _view;
 public:
-    result_atomic_cell_view(api::timestamp_type timestamp, expiry_opt expiry, ttl_opt ttl, bytes_view value)
-        : _timestamp(timestamp), _expiry(expiry), _ttl(ttl), _value(value) { }
+    result_atomic_cell_view(ser::qr_cell_view view)
+        : _view(view) { }
 
     api::timestamp_type timestamp() const {
-        return _timestamp;
+        return _view.timestamp().value_or(api::missing_timestamp);
     }
 
     expiry_opt expiry() const {
-        return _expiry;
+        return _view.expiry();
     }
 
     ttl_opt ttl() const {
-        return _ttl;
+        return _view.ttl();
     }
 
-    bytes_view value() const {
-        return _value;
+    result_bytes_view value() const {
+        return _view.value().view();
     }
 };
 
@@ -73,35 +72,28 @@ public:
     result_row_view(ser::qr_row_view v) : _v(v) {}
 
     class iterator_type {
-        using cells_vec = std::vector<std::experimental::optional<ser::qr_cell_view>>;
+        using cells_vec = std::vector<std::optional<ser::qr_cell_view>>;
         cells_vec _cells;
         cells_vec::iterator _i;
-        bytes _tmp_value;
     public:
         iterator_type(ser::qr_row_view v)
             : _cells(v.cells())
             , _i(_cells.begin())
         { }
-        std::experimental::optional<result_atomic_cell_view> next_atomic_cell() {
+        std::optional<result_atomic_cell_view> next_atomic_cell() {
             auto cell_opt = *_i++;
             if (!cell_opt) {
                 return {};
             }
-            ser::qr_cell_view v = *cell_opt;
-            api::timestamp_type timestamp = v.timestamp().value_or(api::missing_timestamp);
-            expiry_opt expiry = v.expiry();
-            ttl_opt ttl = v.ttl();
-            _tmp_value = v.value();
-            return {result_atomic_cell_view(timestamp, expiry, ttl, _tmp_value)};
+            return {result_atomic_cell_view(*cell_opt)};
         }
-        std::experimental::optional<bytes_view> next_collection_cell() {
+        std::optional<result_bytes_view> next_collection_cell() {
             auto cell_opt = *_i++;
             if (!cell_opt) {
                 return {};
             }
             ser::qr_cell_view v = *cell_opt;
-            _tmp_value = v.value();
-            return {bytes_view(_tmp_value)};
+            return {v.value().view()};
         };
         void skip(const column_definition& def) {
             ++_i;
@@ -130,9 +122,9 @@ public:
 struct result_visitor {
     void accept_new_partition(
         const partition_key& key, // FIXME: use view for the key
-        uint32_t row_count) {}
+        uint64_t row_count) {}
 
-    void accept_new_partition(uint32_t row_count) {}
+    void accept_new_partition(uint64_t row_count) {}
 
     void accept_new_row(
         const clustering_key& key, // FIXME: use view for the key
@@ -144,12 +136,25 @@ struct result_visitor {
     void accept_partition_end(const result_row_view& static_row) {}
 };
 
+template<typename Visitor>
+concept ResultVisitor = requires(Visitor visitor, const partition_key& pkey,
+                                      uint64_t row_count, const clustering_key& ckey,
+                                      const result_row_view& static_row, const result_row_view& row)
+{
+    visitor.accept_new_partition(pkey, row_count);
+    visitor.accept_new_partition(row_count);
+    visitor.accept_new_row(ckey, static_row, row);
+    visitor.accept_new_row(static_row, row);
+    visitor.accept_partition_end(static_row);
+};
+
 class result_view {
     ser::query_result_view _v;
     friend class result_merger;
 public:
     result_view(const bytes_ostream& v) : _v(ser::query_result_view{ser::as_input_stream(v)}) {}
     result_view(ser::query_result_view v) : _v(v) {}
+    explicit result_view(const query::result& res) : result_view(res.buf()) { }
 
     template <typename Func>
     static auto do_with(const query::result& res, Func&& func) {
@@ -159,13 +164,12 @@ public:
 
     template <typename ResultVisitor>
     static void consume(const query::result& res, const partition_slice& slice, ResultVisitor&& visitor) {
-        do_with(res, [&] (result_view v) {
-            v.consume(slice, visitor);
-        });
+        result_view(res).consume(slice, visitor);
     }
 
-    template <typename ResultVisitor>
-    void consume(const partition_slice& slice, ResultVisitor&& visitor) {
+    template <typename Visitor>
+    requires ResultVisitor<Visitor>
+    void consume(const partition_slice& slice, Visitor&& visitor) const {
         for (auto&& p : _v.partitions()) {
             auto rows = p.rows();
             auto row_count = rows.size();
@@ -191,12 +195,21 @@ public:
         }
     }
 
-    std::tuple<uint32_t, uint32_t> count_partitions_and_rows() {
+    std::tuple<uint32_t, uint64_t> count_partitions_and_rows() const {
         auto&& ps = _v.partitions();
         auto rows = boost::accumulate(ps | boost::adaptors::transformed([] (auto& p) {
             return std::max(p.rows().size(), size_t(1));
-        }), uint32_t(0));
+        }), uint64_t(0));
         return std::make_tuple(ps.size(), rows);
+    }
+
+    std::tuple<partition_key, std::optional<clustering_key>>
+    get_last_partition_and_clustering_key() const {
+        auto ps = _v.partitions();
+        assert(!ps.empty());
+        auto& p = ps.back();
+        auto rs = p.rows();
+        return { p.key().value(), !rs.empty() ? rs.back().key() : std::optional<clustering_key>() };
     }
 };
 

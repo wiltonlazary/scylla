@@ -56,8 +56,7 @@ public:
     function_call(shared_ptr<scalar_function> fun, std::vector<shared_ptr<term>> terms)
             : _fun(std::move(fun)), _terms(std::move(terms)) {
     }
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
-    virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names) override;
+    virtual void collect_marker_specification(variable_specifications& bound_names) const override;
     virtual shared_ptr<terminal> bind(const query_options& options) override;
     virtual cql3::raw_value_view bind_and_get(const query_options& options) override;
 private:
@@ -74,12 +73,12 @@ public:
         raw(function_name name, std::vector<shared_ptr<term::raw>> terms)
             : _name(std::move(name)), _terms(std::move(terms)) {
         }
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) override;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
         // All parameters must be terminal
         static bytes_opt execute(scalar_function& fun, std::vector<shared_ptr<term>> parameters);
     public:
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) override;
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override;
         virtual sstring to_string() const override;
     };
 };

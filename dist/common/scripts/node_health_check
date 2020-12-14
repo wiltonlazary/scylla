@@ -17,9 +17,11 @@
 # You should have received a copy of the GNU General Public License
 # along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
 
+# When a CLI tool is not installed, use relocatable CLI tool provided by Scylla
+export PATH=$PATH:/opt/scylladb/bin
 
 ##Variables##
-REPORT="./`hostname -i`-health-check-report.txt"
+REPORT="./`hostname`-health-check-report.txt"
 OUTPUT_PATH="./output_files"
 OUTPUT_PATH1="$OUTPUT_PATH/system_checks"
 OUTPUT_PATH2="$OUTPUT_PATH/scylladb_checks"
@@ -28,6 +30,7 @@ OUTPUT_PATH4="$OUTPUT_PATH/data_model"
 OUTPUT_PATH5="$OUTPUT_PATH/network_checks"
 IS_FEDORA="0"
 IS_DEBIAN="0"
+IS_GENTOO="0"
 JMX_PORT="7199"
 CQL_PORT="9042"
 PRINT_DM=NO
@@ -35,6 +38,7 @@ PRINT_NET=NO
 PRINT_cfstats=NO
 SCYLLA_SERVICE="0"
 JMX_SERVICE="0"
+LISTEN_ADDR=$(grep -e '^listen_address' /etc/scylla/scylla.yaml|awk -F':' '{ print $NF }')
 
 while getopts ":hdncap:q:" opt; do
     case $opt in
@@ -74,8 +78,17 @@ while getopts ":hdncap:q:" opt; do
     esac
 done
 
+# Get the CQL_ADDR from whatever is currently listening on $CQL_PORT. If it's a wildcard, 
+# use the listen_address from scylla.yaml
+CQL_ADDR=`ss -l |grep ${CQL_PORT}|awk -F"${CQL_PORT}" '{print $1}'|awk '{print $NF}'`
 
-##Check server release (Fedora/Oracle/Debian)##
+if [ "$CQL_ADDR" == '*:' -o "$CQL_ADDR" == '0.0.0.0:' ]; then
+    CQL_ADDR=`grep -e '^listen_address:' /etc/scylla/scylla.yaml|awk '{print $NF}'`
+else
+    CQL_ADDR=${CQL_ADDR/%:/}
+fi
+
+##Check server release (Fedora/Oracle/Debian/Gentoo)##
 cat /etc/os-release | grep -i fedora &> /dev/null
 if [ $? -ne 0 ]; then
     cat /etc/os-release | grep -i oracle &> /dev/null
@@ -89,7 +102,12 @@ if [ $? -ne 0 ]; then
     IS_DEBIAN="1"
 fi
 
-if [ "$IS_FEDORA" == "1" ] && [ "$IS_DEBIAN" == "1" ]; then
+cat /etc/os-release | grep -i gentoo &> /dev/null
+if [ $? -ne 0 ]; then
+    IS_GENTOO="1"
+fi
+
+if [ "$IS_FEDORA" == "1" ] && [ "$IS_DEBIAN" == "1" ] && [ "$IS_GENTOO" == "1" ]; then
     echo "This s a Non-Supported OS, Please Review the Support Matrix"
     exit 222
 fi
@@ -108,7 +126,7 @@ if [ $? -ne 0 ]; then
 else
     echo "Scylla-server Service: OK"
     echo "--------------------------------------------------"
-fi 
+fi
 
 
 ##Scylla-JMX service status##
@@ -125,22 +143,7 @@ if [ $? -ne 0 ]; then
 else
     echo "Scylla-JMX Service (nodetool): OK"
     echo "--------------------------------------------------"
-fi 
-
-
-#Install 'net-tools' pkg, to be used for netstat command#
-echo "Installing 'net-tools' Package (for 'netstat' command)"
-echo "--------------------------------------------------"
-
-if [ "$IS_FEDORA" == "0" ]; then
-    sudo yum install net-tools -y -q
 fi
-
-if [ "$IS_DEBIAN" == "0" ]; then
-#    sudo apt-get update -qq
-    sudo apt-get install net-tools -y | grep already
-fi
-
 
 #Create dir structure to save output_files#
 echo "--------------------------------------------------"
@@ -170,6 +173,7 @@ echo "--------------------------------------------------"
 
 scylla --version > $OUTPUT_PATH2/scylla-version.txt
 cp -p /etc/scylla/* $OUTPUT_PATH2
+cp -p /etc/scylla.d/* $OUTPUT_PATH2
 ls -ltrh /var/lib/scylla/coredump/ > $OUTPUT_PATH2/coredump-folder.txt
 
 if [ "$IS_FEDORA" == "0" ]; then
@@ -179,6 +183,12 @@ fi
 
 if [ "$IS_DEBIAN" == "0" ]; then
     dpkg -l | grep -i scylla > $OUTPUT_PATH2/scylla-pkgs.txt
+    cp -p /etc/default/scylla-server $OUTPUT_PATH2
+fi
+
+if [ "$IS_GENTOO" == "0" ]; then
+    sudo emerge -1uq app-portage/portage-utils
+    sudo qlist -ICv scylla > $OUTPUT_PATH2/scylla-pkgs.txt
     cp -p /etc/default/scylla-server $OUTPUT_PATH2
 fi
 
@@ -192,7 +202,11 @@ journalctl --help &> /dev/null
 if [ $? -eq 0 ]; then
     journalctl -t scylla > $OUTPUT_PATH/scylla-logs.txt
 else
-    cat /var/log/syslog | grep -i scylla > $OUTPUT_PATH/scylla-logs.txt
+    if [ "$IS_GENTOO" == "0" ]; then
+        cat /var/log/scylla/scylla.log > $OUTPUT_PATH/scylla-logs.txt
+    else
+        cat /var/log/syslog | grep -i scylla > $OUTPUT_PATH/scylla-logs.txt
+    fi
 fi
 
 gzip -f $OUTPUT_PATH/scylla-logs.txt
@@ -224,12 +238,13 @@ if [ "$SCYLLA_SERVICE" == "1" ]; then
     echo "Skipping Data Model Info Collection"
     echo "--------------------------------------------------"
 else
-    cqlsh `hostname -i` $CQL_PORT -e "HELP" &> /dev/null
+    # TODO: handle connecting with authentication
+    cqlsh $CQL_ADDR $CQL_PORT -e "HELP" &> /dev/null
     if [ $? -eq 0 ]; then
         echo "Collecting Data Model Info (using port $CQL_PORT)"
         echo "--------------------------------------------------"
-        cqlsh `hostname -i` $CQL_PORT -e "DESCRIBE SCHEMA" > $OUTPUT_PATH4/describe-schema.txt
-        cqlsh `hostname -i` $CQL_PORT -e "DESCRIBE TABLES" > $OUTPUT_PATH4/describe-tables.txt
+        cqlsh $CQL_ADDR $CQL_PORT -e "DESCRIBE SCHEMA" > $OUTPUT_PATH4/describe-schema.txt
+        cqlsh $CQL_ADDR $CQL_PORT -e "DESCRIBE TABLES" > $OUTPUT_PATH4/describe-tables.txt
     else
         echo "ERROR: CQL is NOT Listening on Port $CQL_PORT"
         echo "Cannot Collect Data Model Info"
@@ -251,7 +266,11 @@ for i in `ls -I lo /sys/class/net/`; do echo "--$i"; cat /sys/class/net/$i/queue
 for i in `ls -I lo /sys/class/net/`; do echo "--$i"; cat /sys/class/net/$i/queues/rx-*/rps_flow_cnt; echo ""; done > $OUTPUT_PATH5/rfs-conf.txt
 ps -elf | grep irqbalance > $OUTPUT_PATH5/irqbalance-conf.txt
 sudo sysctl -a > $OUTPUT_PATH5/sysctl.txt 2>&1
-sudo iptables -L -v > $OUTPUT_PATH5/iptables.txt
+if [ -e /usr/sbin/iptables ]; then
+    sudo iptables -L -v > $OUTPUT_PATH5/iptables.txt
+else
+    touch $OUTPUT_PATH5/iptables.txt
+fi
 netstat -an | grep tcp > $OUTPUT_PATH5/netstat-tcp.txt
 
 
@@ -271,7 +290,7 @@ echo "" > $REPORT
 date "+DATE: %m/%d/%y" >> $REPORT
 echo "" >> $REPORT
 echo "" >> $REPORT
-echo "              Health Check Report for node: `hostname -i`" >> $REPORT
+echo "              Health Check Report for node: `hostname`" >> $REPORT
 echo "" >> $REPORT
 echo "" >> $REPORT
 
@@ -293,6 +312,7 @@ echo "" >> $REPORT
 echo "Host Operating System" >> $REPORT
 echo "---------------------" >> $REPORT
 cat $OUTPUT_PATH1/os-release >> $REPORT
+if [ -f /etc/redhat-release ]; then cat /etc/redhat-release >> $REPORT; fi
 echo "" >> $REPORT
 echo "" >> $REPORT
 
@@ -357,7 +377,7 @@ if [ "$IS_FEDORA" == "0" ]; then
     echo "## /etc/sysconfig/scylla-server ##" >> $REPORT
 fi
 
-if [ "$IS_DEBIAN" == "0" ]; then
+if [ "$IS_DEBIAN" == "0" ] || [ "$IS_GENTOO" == "0" ]; then
     echo "## /etc/default/scylla-server ##" >> $REPORT
 fi
 
@@ -397,7 +417,7 @@ if [ $PRINT_DM == "YES" ]; then
     echo "===============" >> $REPORT
     echo "" >> $REPORT
 
-    cqlsh `hostname -i` $CQL_PORT -e "HELP" &> /dev/null
+    cqlsh $CQL_ADDR $CQL_PORT -e "HELP" &> /dev/null
     if [ $? -eq 0 ]; then
         echo "Printing Data Model Info to Report"
         echo "--------------------------------------------------"

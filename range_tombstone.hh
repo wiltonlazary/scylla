@@ -23,12 +23,11 @@
 
 #include <boost/intrusive/set.hpp>
 #include <boost/range/algorithm.hpp>
-#include <experimental/optional>
+#include <optional>
 #include "hashing.hh"
 #include "keys.hh"
 #include "tombstone.hh"
 #include "clustering_bounds_comparator.hh"
-#include "stdx.hh"
 #include "position_in_partition.hh"
 
 namespace bi = boost::intrusive;
@@ -52,8 +51,13 @@ public:
             , tomb(std::move(tomb))
     { }
     range_tombstone(bound_view start, bound_view end, tombstone tomb)
-            : range_tombstone(start.prefix, start.kind, end.prefix, end.kind, std::move(tomb))
+            : range_tombstone(start.prefix(), start.kind(), end.prefix(), end.kind(), std::move(tomb))
     { }
+
+    // Can be called only when both start and end are !is_static_row && !is_clustering_row().
+    range_tombstone(position_in_partition_view start, position_in_partition_view end, tombstone tomb)
+            : range_tombstone(start.as_start_bound_view(), end.as_end_bound_view(), tomb)
+    {}
     range_tombstone(clustering_key_prefix&& start, clustering_key_prefix&& end, tombstone tomb)
             : range_tombstone(std::move(start), bound_kind::incl_start, std::move(end), bound_kind::incl_end, std::move(tomb))
     { }
@@ -134,7 +138,7 @@ public:
     // The start bounds of this and src are required to be equal. The start bound
     // of this is not changed. The start bound of the remainder (if there is any)
     // is larger than the end bound of this.
-    stdx::optional<range_tombstone> apply(const schema& s, range_tombstone&& src);
+    std::optional<range_tombstone> apply(const schema& s, range_tombstone&& src);
 
     // Intersects the range of this tombstone with [pos, +inf) and replaces
     // the range of the tombstone if there is an overlap.
@@ -150,19 +154,24 @@ public:
             return false;
         }
         if (less(position(), pos)) {
-            bound_view new_start = pos.as_start_bound_view();
-            start = new_start.prefix;
-            start_kind = new_start.kind;
+            set_start(pos);
         }
         return true;
     }
 
-    size_t external_memory_usage() const {
+    // Assumes !pos.is_clustering_row(), because range_tombstone bounds can't represent such positions
+    void set_start(position_in_partition_view pos) {
+        bound_view new_start = pos.as_start_bound_view();
+        start = new_start.prefix();
+        start_kind = new_start.kind();
+    }
+
+    size_t external_memory_usage(const schema&) const {
         return start.external_memory_usage() + end.external_memory_usage();
     }
 
-    size_t memory_usage() const {
-        return sizeof(range_tombstone) + external_memory_usage();
+    size_t memory_usage(const schema& s) const {
+        return sizeof(range_tombstone) + external_memory_usage(s);
     }
 private:
     void move_assign(range_tombstone&& rt) {
@@ -253,6 +262,10 @@ public:
     const std::deque<range_tombstone>& range_tombstones_for_row(const clustering_key_prefix& ck) {
         drop_unneeded_tombstones(ck);
         return _range_tombstones;
+    }
+
+    std::deque<range_tombstone> range_tombstones() && {
+        return std::move(_range_tombstones);
     }
 
     void apply(range_tombstone rt);

@@ -67,7 +67,7 @@ namespace bloom_calculations {
         bloom_specification(int k, int buckets_per_element) : K(k), buckets_per_element(buckets_per_element) { }
 
         operator sstring() {
-            return sprint("bloom_specification(K=%d, buckets_per_element=%d)", K, buckets_per_element);
+            return format("bloom_specification(K={:d}, buckets_per_element={:d})", K, buckets_per_element);
         }
     };
 
@@ -117,7 +117,7 @@ namespace bloom_calculations {
         }
 
         if (max_false_pos_prob < probs[max_buckets_per_element][max_k]) {
-            throw exceptions::unsupported_operation_exception(sprint("Unable to satisfy %f with %d buckets per element", max_false_pos_prob, max_buckets_per_element));
+            throw exceptions::unsupported_operation_exception(format("Unable to satisfy {:f} with {:d} buckets per element", max_false_pos_prob, max_buckets_per_element));
         }
 
         // First find the minimal required number of buckets:
@@ -145,11 +145,11 @@ namespace bloom_calculations {
     inline int max_buckets_per_element(long num_elements) {
         num_elements = std::max(1l, num_elements);
 
-        double v = std::numeric_limits<long>::max() - EXCESS;
+        auto v = std::numeric_limits<long>::max() - EXCESS;
         v = v / num_elements;
 
-        if (v < 1.0) {
-            throw exceptions::unsupported_operation_exception(sprint("Cannot compute probabilities for %ld elements.", num_elements));
+        if (v < 1) {
+            throw exceptions::unsupported_operation_exception(format("Cannot compute probabilities for {:d} elements.", num_elements));
         }
         return std::min(probs.size() - 1, size_t(v));
     }

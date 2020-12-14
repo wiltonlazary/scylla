@@ -46,7 +46,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/net/api.hh>
 
-#include <experimental/optional>
+#include <optional>
 #include <stdexcept>
 
 namespace cql_transport {
@@ -69,15 +69,13 @@ public:
     enum class change_type { NEW_NODE, REMOVED_NODE, MOVED_NODE };
 
     const change_type change;
-    const ipv4_addr node;
+    const socket_address node;
 
-    topology_change(change_type change, const ipv4_addr& node);
+    topology_change(change_type change, const socket_address& node);
 
     static topology_change new_node(const gms::inet_address& host, uint16_t port);
 
     static topology_change removed_node(const gms::inet_address& host, uint16_t port);
-
-    static topology_change moved_node(const gms::inet_address& host, uint16_t port);
 };
 
 class event::status_change : public event {
@@ -85,9 +83,9 @@ public:
     enum class status_type { UP, DOWN };
 
     const status_type status;
-    const ipv4_addr node;
+    const socket_address node;
 
-    status_change(status_type status, const ipv4_addr& node);
+    status_change(status_type status, const socket_address& node);
 
     static status_change node_up(const gms::inet_address& host, uint16_t port);
 
@@ -97,16 +95,22 @@ public:
 class event::schema_change : public event {
 public:
     enum class change_type { CREATED, UPDATED, DROPPED };
-    enum class target_type { KEYSPACE, TABLE, TYPE };
+    enum class target_type { KEYSPACE, TABLE, TYPE, FUNCTION, AGGREGATE };
 
     const change_type change;
     const target_type target;
+
+    // Every target is followed by at least a keyspace.
     const sstring keyspace;
-    const std::experimental::optional<sstring> table_or_type_or_function;
 
-    schema_change(const change_type change_, const target_type target_, const sstring& keyspace_, const std::experimental::optional<sstring>& table_or_type_or_function_);
+    // Target types other than keyspace have a list of arguments.
+    const std::vector<sstring> arguments;
 
-    schema_change(const change_type change_, const sstring keyspace_);
+    schema_change(change_type change, target_type target, sstring keyspace, std::vector<sstring> arguments);
+
+    template <typename... Ts>
+    schema_change(change_type change, target_type target, sstring keyspace, Ts... arguments)
+        : schema_change(change, target, keyspace, std::vector<sstring>{std::move(arguments)...}) {}
 };
 
 }

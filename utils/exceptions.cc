@@ -18,8 +18,15 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <seastar/core/print.hh>
+#include <seastar/rpc/rpc.hh>
+#include <seastar/util/log.hh>
+#include <seastar/util/backtrace.hh>
+#include <seastar/core/abort_on_ebadf.hh>
+
 #include <exception>
 #include <system_error>
+#include <atomic>
 #include "exceptions.hh"
 
 #include <iostream>
@@ -62,4 +69,16 @@ bool should_stop_on_system_error(const std::system_error& e) {
         }
     }
     return true;
+}
+
+bool is_timeout_exception(std::exception_ptr e) {
+    try {
+        std::rethrow_exception(e);
+    } catch (seastar::rpc::timeout_error& unused) {
+        return true;
+    } catch (seastar::semaphore_timed_out& unused) {
+        return true;
+    } catch (...) {
+    }
+    return false;
 }

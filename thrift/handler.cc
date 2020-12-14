@@ -25,10 +25,10 @@
 #include <sys/param.h>
 // end thrift workaround
 #include "Cassandra.h"
-#include "core/distributed.hh"
+#include <seastar/core/distributed.hh>
 #include "database.hh"
-#include "core/sstring.hh"
-#include "core/print.hh"
+#include <seastar/core/sstring.hh>
+#include <seastar/core/print.hh>
 #include "frozen_mutation.hh"
 #include "utils/UUID_gen.hh"
 #include <thrift/protocol/TBinaryProtocol.h>
@@ -53,6 +53,13 @@
 #include <boost/range/adaptor/indirected.hpp>
 #include "query-result-reader.hh"
 #include "thrift/server.hh"
+#include "db/config.hh"
+
+#ifdef THRIFT_USES_BOOST
+namespace thrift_fn = tcxx;
+#else
+namespace thrift_fn = std;
+#endif
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
@@ -68,7 +75,7 @@ public:
     virtual const char* what() const throw () override { return "sorry, not implemented"; }
 };
 
-void pass_unimplemented(const tcxx::function<void(::apache::thrift::TDelayedException* _throw)>& exn_cob) {
+void pass_unimplemented(const thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)>& exn_cob) {
     exn_cob(::apache::thrift::TDelayedException::delayException(unimplemented_exception()));
 }
 
@@ -118,11 +125,11 @@ public:
 
 template <typename Func, typename T>
 void
-with_cob(tcxx::function<void (const T& ret)>&& cob,
-        tcxx::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob,
+with_cob(thrift_fn::function<void (const T& ret)>&& cob,
+        thrift_fn::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob,
         Func&& func) {
     // then_wrapped() terminates the fiber by calling one of the cob objects
-    futurize<noexcept_movable_t<T>>::apply([func = std::forward<Func>(func)] {
+    (void)futurize_invoke([func = std::forward<Func>(func)] {
         return noexcept_movable<T>::wrap(func());
     }).then_wrapped([cob = std::move(cob), exn_cob = std::move(exn_cob)] (auto&& f) {
         try {
@@ -136,11 +143,11 @@ with_cob(tcxx::function<void (const T& ret)>&& cob,
 
 template <typename Func>
 void
-with_cob(tcxx::function<void ()>&& cob,
-        tcxx::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob,
+with_cob(thrift_fn::function<void ()>&& cob,
+        thrift_fn::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob,
         Func&& func) {
     // then_wrapped() terminates the fiber by calling one of the cob objects
-    futurize<void>::apply(func).then_wrapped([cob = std::move(cob), exn_cob = std::move(exn_cob)] (future<> f) {
+    (void)futurize_invoke(func).then_wrapped([cob = std::move(cob), exn_cob = std::move(exn_cob)] (future<> f) {
         try {
             f.get();
             cob();
@@ -153,9 +160,9 @@ with_cob(tcxx::function<void ()>&& cob,
 
 template <typename Func>
 void
-with_exn_cob(tcxx::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob, Func&& func) {
+with_exn_cob(thrift_fn::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob, Func&& func) {
     // then_wrapped() terminates the fiber by calling one of the cob objects
-    futurize<void>::apply(func).then_wrapped([exn_cob = std::move(exn_cob)] (future<> f) {
+    (void)futurize_invoke(func).then_wrapped([exn_cob = std::move(exn_cob)] (future<> f) {
         try {
             f.get();
         } catch (...) {
@@ -169,15 +176,24 @@ std::string bytes_to_string(bytes_view v) {
     return { reinterpret_cast<const char*>(v.begin()), v.size() };
 }
 
+std::string bytes_to_string(query::result_bytes_view v) {
+    std::string str;
+    str.reserve(v.size_bytes());
+    using boost::range::for_each;
+    for_each(v, [&] (bytes_view fragment) {
+        auto view = std::string_view(reinterpret_cast<const char*>(fragment.data()), fragment.size());
+        str.insert(str.end(), view.begin(), view.end());
+    });
+    return str;
+}
+
 namespace thrift {
-GCC6_CONCEPT(
 template<typename T>
-concept bool Aggregator =
+concept Aggregator =
     requires() { typename T::type; }
     && requires(T aggregator, typename T::type* aggregation, const bytes& name, const query::result_atomic_cell_view& cell) {
-        { aggregator.on_column(aggregation, name, cell) } -> void;
+        { aggregator.on_column(aggregation, name, cell) } -> std::same_as<void>;
     };
-)
 }
 
 enum class query_order { no, yes };
@@ -185,13 +201,14 @@ enum class query_order { no, yes };
 class thrift_handler : public CassandraCobSvIf {
     distributed<database>& _db;
     distributed<cql3::query_processor>& _query_processor;
+    service::client_state _client_state;
     service::query_state _query_state;
     ::timeout_config _timeout_config;
 private:
     template <typename Cob, typename Func>
     void
     with_schema(Cob&& cob,
-                tcxx::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob,
+                thrift_fn::function<void (::apache::thrift::TDelayedException* _throw)>&& exn_cob,
                 const std::string& cf,
                 Func&& func) {
         with_cob(std::move(cob), std::move(exn_cob), [this, &cf, func = std::move(func)] {
@@ -203,7 +220,8 @@ public:
     explicit thrift_handler(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service& auth_service, ::timeout_config timeout_config)
         : _db(db)
         , _query_processor(qp)
-        , _query_state(service::client_state::for_external_thrift_calls(auth_service))
+        , _client_state(service::client_state::external_tag{}, auth_service, socket_address(), true)
+        , _query_state(_client_state, /*FIXME: pass real permit*/empty_service_permit())
         , _timeout_config(timeout_config)
     { }
 
@@ -215,23 +233,23 @@ public:
         return _query_state.get_client_state().validate_login();
     };
 
-    void login(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const AuthenticationRequest& auth_request) {
+    void login(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const AuthenticationRequest& auth_request) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auth::authenticator::credentials_map creds(auth_request.credentials.begin(), auth_request.credentials.end());
             auto& auth_service = *_query_state.get_client_state().get_auth_service();
             return auth_service.underlying_authenticator().authenticate(creds).then([this] (auto user) {
-                _query_state.get_client_state().set_login(::make_shared<auth::authenticated_user>(std::move(user)));
+                _query_state.get_client_state().set_login(std::move(user));
             });
         });
     }
 
-    void set_keyspace(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
+    void set_keyspace(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
-            _query_state.get_client_state().set_keyspace(_db, keyspace);
+            _query_state.get_client_state().set_keyspace(_db.local(), keyspace);
         });
     }
 
-    void get(tcxx::function<void(ColumnOrSuperColumn const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const ConsistencyLevel::type consistency_level) {
+    void get(thrift_fn::function<void(ColumnOrSuperColumn const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const ConsistencyLevel::type consistency_level) {
         return get_slice([cob = std::move(cob), &column_path](auto&& results) {
             if (results.empty()) {
                 throw NotFoundException();
@@ -240,7 +258,7 @@ public:
         }, exn_cob, key, column_path_to_column_parent(column_path), column_path_to_slice_predicate(column_path), std::move(consistency_level));
     }
 
-    void get_slice(tcxx::function<void(std::vector<ColumnOrSuperColumn>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
+    void get_slice(thrift_fn::function<void(std::vector<ColumnOrSuperColumn>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
         return multiget_slice([cob = std::move(cob)](auto&& results) {
             if (!results.empty()) {
                 return cob(std::move(results.begin()->second));
@@ -249,7 +267,7 @@ public:
         }, exn_cob, {key}, column_parent, predicate, consistency_level);
     }
 
-    void get_count(tcxx::function<void(int32_t const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
+    void get_count(thrift_fn::function<void(int32_t const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
         return multiget_count([cob = std::move(cob)](auto&& results) {
             if (!results.empty()) {
                 return cob(results.begin()->second);
@@ -258,18 +276,19 @@ public:
         }, exn_cob, {key}, column_parent, predicate, consistency_level);
     }
 
-    void multiget_slice(tcxx::function<void(std::map<std::string, std::vector<ColumnOrSuperColumn> >  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::vector<std::string> & keys, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
+    void multiget_slice(thrift_fn::function<void(std::map<std::string, std::vector<ColumnOrSuperColumn> >  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::vector<std::string> & keys, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_parent.column_family, [&](schema_ptr schema) {
             if (!column_parent.super_column.empty()) {
                 fail(unimplemented::cause::SUPER);
             }
-            auto cmd = slice_pred_to_read_cmd(*schema, predicate);
+            auto& proxy = service::get_local_storage_proxy();
+            auto cmd = slice_pred_to_read_cmd(proxy, *schema, predicate);
             auto cell_limit = predicate.__isset.slice_range ? static_cast<uint32_t>(predicate.slice_range.count) : std::numeric_limits<uint32_t>::max();
             auto pranges = make_partition_ranges(*schema, keys);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
+            return f.then([this, &proxy, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
                 auto timeout = db::timeout_clock::now() + _timeout_config.read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout}).then(
+                return proxy.query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd, cell_limit, keys = std::move(keys)](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
                         if (schema->is_counter()) {
@@ -286,18 +305,19 @@ public:
         });
     }
 
-    void multiget_count(tcxx::function<void(std::map<std::string, int32_t>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::vector<std::string> & keys, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
+    void multiget_count(thrift_fn::function<void(std::map<std::string, int32_t>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::vector<std::string> & keys, const ColumnParent& column_parent, const SlicePredicate& predicate, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_parent.column_family, [&](schema_ptr schema) {
             if (!column_parent.super_column.empty()) {
                 fail(unimplemented::cause::SUPER);
             }
-            auto cmd = slice_pred_to_read_cmd(*schema, predicate);
+            auto& proxy = service::get_local_storage_proxy();
+            auto cmd = slice_pred_to_read_cmd(proxy, *schema, predicate);
             auto cell_limit = predicate.__isset.slice_range ? static_cast<uint32_t>(predicate.slice_range.count) : std::numeric_limits<uint32_t>::max();
             auto pranges = make_partition_ranges(*schema, keys);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
+            return f.then([this, &proxy, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
                 auto timeout = db::timeout_clock::now() + _timeout_config.read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout}).then(
+                return proxy.query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd, cell_limit, keys = std::move(keys)](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
                         column_counter counter(*schema, cmd->slice, cell_limit, std::move(keys));
@@ -315,13 +335,14 @@ public:
      * don't know which partition keys in the specified range we should return back to the client. So for
      * now our behavior differs from Origin.
      */
-    void get_range_slices(tcxx::function<void(std::vector<KeySlice>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const ColumnParent& column_parent, const SlicePredicate& predicate, const KeyRange& range, const ConsistencyLevel::type consistency_level) {
+    void get_range_slices(thrift_fn::function<void(std::vector<KeySlice>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const ColumnParent& column_parent, const SlicePredicate& predicate, const KeyRange& range, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_parent.column_family, [&](schema_ptr schema) {
             if (!column_parent.super_column.empty()) {
                 fail(unimplemented::cause::SUPER);
             }
+            auto& proxy = service::get_local_storage_proxy();
             auto&& prange = make_partition_range(*schema, range);
-            auto cmd = slice_pred_to_read_cmd(*schema, predicate);
+            auto cmd = slice_pred_to_read_cmd(proxy, *schema, predicate);
             // KeyRange::count is the number of thrift rows to return, while
             // SlicePredicte::slice_range::count limits the number of thrift colums.
             if (schema->thrift().is_dynamic()) {
@@ -329,12 +350,12 @@ public:
                 cmd->partition_limit = range.count;
             } else {
                 // For static CFs each thrift row maps to a CQL row.
-                cmd->row_limit = range.count;
+                cmd->set_row_limit(static_cast<uint64_t>(range.count));
             }
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, schema, cmd, prange = std::move(prange), consistency_level] () mutable {
+            return f.then([this, &proxy, schema, cmd, prange = std::move(prange), consistency_level] () mutable {
                 auto timeout = db::timeout_clock::now() + _timeout_config.range_read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, std::move(prange), cl_from_thrift(consistency_level), {timeout}).then(
+                return proxy.query(schema, cmd, std::move(prange), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd](query::result_view v) {
                         return to_key_slices(*schema, cmd->slice, v, std::numeric_limits<uint32_t>::max());
@@ -344,18 +365,18 @@ public:
         });
     }
 
-    static lw_shared_ptr<query::read_command> make_paged_read_cmd(const schema& s, uint32_t column_limit, const std::string* start_column, const dht::partition_range_vector& range) {
+    static lw_shared_ptr<query::read_command> make_paged_read_cmd(service::storage_proxy& proxy, const schema& s, uint32_t column_limit, const std::string* start_column, const dht::partition_range_vector& range) {
         auto opts = query_opts(s);
         std::vector<query::clustering_range> clustering_ranges;
-        std::vector<column_id> regular_columns;
-        uint32_t row_limit;
+        query::column_id_vector regular_columns;
+        uint64_t row_limit;
         uint32_t partition_limit;
         std::unique_ptr<query::specific_ranges> specific_ranges = nullptr;
         // KeyRange::count is the number of thrift columns to return (unlike get_range_slices).
         if (s.thrift().is_dynamic()) {
             // For dynamic CFs we must limit the number of rows returned. We use the query::specific_ranges to constrain
             // the first partition, of which we are only interested in the columns after start_column.
-            row_limit = column_limit;
+            row_limit = static_cast<uint64_t>(column_limit);
             partition_limit = query::max_partitions;
             if (start_column) {
                 auto sr = query::specific_ranges(*range[0].start()->value().key(), {make_clustering_range_and_validate(s, *start_column, std::string())});
@@ -366,7 +387,7 @@ public:
             // For static CFs we must limit the number of columns returned. Since we don't implement a cell limit,
             // we ask for as many partitions as those that are capable of exhausting the limit and later filter out
             // any excess cells.
-            row_limit = query::max_rows;
+            row_limit = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
             partition_limit = (column_limit + s.regular_columns_count() - 1) / s.regular_columns_count();
             schema::const_iterator start_col = start_column
                                              ? s.regular_lower_bound(to_bytes(*start_column))
@@ -376,7 +397,8 @@ public:
         clustering_ranges.emplace_back(query::clustering_range::make_open_ended_both_sides());
         auto slice = query::partition_slice(std::move(clustering_ranges), { }, std::move(regular_columns), opts,
                 std::move(specific_ranges), cql_serialization_format::internal());
-        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice), row_limit, gc_clock::now(), stdx::nullopt, partition_limit);
+        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice), proxy.get_max_result_size(slice),
+                query::row_limit(row_limit), query::partition_limit(partition_limit));
     }
 
     static future<> do_get_paged_slice(
@@ -386,9 +408,11 @@ public:
             const std::string* start_column,
             db::consistency_level consistency_level,
             const ::timeout_config& timeout_config,
-            std::vector<KeySlice>& output) {
-        auto cmd = make_paged_read_cmd(*schema, column_limit, start_column, range);
-        stdx::optional<partition_key> start_key;
+            std::vector<KeySlice>& output,
+            service::query_state& qs) {
+        auto& proxy = service::get_local_storage_proxy();
+        auto cmd = make_paged_read_cmd(proxy, *schema, column_limit, start_column, range);
+        std::optional<partition_key> start_key;
         auto end = range[0].end();
         if (start_column && !schema->thrift().is_dynamic()) {
             // For static CFs, we must first query for a specific key so as to consume the remainder
@@ -398,21 +422,21 @@ public:
         }
         auto range1 = range; // query() below accepts an rvalue, so need a copy to reuse later
         auto timeout = db::timeout_clock::now() + timeout_config.range_read_timeout;
-        return service::get_local_storage_proxy().query(schema, cmd, std::move(range), consistency_level, {timeout}).then(
+        return proxy.query(schema, cmd, std::move(range), consistency_level, {timeout, empty_service_permit(), qs.get_client_state()}).then(
                 [schema, cmd, column_limit](service::storage_proxy::coordinator_query_result qr) {
             return query::result_view::do_with(*qr.query_result, [schema, cmd, column_limit](query::result_view v) {
                 return to_key_slices(*schema, cmd->slice, v, column_limit);
             });
-        }).then([schema, cmd, column_limit, range = std::move(range1), consistency_level, start_key = std::move(start_key), end = std::move(end), &timeout_config, &output](auto&& slices) mutable {
+        }).then([schema, cmd, column_limit, range = std::move(range1), consistency_level, start_key = std::move(start_key), end = std::move(end), &timeout_config, &output, &qs](auto&& slices) mutable {
             auto columns = std::accumulate(slices.begin(), slices.end(), 0u, [](auto&& acc, auto&& ks) {
                 return acc + ks.columns.size();
             });
             std::move(slices.begin(), slices.end(), std::back_inserter(output));
-            if (columns == 0 || columns == column_limit || (slices.size() < cmd->partition_limit && columns < cmd->row_limit)) {
+            if (columns == 0 || columns == column_limit || (slices.size() < cmd->partition_limit && columns < cmd->get_row_limit())) {
                 if (!output.empty() || !start_key) {
                     if (range.size() > 1 && columns < column_limit) {
                         range.erase(range.begin());
-                        return do_get_paged_slice(std::move(schema), column_limit - columns, std::move(range), nullptr, consistency_level, timeout_config, output);
+                        return do_get_paged_slice(std::move(schema), column_limit - columns, std::move(range), nullptr, consistency_level, timeout_config, output, qs);
                     }
                     return make_ready_future();
                 }
@@ -420,13 +444,13 @@ public:
             } else {
                 start_key = key_from_thrift(*schema, to_bytes_view(output.back().key));
             }
-            auto start = dht::global_partitioner().decorate_key(*schema, std::move(*start_key));
+            auto start = dht::decorate_key(*schema, std::move(*start_key));
             range[0] = dht::partition_range(dht::partition_range::bound(std::move(start), false), std::move(end));
-            return do_get_paged_slice(schema, column_limit - columns, std::move(range), nullptr, consistency_level, timeout_config, output);
+            return do_get_paged_slice(schema, column_limit - columns, std::move(range), nullptr, consistency_level, timeout_config, output, qs);
         });
     }
 
-    void get_paged_slice(tcxx::function<void(std::vector<KeySlice> const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& column_family, const KeyRange& range, const std::string& start_column, const ConsistencyLevel::type consistency_level) {
+    void get_paged_slice(thrift_fn::function<void(std::vector<KeySlice> const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& column_family, const KeyRange& range, const std::string& start_column, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_family, [&](schema_ptr schema) {
             return do_with(std::vector<KeySlice>(), [&](auto& output) {
                 if (range.__isset.row_filter) {
@@ -446,7 +470,7 @@ public:
                 auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
                 return f.then([this, schema, count = range.count, start_column, prange = std::move(prange), consistency_level, &output] () mutable {
                     return do_get_paged_slice(std::move(schema), count, std::move(prange), &start_column,
-                            cl_from_thrift(consistency_level), _timeout_config, output).then([&output] {
+                            cl_from_thrift(consistency_level), _timeout_config, output, _query_state).then([&output] {
                         return std::move(output);
                     });
                 });
@@ -454,14 +478,14 @@ public:
         });
     }
 
-    void get_indexed_slices(tcxx::function<void(std::vector<KeySlice>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const ColumnParent& column_parent, const IndexClause& index_clause, const SlicePredicate& column_predicate, const ConsistencyLevel::type consistency_level) {
+    void get_indexed_slices(thrift_fn::function<void(std::vector<KeySlice>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const ColumnParent& column_parent, const IndexClause& index_clause, const SlicePredicate& column_predicate, const ConsistencyLevel::type consistency_level) {
         std::vector<KeySlice>  _return;
         warn(unimplemented::cause::INDEXES);
         // FIXME: implement
         return pass_unimplemented(exn_cob);
     }
 
-    void insert(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const Column& column, const ConsistencyLevel::type consistency_level) {
+    void insert(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const Column& column, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_parent.column_family, [&](schema_ptr schema) {
             if (column_parent.__isset.super_column) {
                 fail(unimplemented::cause::SUPER);
@@ -473,13 +497,14 @@ public:
 
             mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
             add_to_mutation(*schema, column, m_to_apply);
-            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
-                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
+            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([this, m_to_apply = std::move(m_to_apply), consistency_level] {
+                auto timeout = db::timeout_clock::now() + _timeout_config.write_timeout;
+                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), timeout, nullptr, /*FIXME: pass real permit*/empty_service_permit());
             });
         });
     }
 
-    void add(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const CounterColumn& column, const ConsistencyLevel::type consistency_level) {
+    void add(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const CounterColumn& column, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_parent.column_family, [&](schema_ptr schema) {
             if (column_parent.__isset.super_column) {
                 fail(unimplemented::cause::SUPER);
@@ -487,20 +512,21 @@ public:
 
             mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
             add_to_mutation(*schema, column, m_to_apply);
-            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
-                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
+            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([this, m_to_apply = std::move(m_to_apply), consistency_level] {
+                auto timeout = db::timeout_clock::now() + _timeout_config.write_timeout;
+                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), timeout, nullptr, /*FIXME: pass real permit*/empty_service_permit());
             });
         });
     }
 
-    void cas(tcxx::function<void(CASResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const std::string& column_family, const std::vector<Column> & expected, const std::vector<Column> & updates, const ConsistencyLevel::type serial_consistency_level, const ConsistencyLevel::type commit_consistency_level) {
+    void cas(thrift_fn::function<void(CASResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const std::string& column_family, const std::vector<Column> & expected, const std::vector<Column> & updates, const ConsistencyLevel::type serial_consistency_level, const ConsistencyLevel::type commit_consistency_level) {
         CASResult _return;
         warn(unimplemented::cause::LWT);
         // FIXME: implement
         return pass_unimplemented(exn_cob);
     }
 
-    void remove(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const int64_t timestamp, const ConsistencyLevel::type consistency_level) {
+    void remove(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const int64_t timestamp, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_path.column_family, [&](schema_ptr schema) {
             if (schema->is_view()) {
                 throw make_exception<InvalidRequestException>("Cannot modify Materialized Views directly");
@@ -521,13 +547,14 @@ public:
                 m_to_apply.partition().apply(tombstone(timestamp, gc_clock::now()));
             }
 
-            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
-                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
+            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([this, m_to_apply = std::move(m_to_apply), consistency_level] {
+                auto timeout = db::timeout_clock::now() + _timeout_config.write_timeout;
+                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), timeout, nullptr, /*FIXME: pass real permit*/empty_service_permit());
             });
         });
     }
 
-    void remove_counter(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const ConsistencyLevel::type consistency_level) {
+    void remove_counter(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_path.column_family, [&](schema_ptr schema) {
             mutation m_to_apply(schema, key_from_thrift(*schema, to_bytes_view(key)));
 
@@ -545,42 +572,45 @@ public:
                 m_to_apply.partition().apply(tombstone(timestamp, gc_clock::now()));
             }
 
-            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
+            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([this, m_to_apply = std::move(m_to_apply), consistency_level] {
                 // This mutation contains only counter tombstones so it can be applied like non-counter mutations.
-                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
+                auto timeout = db::timeout_clock::now() + _timeout_config.counter_write_timeout;
+                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), timeout, nullptr, /*FIXME: pass real permit*/empty_service_permit());
             });
         });
     }
 
-    void batch_mutate(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::map<std::string, std::map<std::string, std::vector<Mutation> > > & mutation_map, const ConsistencyLevel::type consistency_level) {
+    void batch_mutate(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::map<std::string, std::map<std::string, std::vector<Mutation> > > & mutation_map, const ConsistencyLevel::type consistency_level) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto p = prepare_mutations(_db.local(), current_keyspace(), mutation_map);
             return parallel_for_each(std::move(p.second), [this](auto&& schema) {
                 return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY);
-            }).then([muts = std::move(p.first), consistency_level] {
-                return service::get_local_storage_proxy().mutate(std::move(muts), cl_from_thrift(consistency_level), nullptr);
+            }).then([this, muts = std::move(p.first), consistency_level] {
+                auto timeout = db::timeout_clock::now() + _timeout_config.write_timeout;
+                return service::get_local_storage_proxy().mutate(std::move(muts), cl_from_thrift(consistency_level), timeout, nullptr, /*FIXME: pass real permit*/empty_service_permit());
             });
         });
     }
 
-    void atomic_batch_mutate(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::map<std::string, std::map<std::string, std::vector<Mutation> > > & mutation_map, const ConsistencyLevel::type consistency_level) {
+    void atomic_batch_mutate(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::map<std::string, std::map<std::string, std::vector<Mutation> > > & mutation_map, const ConsistencyLevel::type consistency_level) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto p = prepare_mutations(_db.local(), current_keyspace(), mutation_map);
             return parallel_for_each(std::move(p.second), [this](auto&& schema) {
                 return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY);
-            }).then([muts = std::move(p.first), consistency_level] {
-                return service::get_local_storage_proxy().mutate_atomically(std::move(muts), cl_from_thrift(consistency_level), nullptr);
+            }).then([this, muts = std::move(p.first), consistency_level] {
+                auto timeout = db::timeout_clock::now() + _timeout_config.write_timeout;
+                return service::get_local_storage_proxy().mutate_atomically(std::move(muts), cl_from_thrift(consistency_level), timeout, nullptr, /*FIXME: pass real permit*/empty_service_permit());
             });
         });
     }
 
-    void truncate(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfname) {
+    void truncate(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfname) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             if (current_keyspace().empty()) {
                 throw make_exception<InvalidRequestException>("keyspace not set");
             }
 
-            return _query_state.get_client_state().has_column_family_access(current_keyspace(), cfname, auth::permission::MODIFY).then([=] {
+            return _query_state.get_client_state().has_column_family_access(_db.local(), current_keyspace(), cfname, auth::permission::MODIFY).then([this, cfname] {
                 if (_db.local().find_schema(current_keyspace(), cfname)->is_view()) {
                     throw make_exception<InvalidRequestException>("Cannot truncate Materialized Views");
                 }
@@ -589,7 +619,7 @@ public:
         });
     }
 
-    void get_multi_slice(tcxx::function<void(std::vector<ColumnOrSuperColumn>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const MultiSliceRequest& request) {
+    void get_multi_slice(thrift_fn::function<void(std::vector<ColumnOrSuperColumn>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const MultiSliceRequest& request) {
         with_schema(std::move(cob), std::move(exn_cob), request.column_parent.column_family, [&](schema_ptr schema) {
             if (!request.__isset.key) {
                 throw make_exception<InvalidRequestException>("Key may not be empty");
@@ -602,11 +632,11 @@ public:
             }
             auto& s = *schema;
             auto pk = key_from_thrift(s, to_bytes(request.key));
-            auto dk = dht::global_partitioner().decorate_key(s, pk);
-            std::vector<column_id> regular_columns;
+            auto dk = dht::decorate_key(s, pk);
+            query::column_id_vector regular_columns;
             std::vector<query::clustering_range> clustering_ranges;
             auto opts = query_opts(s);
-            uint32_t row_limit;
+            uint64_t row_limit;
             if (s.thrift().is_dynamic()) {
                 row_limit = request.count;
                 auto cmp = bound_view::compare(s);
@@ -621,7 +651,7 @@ public:
                     opts.set(query::partition_slice::option::reversed);
                 }
             } else {
-                row_limit = query::max_rows;
+                row_limit = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
                 clustering_ranges.emplace_back(query::clustering_range::make_open_ended_both_sides());
                 auto cmp = [&s](auto&& s1, auto&& s2) { return s.regular_column_name_type()->compare(s1, s2); };
                 auto ranges = make_non_overlapping_ranges<bytes>(std::move(request.column_slices), [](auto&& cslice) {
@@ -639,11 +669,13 @@ public:
                 }
             }
             auto slice = query::partition_slice(std::move(clustering_ranges), {}, std::move(regular_columns), opts, nullptr);
-            auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), row_limit);
+            auto& proxy = service::get_local_storage_proxy();
+            auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), proxy.get_max_result_size(slice),
+                    query::row_limit(row_limit));
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, dk = std::move(dk), cmd, schema, column_limit = request.count, cl = request.consistency_level] {
+            return f.then([this, &proxy, dk = std::move(dk), cmd, schema, column_limit = request.count, cl = request.consistency_level] {
                 auto timeout = db::timeout_clock::now() + _timeout_config.read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, {dht::partition_range::make_singular(dk)}, cl_from_thrift(cl), {timeout}).then(
+                return proxy.query(schema, cmd, {dht::partition_range::make_singular(dk)}, cl_from_thrift(cl), {timeout, /* FIXME: pass real permit */empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd, column_limit](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd, column_limit](query::result_view v) {
                         column_aggregator<query_order::no> aggregator(*schema, cmd->slice, column_limit, { });
@@ -656,7 +688,7 @@ public:
         });
     }
 
-    void describe_schema_versions(tcxx::function<void(std::map<std::string, std::vector<std::string> >  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob) {
+    void describe_schema_versions(thrift_fn::function<void(std::map<std::string, std::vector<std::string> >  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob) {
         with_cob(std::move(cob), std::move(exn_cob), [] {
             return service::get_local_storage_service().describe_schema_versions().then([](auto&& m) {
                 std::map<std::string, std::vector<std::string>> ret;
@@ -668,7 +700,7 @@ public:
         });
     }
 
-    void describe_keyspaces(tcxx::function<void(std::vector<KsDef>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob) {
+    void describe_keyspaces(thrift_fn::function<void(std::vector<KsDef>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             validate_login();
             std::vector<KsDef>  ret;
@@ -679,15 +711,15 @@ public:
         });
     }
 
-    void describe_cluster_name(tcxx::function<void(std::string const& _return)> cob) {
+    void describe_cluster_name(thrift_fn::function<void(std::string const& _return)> cob) {
         cob(_db.local().get_config().cluster_name());
     }
 
-    void describe_version(tcxx::function<void(std::string const& _return)> cob) {
+    void describe_version(thrift_fn::function<void(std::string const& _return)> cob) {
         cob(::cassandra::thrift_version);
     }
 
-    void do_describe_ring(tcxx::function<void(std::vector<TokenRange>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace, bool local) {
+    void do_describe_ring(thrift_fn::function<void(std::vector<TokenRange>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace, bool local) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto& ks = _db.local().find_keyspace(keyspace);
             if (ks.get_replication_strategy().get_type() == locator::replication_strategy_type::local) {
@@ -718,34 +750,34 @@ public:
         });
     }
 
-    void describe_ring(tcxx::function<void(std::vector<TokenRange>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
+    void describe_ring(thrift_fn::function<void(std::vector<TokenRange>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
         do_describe_ring(std::move(cob), std::move(exn_cob), keyspace, false);
     }
 
-    void describe_local_ring(tcxx::function<void(std::vector<TokenRange>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
+    void describe_local_ring(thrift_fn::function<void(std::vector<TokenRange>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
         do_describe_ring(std::move(cob), std::move(exn_cob), keyspace, true);
     }
 
-    void describe_token_map(tcxx::function<void(std::map<std::string, std::string>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob) {
+    void describe_token_map(thrift_fn::function<void(std::map<std::string, std::string>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob) {
         with_cob(std::move(cob), std::move(exn_cob), [] {
             auto m = service::get_local_storage_service().get_token_to_endpoint_map();
             std::map<std::string, std::string> ret;
             for (auto&& p : m) {
-                ret[sprint("%s", p.first)] = p.second.to_sstring();
+                ret[format("{}", p.first)] = p.second.to_sstring();
             }
             return ret;
         });
     }
 
-    void describe_partitioner(tcxx::function<void(std::string const& _return)> cob) {
-        cob(dht::global_partitioner().name());
+    void describe_partitioner(thrift_fn::function<void(std::string const& _return)> cob) {
+        cob(_db.local().get_config().partitioner());
     }
 
-    void describe_snitch(tcxx::function<void(std::string const& _return)> cob) {
-        cob(sprint("org.apache.cassandra.locator.%s", _db.local().get_snitch_name()));
+    void describe_snitch(thrift_fn::function<void(std::string const& _return)> cob) {
+        cob(format("org.apache.cassandra.locator.{}", _db.local().get_snitch_name()));
     }
 
-    void describe_keyspace(tcxx::function<void(KsDef const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
+    void describe_keyspace(thrift_fn::function<void(KsDef const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             validate_login();
             auto& ks = _db.local().find_keyspace(keyspace);
@@ -753,7 +785,7 @@ public:
         });
     }
 
-    void describe_splits(tcxx::function<void(std::vector<std::string>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfName, const std::string& start_token, const std::string& end_token, const int32_t keys_per_split) {
+    void describe_splits(thrift_fn::function<void(std::vector<std::string>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfName, const std::string& start_token, const std::string& end_token, const int32_t keys_per_split) {
         return describe_splits_ex([cob = std::move(cob)](auto&& results) {
             std::vector<std::string> res;
             res.reserve(results.size() + 1);
@@ -765,17 +797,17 @@ public:
         }, exn_cob, cfName, start_token, end_token, keys_per_split);
     }
 
-    void trace_next_query(tcxx::function<void(std::string const& _return)> cob) {
+    void trace_next_query(thrift_fn::function<void(std::string const& _return)> cob) {
         std::string _return;
         // FIXME: implement
         return cob("dummy trace");
     }
 
-    void describe_splits_ex(tcxx::function<void(std::vector<CfSplit>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfName, const std::string& start_token, const std::string& end_token, const int32_t keys_per_split) {
+    void describe_splits_ex(thrift_fn::function<void(std::vector<CfSplit>  const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfName, const std::string& start_token, const std::string& end_token, const int32_t keys_per_split) {
         with_cob(std::move(cob), std::move(exn_cob), [&]{
             dht::token_range_vector ranges;
-            auto tstart = start_token.empty() ? dht::minimum_token() : dht::global_partitioner().from_sstring(sstring(start_token));
-            auto tend = end_token.empty() ? dht::maximum_token() : dht::global_partitioner().from_sstring(sstring(end_token));
+            auto tstart = start_token.empty() ? dht::minimum_token() : dht::token::from_sstring(sstring(start_token));
+            auto tend = end_token.empty() ? dht::maximum_token() : dht::token::from_sstring(sstring(end_token));
             range<dht::token> r({{ std::move(tstart), false }}, {{ std::move(tend), true }});
             auto cf = sstring(cfName);
             auto splits = service::get_local_storage_service().get_splits(current_keyspace(), cf, std::move(r), keys_per_split);
@@ -784,8 +816,8 @@ public:
             for (auto&& s : splits) {
                 res.emplace_back();
                 assert(s.first.start() && s.first.end());
-                auto start_token = dht::global_partitioner().to_sstring(s.first.start()->value());
-                auto end_token = dht::global_partitioner().to_sstring(s.first.end()->value());
+                auto start_token = s.first.start()->value().to_sstring();
+                auto end_token = s.first.end()->value().to_sstring();
                 res.back().__set_start_token(bytes_to_string(to_bytes_view(start_token)));
                 res.back().__set_end_token(bytes_to_string(to_bytes_view(end_token)));
                 res.back().__set_row_count(s.second);
@@ -794,7 +826,7 @@ public:
         });
     }
 
-    void system_add_column_family(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const CfDef& cf_def) {
+    void system_add_column_family(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const CfDef& cf_def) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             if (!_db.local().has_keyspace(cf_def.keyspace)) {
                 throw NotFoundException();
@@ -811,9 +843,9 @@ public:
             });
         });
     }
-    void system_drop_column_family(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& column_family) {
+    void system_drop_column_family(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& column_family) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
-            return _query_state.get_client_state().has_column_family_access(current_keyspace(), column_family, auth::permission::DROP).then([=] {
+            return _query_state.get_client_state().has_column_family_access(_db.local(), current_keyspace(), column_family, auth::permission::DROP).then([this, column_family] {
                 auto& cf = _db.local().find_column_family(current_keyspace(), column_family);
                 if (cf.schema()->is_view()) {
                     throw make_exception<InvalidRequestException>("Cannot drop Materialized Views from Thrift");
@@ -828,7 +860,7 @@ public:
         });
     }
 
-    void system_add_keyspace(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const KsDef& ks_def) {
+    void system_add_keyspace(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const KsDef& ks_def) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto ksm = keyspace_from_thrift(ks_def);
             return _query_state.get_client_state().has_all_keyspaces_access(auth::permission::CREATE).then([this, ksm = std::move(ksm)] {
@@ -839,14 +871,14 @@ public:
         });
     }
 
-    void system_drop_keyspace(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
+    void system_drop_keyspace(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& keyspace) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             thrift_validation::validate_keyspace_not_system(keyspace);
             if (!_db.local().has_keyspace(keyspace)) {
                 throw NotFoundException();
             }
 
-            return _query_state.get_client_state().has_keyspace_access(keyspace, auth::permission::DROP).then([=] {
+            return _query_state.get_client_state().has_keyspace_access(keyspace, auth::permission::DROP).then([this, keyspace] {
                 return service::get_local_migration_manager().announce_keyspace_drop(keyspace, false).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
@@ -854,7 +886,7 @@ public:
         });
     }
 
-    void system_update_keyspace(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const KsDef& ks_def) {
+    void system_update_keyspace(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const KsDef& ks_def) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             thrift_validation::validate_keyspace_not_system(ks_def.name);
 
@@ -874,7 +906,7 @@ public:
         });
     }
 
-    void system_update_column_family(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const CfDef& cf_def) {
+    void system_update_column_family(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const CfDef& cf_def) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto& cf = _db.local().find_column_family(cf_def.keyspace, cf_def.name);
             auto schema = cf.schema();
@@ -905,7 +937,7 @@ public:
         });
     }
 
-    void execute_cql_query(tcxx::function<void(CqlResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression) {
+    void execute_cql_query(thrift_fn::function<void(CqlResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression) {
         throw make_exception<InvalidRequestException>("CQL2 is not supported");
     }
 
@@ -933,16 +965,20 @@ public:
         virtual void visit(const cql_transport::messages::result_message::rows& m) override {
             _result = to_thrift_result(m.rs());
         }
+        virtual void visit(const cql_transport::messages::result_message::bounce_to_shard& m) override {
+            throw TProtocolException(TProtocolException::TProtocolExceptionType::NOT_IMPLEMENTED, "Thrift does not support executing LWT statements");
+        }
     };
 
-    void execute_cql3_query(tcxx::function<void(CqlResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression, const ConsistencyLevel::type consistency) {
+    void execute_cql3_query(thrift_fn::function<void(CqlResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression, const ConsistencyLevel::type consistency) {
         with_exn_cob(std::move(exn_cob), [&] {
             if (compression != Compression::type::NONE) {
                 throw make_exception<InvalidRequestException>("Compressed query strings are not supported");
             }
-            auto opts = std::make_unique<cql3::query_options>(cl_from_thrift(consistency), _timeout_config, stdx::nullopt, std::vector<cql3::raw_value_view>(),
+            auto& qp = _query_processor.local();
+            auto opts = std::make_unique<cql3::query_options>(qp.get_cql_config(), cl_from_thrift(consistency), _timeout_config, std::nullopt, std::vector<cql3::raw_value_view>(),
                             false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
-            auto f = _query_processor.local().process(query, _query_state, *opts);
+            auto f = qp.execute_direct(query, _query_state, *opts);
             return f.then([cob = std::move(cob), opts = std::move(opts)](auto&& ret) {
                 cql3_result_visitor visitor;
                 ret->accept(visitor);
@@ -951,7 +987,7 @@ public:
         });
     }
 
-    void prepare_cql_query(tcxx::function<void(CqlPreparedResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression) {
+    void prepare_cql_query(thrift_fn::function<void(CqlPreparedResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression) {
         throw make_exception<InvalidRequestException>("CQL2 is not supported");
     }
 
@@ -966,7 +1002,7 @@ public:
         }
         virtual void visit(const cql_transport::messages::result_message::prepared::thrift& m) override {
             _result.__set_itemId(m.get_id());
-            auto& names = m.metadata()->names();
+            auto& names = m.metadata().names();
             _result.__set_count(names.size());
             std::vector<std::string> variable_types;
             std::vector<std::string> variable_names;
@@ -979,7 +1015,7 @@ public:
         }
     };
 
-    void prepare_cql3_query(tcxx::function<void(CqlPreparedResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression) {
+    void prepare_cql3_query(thrift_fn::function<void(CqlPreparedResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& query, const Compression::type compression) {
         with_exn_cob(std::move(exn_cob), [&] {
             validate_login();
             if (compression != Compression::type::NONE) {
@@ -993,15 +1029,23 @@ public:
         });
     }
 
-    void execute_prepared_cql_query(tcxx::function<void(CqlResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const int32_t itemId, const std::vector<std::string> & values) {
+    void execute_prepared_cql_query(thrift_fn::function<void(CqlResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const int32_t itemId, const std::vector<std::string> & values) {
         throw make_exception<InvalidRequestException>("CQL2 is not supported");
     }
 
-    void execute_prepared_cql3_query(tcxx::function<void(CqlResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const int32_t itemId, const std::vector<std::string> & values, const ConsistencyLevel::type consistency) {
+    void execute_prepared_cql3_query(thrift_fn::function<void(CqlResult const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const int32_t itemId, const std::vector<std::string> & values, const ConsistencyLevel::type consistency) {
         with_exn_cob(std::move(exn_cob), [&] {
-            auto prepared = _query_processor.local().get_prepared(cql3::prepared_cache_key_type(itemId));
+            cql3::prepared_cache_key_type cache_key(itemId);
+            bool needs_authorization = false;
+
+            auto prepared = _query_processor.local().get_prepared(_query_state.get_client_state().user(), cache_key);
             if (!prepared) {
-                throw make_exception<InvalidRequestException>("Prepared query with id %d not found", itemId);
+                needs_authorization = true;
+
+                prepared = _query_processor.local().get_prepared(cache_key);
+                if (!prepared) {
+                    throw make_exception<InvalidRequestException>("Prepared query with id %d not found", itemId);
+                }
             }
             auto stmt = prepared->statement;
             if (stmt->get_bound_terms() != values.size()) {
@@ -1011,9 +1055,10 @@ public:
             std::transform(values.begin(), values.end(), std::back_inserter(bytes_values), [](auto&& s) {
                 return cql3::raw_value::make_value(to_bytes(s));
             });
-            auto opts = std::make_unique<cql3::query_options>(cl_from_thrift(consistency), _timeout_config, stdx::nullopt, std::move(bytes_values),
+            auto& qp = _query_processor.local();
+            auto opts = std::make_unique<cql3::query_options>(qp.get_cql_config(), cl_from_thrift(consistency), _timeout_config, std::nullopt, std::move(bytes_values),
                             false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
-            auto f = _query_processor.local().process_statement(stmt, _query_state, *opts);
+            auto f = qp.execute_prepared(std::move(prepared), std::move(cache_key), _query_state, *opts, needs_authorization);
             return f.then([cob = std::move(cob), opts = std::move(opts)](auto&& ret) {
                 cql3_result_visitor visitor;
                 ret->accept(visitor);
@@ -1022,7 +1067,7 @@ public:
         });
     }
 
-    void set_cql_version(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& version) {
+    void set_cql_version(thrift_fn::function<void()> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& version) {
         // No-op.
         cob();
     }
@@ -1059,7 +1104,7 @@ private:
         }
         return std::make_pair(std::move(ret), is_compound);
     }
-    static CqlResult to_thrift_result(const cql3::result_set& rs) {
+    static CqlResult to_thrift_result(const cql3::result& rs) {
         CqlResult result;
         result.__set_type(CqlResultType::ROWS);
 
@@ -1079,27 +1124,37 @@ private:
         mtd.__set_default_value_type(utf8);
         result.__set_schema(mtd);
 
-        std::vector<CqlRow> rows;
-        rows.reserve(rs.rows().size());
-        for (auto&& row : rs.rows()) {
-            std::vector<Column> columns;
-            columns.reserve(rs.get_metadata().column_count());
-            for (unsigned i = 0; i < row.size(); i++) { // iterator
-                auto& col = rs.get_metadata().get_names()[i];
-                Column c;
-                c.__set_name(col->name->to_string());
-                auto& data = row[i];
-                if (data) {
-                    c.__set_value(bytes_to_string(*data));
-                }
-                columns.emplace_back(std::move(c));
+        struct visitor {
+            std::vector<CqlRow> _rows;
+            const cql3::metadata& _metadata;
+            std::vector<Column> _columns;
+            column_id _column_id;
+
+            void start_row() {
+                _column_id = 0;
+                _columns.reserve(_metadata.column_count());
             }
-            CqlRow r;
-            r.__set_key(std::string());
-            r.__set_columns(columns);
-            rows.emplace_back(std::move(r));
-        }
-        result.__set_rows(rows);
+            void accept_value(std::optional<query::result_bytes_view> cell) {
+                auto& col = _metadata.get_names()[_column_id++];
+
+                Column& c = _columns.emplace_back();
+                c.__set_name(col->name->to_string());
+                if (cell) {
+                    c.__set_value(bytes_to_string(*cell));
+                }
+
+            }
+            void end_row() {
+                CqlRow& r = _rows.emplace_back();
+                r.__set_key(std::string());
+                r.__set_columns(std::move(_columns));
+                _columns = { };
+            }
+        };
+
+        visitor v { {}, rs.get_metadata(), {}, {} };
+        rs.visit(v);
+        result.__set_rows(std::move(v._rows));
         return result;
     }
     static KsDef get_keyspace_definition(const keyspace& ks) {
@@ -1152,14 +1207,14 @@ private:
         }
         def.__set_cf_defs(cfs);
         def.__set_durable_writes(meta->durable_writes());
-        return std::move(def);
+        return def;
     }
-    static stdx::optional<index_metadata> index_metadata_from_thrift(const ColumnDef& def) {
-        stdx::optional<sstring> idx_name;
-        stdx::optional<std::unordered_map<sstring, sstring>> idx_opts;
-        stdx::optional<index_metadata_kind> idx_type;
+    static std::optional<index_metadata> index_metadata_from_thrift(const ColumnDef& def) {
+        std::optional<sstring> idx_name;
+        std::optional<std::unordered_map<sstring, sstring>> idx_opts;
+        std::optional<index_metadata_kind> idx_type;
         if (def.__isset.index_type) {
-            idx_type = [&def]() -> stdx::optional<index_metadata_kind> {
+            idx_type = [&def]() -> std::optional<index_metadata_kind> {
                 switch (def.index_type) {
                     case IndexType::type::KEYS: return index_metadata_kind::keys;
                     case IndexType::type::COMPOSITES: return index_metadata_kind::composites;
@@ -1175,11 +1230,11 @@ private:
             idx_opts = std::unordered_map<sstring, sstring>(def.index_options.begin(), def.index_options.end());
         }
         if (idx_name && idx_opts && idx_type) {
-            return index_metadata(idx_name.value(), idx_opts.value(), idx_type.value());
+            return index_metadata(idx_name.value(), idx_opts.value(), idx_type.value(), index_metadata::is_local_index::no);
         }
         return {};
     }
-    static schema_ptr schema_from_thrift(const CfDef& cf_def, const sstring ks_name, std::experimental::optional<utils::UUID> id = { }) {
+    static schema_ptr schema_from_thrift(const CfDef& cf_def, const sstring ks_name, std::optional<utils::UUID> id = { }) {
         thrift_validation::validate_cf_def(cf_def);
         schema_builder builder(ks_name, cf_def.name, id);
         schema_builder::default_names names(builder);
@@ -1217,7 +1272,7 @@ private:
             auto column_name_type = db::marshal::type_parser::parse(to_sstring(cf_def.comparator_type));
             for (const ColumnDef& col_def : cf_def.column_metadata) {
                 auto col_name = to_bytes(col_def.name);
-                column_name_type->validate(col_name);
+                column_name_type->validate(col_name, cql_serialization_format::latest());
                 builder.with_column(std::move(col_name), db::marshal::type_parser::parse(to_sstring(col_def.validation_class)),
                                     column_kind::regular_column);
                 auto index = index_metadata_from_thrift(col_def);
@@ -1289,8 +1344,8 @@ private:
             cf_defs.emplace_back(schema_from_thrift(cf_def, ks_def.name));
         }
         return make_lw_shared<keyspace_metadata>(
-            to_sstring(ks_def.name),
-            to_sstring(ks_def.strategy_class),
+            ks_def.name,
+            ks_def.strategy_class,
             std::map<sstring, sstring>{ks_def.strategy_options.begin(), ks_def.strategy_options.end()},
             ks_def.durable_writes,
             std::move(cf_defs));
@@ -1310,7 +1365,7 @@ private:
         return partition_key::from_exploded(composite.values());
     }
     static db::consistency_level cl_from_thrift(const ConsistencyLevel::type consistency_level) {
-        switch(consistency_level) {
+        switch (consistency_level) {
         case ConsistencyLevel::type::ONE: return db::consistency_level::ONE;
         case ConsistencyLevel::type::QUORUM: return db::consistency_level::QUORUM;
         case ConsistencyLevel::type::LOCAL_QUORUM: return db::consistency_level::LOCAL_QUORUM;
@@ -1341,9 +1396,18 @@ private:
             return { };
         }
     }
+    static void validate_key(const schema& s, const clustering_key& ck, bytes_view v) {
+        auto ck_size = ck.size(s);
+        if (ck_size > s.clustering_key_size()) {
+            throw std::runtime_error(format("Cell name of {}.{} has too many components, expected {} but got {} in 0x{}",
+                s.ks_name(), s.cf_name(), s.clustering_key_size(), ck_size, to_hex(v)));
+        }
+    }
     static clustering_key_prefix make_clustering_prefix(const schema& s, bytes_view v) {
         auto composite = composite_view(v, s.thrift().has_compound_comparator());
-        return clustering_key_prefix::from_exploded(composite.values());
+        auto ck = clustering_key_prefix::from_exploded(composite.values());
+        validate_key(s, ck, v);
+        return ck;
     }
     static query::clustering_range::bound make_clustering_bound(const schema& s, bytes_view v, composite::eoc exclusiveness_marker) {
         auto composite = composite_view(v, s.thrift().has_compound_comparator());
@@ -1352,15 +1416,16 @@ private:
             last = c.second;
             return c.first;
         }));
+        validate_key(s, ck, v);
         return query::clustering_range::bound(std::move(ck), last != exclusiveness_marker);
     }
     static range<clustering_key_prefix> make_clustering_range(const schema& s, const std::string& start, const std::string& end) {
         using bound = range<clustering_key_prefix>::bound;
-        stdx::optional<bound> start_bound;
+        std::optional<bound> start_bound;
         if (!start.empty()) {
             start_bound = make_clustering_bound(s, to_bytes_view(start), composite::eoc::end);
         }
-        stdx::optional<bound> end_bound;
+        std::optional<bound> end_bound;
         if (!end.empty()) {
             end_bound = make_clustering_bound(s, to_bytes_view(end), composite::eoc::start);
         }
@@ -1376,11 +1441,11 @@ private:
     }
     static range<bytes> make_range(const std::string& start, const std::string& end) {
         using bound = range<bytes>::bound;
-        stdx::optional<bound> start_bound;
+        std::optional<bound> start_bound;
         if (!start.empty()) {
             start_bound = bound(to_bytes(start));
         }
-        stdx::optional<bound> end_bound;
+        std::optional<bound> end_bound;
         if (!end.empty()) {
             end_bound = bound(to_bytes(end));
         }
@@ -1397,12 +1462,12 @@ private:
     // Adds the column_ids from the specified range of column_definitions to the out vector,
     // according to the order defined by reversed.
     template <typename Iterator>
-    static std::vector<column_id> add_columns(Iterator beg, Iterator end, bool reversed) {
+    static query::column_id_vector add_columns(Iterator beg, Iterator end, bool reversed) {
         auto range = boost::make_iterator_range(std::move(beg), std::move(end))
                      | boost::adaptors::filtered(std::mem_fn(&column_definition::is_atomic))
                      | boost::adaptors::transformed(std::mem_fn(&column_definition::id));
-        return reversed ? boost::copy_range<std::vector<column_id>>(range | boost::adaptors::reversed)
-                        : boost::copy_range<std::vector<column_id>>(range);
+        return reversed ? boost::copy_range<query::column_id_vector>(range | boost::adaptors::reversed)
+                        : boost::copy_range<query::column_id_vector>(range);
     }
     static query::partition_slice::option_set query_opts(const schema& s) {
         query::partition_slice::option_set opts;
@@ -1416,11 +1481,20 @@ private:
         opts.set(query::partition_slice::option::send_partition_key);
         return opts;
     }
-    static lw_shared_ptr<query::read_command> slice_pred_to_read_cmd(const schema& s, const SlicePredicate& predicate) {
+    static void sort_ranges(const schema& s, std::vector<query::clustering_range>& ranges) {
+        position_in_partition::less_compare less(s);
+        std::sort(ranges.begin(), ranges.end(),
+            [&less] (const query::clustering_range& r1, const query::clustering_range& r2) {
+                return less(
+                    position_in_partition_view::for_range_start(r1),
+                    position_in_partition_view::for_range_start(r2));
+            });
+    }
+    static lw_shared_ptr<query::read_command> slice_pred_to_read_cmd(service::storage_proxy& proxy, const schema& s, const SlicePredicate& predicate) {
         auto opts = query_opts(s);
         std::vector<query::clustering_range> clustering_ranges;
-        std::vector<column_id> regular_columns;
-        uint32_t per_partition_row_limit = query::max_rows;
+        query::column_id_vector regular_columns;
+        uint64_t per_partition_row_limit = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
         if (predicate.__isset.column_names) {
             thrift_validation::validate_column_names(predicate.column_names);
             auto unique_column_names = boost::copy_range<std::vector<std::string>>(predicate.column_names | boost::adaptors::uniqued);
@@ -1429,6 +1503,7 @@ private:
                     auto ckey = make_clustering_prefix(s, to_bytes(name));
                     clustering_ranges.emplace_back(query::clustering_range::make_singular(std::move(ckey)));
                 }
+                sort_ranges(s, clustering_ranges);
                 regular_columns.emplace_back(s.regular_begin()->id);
             } else {
                 clustering_ranges.emplace_back(query::clustering_range::make_open_ended_both_sides());
@@ -1447,7 +1522,7 @@ private:
                 std::swap(range.start, range.finish);
                 opts.set(query::partition_slice::option::reversed);
             }
-            per_partition_row_limit = static_cast<uint32_t>(range.count);
+            per_partition_row_limit = static_cast<uint64_t>(range.count);
             if (s.thrift().is_dynamic()) {
                 clustering_ranges.emplace_back(make_clustering_range_and_validate(s, range.start, range.finish));
                 regular_columns.emplace_back(s.regular_begin()->id);
@@ -1463,7 +1538,7 @@ private:
         }
         auto slice = query::partition_slice(std::move(clustering_ranges), {}, std::move(regular_columns), opts,
                 nullptr, cql_serialization_format::internal(), per_partition_row_limit);
-        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice));
+        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice), proxy.get_max_result_size(slice));
     }
     static ColumnParent column_path_to_column_parent(const ColumnPath& column_path) {
         ColumnParent ret;
@@ -1484,7 +1559,7 @@ private:
         dht::partition_range_vector ranges;
         for (auto&& key : keys) {
             auto pk = key_from_thrift(s, to_bytes_view(key));
-            auto dk = dht::global_partitioner().decorate_key(s, pk);
+            auto dk = dht::decorate_key(s, pk);
             ranges.emplace_back(dht::partition_range::make_singular(std::move(dk)));
         }
         return ranges;
@@ -1510,7 +1585,9 @@ private:
     static CounterColumn make_counter_column(const bytes& col, const query::result_atomic_cell_view& cell) {
         CounterColumn ret;
         ret.__set_name(bytes_to_string(col));
-        ret.__set_value(value_cast<int64_t>(long_type->deserialize_value(cell.value())));
+        cell.value().with_linearized([&] (bytes_view value_view) {
+            ret.__set_value(value_cast<int64_t>(long_type->deserialize_value(value_view)));
+        });
         return ret;
     }
     static ColumnOrSuperColumn counter_column_to_column_or_supercolumn(CounterColumn&& col) {
@@ -1555,7 +1632,7 @@ private:
     };
 
     template<typename Aggregator, query_order QueryOrder>
-    GCC6_CONCEPT( requires thrift::Aggregator<Aggregator> )
+    requires thrift::Aggregator<Aggregator>
     class column_visitor : public Aggregator {
         const schema& _s;
         const query::partition_slice& _slice;
@@ -1635,7 +1712,7 @@ private:
             throw make_exception<InvalidRequestException>("Start token + end key is not a supported key range");
         }
 
-        auto&& partitioner = dht::global_partitioner();
+        auto&& partitioner = s.get_partitioner();
 
         if (range.__isset.start_key && range.__isset.end_key) {
             auto start = range.start_key.empty()
@@ -1645,13 +1722,8 @@ private:
                      ? dht::ring_position::ending_at(dht::maximum_token())
                      : partitioner.decorate_key(s, key_from_thrift(s, to_bytes(range.end_key)));
             if (end.less_compare(s, start)) {
-                if (partitioner.preserves_order()) {
-                    throw make_exception<InvalidRequestException>(
-                            "Start key must sort before (or equal to) finish key in the partitioner");
-                } else {
-                    throw make_exception<InvalidRequestException>(
-                            "Start key's token sorts after end key's token. This is not allowed; you probably should not specify end key at all except with an ordered partitioner");
-                }
+                throw make_exception<InvalidRequestException>(
+                        "Start key's token sorts after end key's token. This is not allowed; you probably should not specify end key at all except with an ordered partitioner");
             }
             return {{dht::partition_range::bound(std::move(start), true),
                      dht::partition_range::bound(std::move(end), true)}};
@@ -1662,7 +1734,7 @@ private:
             auto start = range.start_key.empty()
                        ? dht::ring_position::starting_at(dht::minimum_token())
                        : partitioner.decorate_key(s, key_from_thrift(s, to_bytes(range.start_key)));
-            auto end = dht::ring_position::ending_at(partitioner.from_sstring(sstring(range.end_token)));
+            auto end = dht::ring_position::ending_at(dht::token::from_sstring(sstring(range.end_token)));
             if (end.token().is_minimum()) {
                 end = dht::ring_position::ending_at(dht::maximum_token());
             } else if (end.less_compare(s, start)) {
@@ -1673,8 +1745,8 @@ private:
         }
 
         // Token range can wrap; the start token is exclusive.
-        auto start = dht::ring_position::ending_at(partitioner.from_sstring(sstring(range.start_token)));
-        auto end = dht::ring_position::ending_at(partitioner.from_sstring(sstring(range.end_token)));
+        auto start = dht::ring_position::ending_at(dht::token::from_sstring(sstring(range.start_token)));
+        auto end = dht::ring_position::ending_at(dht::token::from_sstring(sstring(range.end_token)));
         if (end.token().is_minimum()) {
             end = dht::ring_position::ending_at(dht::maximum_token());
         }
@@ -1731,11 +1803,11 @@ private:
     }
     static range_tombstone make_range_tombstone(const schema& s, const SliceRange& range, tombstone tomb) {
         using bound = query::clustering_range::bound;
-        stdx::optional<bound> start_bound;
+        std::optional<bound> start_bound;
         if (!range.start.empty()) {
             start_bound = make_clustering_bound(s, to_bytes_view(range.start), composite::eoc::end);
         }
-        stdx::optional<bound> end_bound;
+        std::optional<bound> end_bound;
         if (!range.finish.empty()) {
             end_bound = make_clustering_bound(s, to_bytes_view(range.finish), composite::eoc::start);
         }
@@ -1787,7 +1859,7 @@ private:
     }
     static void add_live_cell(const schema& s, const Column& col, const column_definition& def, clustering_key_prefix ckey, mutation& m_to_apply) {
         thrift_validation::validate_column(col, def);
-        auto cell = atomic_cell::make_live(col.timestamp, to_bytes_view(col.value), maybe_ttl(s, col));
+        auto cell = atomic_cell::make_live(*def.type, col.timestamp, to_bytes_view(col.value), maybe_ttl(s, col));
         m_to_apply.set_clustered_cell(std::move(ckey), def, std::move(cell));
     }
     static void add_live_cell(const schema& s, const CounterColumn& col, const column_definition& def, clustering_key_prefix ckey, mutation& m_to_apply) {
@@ -1902,7 +1974,8 @@ class handler_factory : public CassandraCobSvIfFactory {
 public:
     explicit handler_factory(distributed<database>& db,
                              distributed<cql3::query_processor>& qp,
-                             auth::service& auth_service, ::timeout_config timeout_config)
+                             auth::service& auth_service,
+                             ::timeout_config timeout_config)
         : _db(db), _query_processor(qp), _auth_service(auth_service), _timeout_config(timeout_config) {}
     typedef CassandraCobSvIf Handler;
     virtual CassandraCobSvIf* getHandler(const ::apache::thrift::TConnectionInfo& connInfo) {
@@ -1914,6 +1987,7 @@ public:
 };
 
 std::unique_ptr<CassandraCobSvIfFactory>
-create_handler_factory(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service& auth_service, ::timeout_config timeout_config) {
+create_handler_factory(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service& auth_service,
+        ::timeout_config timeout_config) {
     return std::make_unique<handler_factory>(db, qp, auth_service, timeout_config);
 }

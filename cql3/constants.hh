@@ -46,7 +46,8 @@
 #include "cql3/operation.hh"
 #include "cql3/values.hh"
 #include "cql3/term.hh"
-#include "core/shared_ptr.hh"
+#include "mutation.hh"
+#include <seastar/core/shared_ptr.hh>
 
 namespace cql3 {
 
@@ -87,8 +88,8 @@ public:
         };
     public:
         static thread_local const ::shared_ptr<terminal> NULL_VALUE;
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) override {
-            if (!is_assignable(test_assignment(db, keyspace, receiver))) {
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override {
+            if (!is_assignable(test_assignment(db, keyspace, *receiver))) {
                 throw exceptions::invalid_request_exception("Invalid null value for counter increment/decrement");
             }
             return NULL_VALUE;
@@ -96,8 +97,8 @@ public:
 
         virtual assignment_testable::test_result test_assignment(database& db,
             const sstring& keyspace,
-            ::shared_ptr<column_specification> receiver) override {
-                return receiver->type->is_counter()
+            const column_specification& receiver) const override {
+                return receiver.type->is_counter()
                     ? assignment_testable::test_result::NOT_ASSIGNABLE
                     : assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         }
@@ -124,7 +125,7 @@ public:
             // calling in lexer setText() with an empty string and not calling
             // setText() at all.
             if (text.size() == 1 && text[0] == '\xFF') {
-                text.reset();
+                text = {};
             }
             return ::make_shared<literal>(type::STRING, text);
         }
@@ -153,38 +154,39 @@ public:
             return ::make_shared<literal>(type::DURATION, text);
         }
 
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver);
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
-        bytes parsed_value(data_type validator);
+        bytes parsed_value(data_type validator) const;
     public:
         const sstring& get_raw_text() {
             return _text;
         }
 
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver);
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const;
 
         virtual sstring to_string() const override {
-            return _type == type::STRING ? sstring(sprint("'%s'", _text)) : _text;
+            return _type == type::STRING ? sstring(format("'{}'", _text)) : _text;
         }
     };
 
     class marker : public abstract_marker {
     public:
-        marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+        marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
             : abstract_marker{bind_index, std::move(receiver)}
         {
-            assert(!_receiver->type->is_collection());
+            assert(!_receiver->type->is_collection() && !_receiver->type->is_user_type());
         }
 
         virtual cql3::raw_value_view bind_and_get(const query_options& options) override {
             try {
                 auto value = options.get_value_at(_bind_index);
                 if (value) {
-                    _receiver->type->validate(*value);
+                    _receiver->type->validate(*value, options.get_cql_serialization_format());
                 }
                 return value;
             } catch (const marshal_exception& e) {
-                throw exceptions::invalid_request_exception(e.what());
+                throw exceptions::invalid_request_exception(
+                        format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
             }
         }
 
@@ -210,7 +212,7 @@ public:
             if (value.is_null()) {
                 m.set_cell(prefix, column, std::move(make_dead_cell(params)));
             } else if (value.is_value()) {
-                m.set_cell(prefix, column, std::move(make_cell(*value, params)));
+                m.set_cell(prefix, column, std::move(make_cell(*column.type, *value, params)));
             }
         }
     };
@@ -242,7 +244,7 @@ public:
             }
             auto increment = value_cast<int64_t>(long_type->deserialize_value(*value));
             if (increment == std::numeric_limits<int64_t>::min()) {
-                throw exceptions::invalid_request_exception(sprint("The negation of %d overflows supported counter precision (signed 8 bytes integer)", increment));
+                throw exceptions::invalid_request_exception(format("The negation of {:d} overflows supported counter precision (signed 8 bytes integer)", increment));
             }
             m.set_cell(prefix, column, make_counter_update_cell(-increment, params));
         }

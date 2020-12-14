@@ -27,14 +27,57 @@
 #include "cql3/sets.hh"
 #include "cql3/lists.hh"
 #include "cql3/constants.hh"
+#include "cql3/user_types.hh"
+#include "cql3/type_json.hh"
+#include "database.hh"
+#include "types/map.hh"
+#include "types/set.hh"
+#include "types/list.hh"
+#include "types/user.hh"
+#include "concrete_types.hh"
+#include "as_json_function.hh"
+
+#include "error_injection_fcts.hh"
+
+namespace std {
+std::ostream& operator<<(std::ostream& os, const std::vector<data_type>& arg_types) {
+    for (size_t i = 0; i < arg_types.size(); ++i) {
+        if (i > 0) {
+            os << ", ";
+        }
+        os << arg_types[i]->as_cql3_type().to_string();
+    }
+    return os;
+}
+}
 
 namespace cql3 {
 namespace functions {
 
+static logging::logger log("cql3_fuctions");
+
+bool abstract_function::requires_thread() const { return false; }
+
+bool as_json_function::requires_thread() const { return false; }
+
 thread_local std::unordered_multimap<function_name, shared_ptr<function>> functions::_declared = init();
 
+void functions::clear_functions() noexcept {
+    functions::_declared = init();
+}
+
 std::unordered_multimap<function_name, shared_ptr<function>>
-functions::init() {
+functions::init() noexcept {
+    // It is possible that this function will fail with a
+    // std::bad_alloc causing std::unexpected to be called. Since
+    // this is used during initialization, we would have to abort
+    // somehow. We could add a try/catch to print a better error
+    // message before aborting, but that would produce a core file
+    // that has less information in it. Given how unlikely it is that
+    // we will run out of memory this early, having a better core dump
+    // if we do seems like a good trade-off.
+    memory::scoped_critical_alloc_section dfg;
+
     std::unordered_multimap<function_name, shared_ptr<function>> ret;
     auto declare = [&ret] (shared_ptr<function> f) { ret.emplace(f->name(), f); };
     declare(aggregate_fcts::make_count_rows_function());
@@ -42,101 +85,43 @@ functions::init() {
     declare(time_uuid_fcts::make_min_timeuuid_fct());
     declare(time_uuid_fcts::make_max_timeuuid_fct());
     declare(time_uuid_fcts::make_date_of_fct());
-    declare(time_uuid_fcts::make_unix_timestamp_of_fcf());
+    declare(time_uuid_fcts::make_unix_timestamp_of_fct());
+    declare(time_uuid_fcts::make_currenttimestamp_fct());
+    declare(time_uuid_fcts::make_currentdate_fct());
+    declare(time_uuid_fcts::make_currenttime_fct());
+    declare(time_uuid_fcts::make_currenttimeuuid_fct());
+    declare(time_uuid_fcts::make_timeuuidtodate_fct());
+    declare(time_uuid_fcts::make_timestamptodate_fct());
+    declare(time_uuid_fcts::make_timeuuidtotimestamp_fct());
+    declare(time_uuid_fcts::make_datetotimestamp_fct());
+    declare(time_uuid_fcts::make_timeuuidtounixtimestamp_fct());
+    declare(time_uuid_fcts::make_timestamptounixtimestamp_fct());
+    declare(time_uuid_fcts::make_datetounixtimestamp_fct());
     declare(make_uuid_fct());
 
     for (auto&& type : cql3_type::values()) {
         // Note: because text and varchar ends up being synonymous, our automatic makeToBlobFunction doesn't work
         // for varchar, so we special case it below. We also skip blob for obvious reasons.
-        if (type == cql3_type::varchar || type == cql3_type::blob) {
+        if (type == cql3_type::blob) {
             continue;
         }
         // counters are not supported yet
-        if (type->is_counter()) {
+        if (type.is_counter()) {
             warn(unimplemented::cause::COUNTERS);
             continue;
         }
 
-        declare(make_to_blob_function(type->get_type()));
-        declare(make_from_blob_function(type->get_type()));
+        declare(make_to_blob_function(type.get_type()));
+        declare(make_from_blob_function(type.get_type()));
     }
-    declare(aggregate_fcts::make_count_function<int8_t>());
-    declare(aggregate_fcts::make_max_function<int8_t>());
-    declare(aggregate_fcts::make_min_function<int8_t>());
-
-    declare(aggregate_fcts::make_count_function<int16_t>());
-    declare(aggregate_fcts::make_max_function<int16_t>());
-    declare(aggregate_fcts::make_min_function<int16_t>());
-
-    declare(aggregate_fcts::make_count_function<int32_t>());
-    declare(aggregate_fcts::make_max_function<int32_t>());
-    declare(aggregate_fcts::make_min_function<int32_t>());
-
-    declare(aggregate_fcts::make_count_function<int64_t>());
-    declare(aggregate_fcts::make_max_function<int64_t>());
-    declare(aggregate_fcts::make_min_function<int64_t>());
-
-    declare(aggregate_fcts::make_count_function<boost::multiprecision::cpp_int>());
-    declare(aggregate_fcts::make_max_function<boost::multiprecision::cpp_int>());
-    declare(aggregate_fcts::make_min_function<boost::multiprecision::cpp_int>());
-
-    declare(aggregate_fcts::make_count_function<big_decimal>());
-    declare(aggregate_fcts::make_max_function<big_decimal>());
-    declare(aggregate_fcts::make_min_function<big_decimal>());
-
-    declare(aggregate_fcts::make_count_function<float>());
-    declare(aggregate_fcts::make_max_function<float>());
-    declare(aggregate_fcts::make_min_function<float>());
-
-    declare(aggregate_fcts::make_count_function<double>());
-    declare(aggregate_fcts::make_max_function<double>());
-    declare(aggregate_fcts::make_min_function<double>());
-
-    declare(aggregate_fcts::make_count_function<sstring>());
-    declare(aggregate_fcts::make_max_function<sstring>());
-    declare(aggregate_fcts::make_min_function<sstring>());
-
-    declare(aggregate_fcts::make_count_function<simple_date_native_type>());
-    declare(aggregate_fcts::make_max_function<simple_date_native_type>());
-    declare(aggregate_fcts::make_min_function<simple_date_native_type>());
-
-    declare(aggregate_fcts::make_count_function<timestamp_native_type>());
-    declare(aggregate_fcts::make_max_function<timestamp_native_type>());
-    declare(aggregate_fcts::make_min_function<timestamp_native_type>());
-
-    declare(aggregate_fcts::make_count_function<timeuuid_native_type>());
-    declare(aggregate_fcts::make_max_function<timeuuid_native_type>());
-    declare(aggregate_fcts::make_min_function<timeuuid_native_type>());
-
-    declare(aggregate_fcts::make_count_function<utils::UUID>());
-    declare(aggregate_fcts::make_max_function<utils::UUID>());
-    declare(aggregate_fcts::make_min_function<utils::UUID>());
-
-    //FIXME:
-    //declare(aggregate_fcts::make_count_function<bytes>());
-    //declare(aggregate_fcts::make_max_function<bytes>());
-    //declare(aggregate_fcts::make_min_function<bytes>());
-
-    // FIXME: more count/min/max
 
     declare(make_varchar_as_blob_fct());
     declare(make_blob_as_varchar_fct());
-    declare(aggregate_fcts::make_sum_function<int8_t>());
-    declare(aggregate_fcts::make_sum_function<int16_t>());
-    declare(aggregate_fcts::make_sum_function<int32_t>());
-    declare(aggregate_fcts::make_sum_function<int64_t>());
-    declare(aggregate_fcts::make_sum_function<float>());
-    declare(aggregate_fcts::make_sum_function<double>());
-    declare(aggregate_fcts::make_sum_function<boost::multiprecision::cpp_int>());
-    declare(aggregate_fcts::make_sum_function<big_decimal>());
-    declare(aggregate_fcts::make_avg_function<int8_t>());
-    declare(aggregate_fcts::make_avg_function<int16_t>());
-    declare(aggregate_fcts::make_avg_function<int32_t>());
-    declare(aggregate_fcts::make_avg_function<int64_t>());
-    declare(aggregate_fcts::make_avg_function<float>());
-    declare(aggregate_fcts::make_avg_function<double>());
-    declare(aggregate_fcts::make_avg_function<boost::multiprecision::cpp_int>());
-    declare(aggregate_fcts::make_avg_function<big_decimal>());
+    add_agg_functions(ret);
+
+    declare(error_injection::make_enable_injection_function());
+    declare(error_injection::make_disable_injection_function());
+    declare(error_injection::make_enabled_injections_function());
 
     // also needed for smp:
 #if 0
@@ -145,20 +130,42 @@ functions::init() {
     return ret;
 }
 
-shared_ptr<column_specification>
+void functions::add_function(shared_ptr<function> func) {
+    if (find(func->name(), func->arg_types())) {
+        throw std::logic_error(format("duplicated function {}", func));
+    }
+    _declared.emplace(func->name(), func);
+}
+
+template <typename F>
+void functions::with_udf_iter(const function_name& name, const std::vector<data_type>& arg_types, F&& f) {
+    auto i = find_iter(name, arg_types);
+    if (i == _declared.end() || i->second->is_native()) {
+        log.error("attempted to remove or alter non existent user defined function {}({})", name, arg_types);
+        return;
+    }
+    f(i);
+}
+
+void functions::replace_function(shared_ptr<function> func) {
+    with_udf_iter(func->name(), func->arg_types(), [func] (functions::declared_t::iterator i) {
+        i->second = std::move(func);
+    });
+}
+
+void functions::remove_function(const function_name& name, const std::vector<data_type>& arg_types) {
+    with_udf_iter(name, arg_types, [] (functions::declared_t::iterator i) { _declared.erase(i); });
+}
+
+lw_shared_ptr<column_specification>
 functions::make_arg_spec(const sstring& receiver_ks, const sstring& receiver_cf,
         const function& fun, size_t i) {
     auto&& name = boost::lexical_cast<std::string>(fun.name());
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-    return ::make_shared<column_specification>(receiver_ks,
+    return make_lw_shared<column_specification>(receiver_ks,
                                    receiver_cf,
-                                   ::make_shared<column_identifier>(sprint("arg%d(%s)", i, name), true),
+                                   ::make_shared<column_identifier>(format("arg{:d}({})", i, name), true),
                                    fun.arg_types()[i]);
-}
-
-int
-functions::get_overload_count(const function_name& name) {
-    return _declared.count(name);
 }
 
 inline
@@ -166,7 +173,7 @@ shared_ptr<function>
 make_to_json_function(data_type t) {
     return make_native_scalar_function<true>("tojson", utf8_type, {t},
             [t](cql_serialization_format sf, const std::vector<bytes_opt>& parameters) -> bytes_opt {
-        return utf8_type->decompose(t->to_json_string(parameters[0].value()));
+        return utf8_type->decompose(to_json_string(*t, parameters[0]));
     });
 }
 
@@ -175,12 +182,12 @@ shared_ptr<function>
 make_from_json_function(database& db, const sstring& keyspace, data_type t) {
     return make_native_scalar_function<true>("fromjson", t, {utf8_type},
             [&db, &keyspace, t](cql_serialization_format sf, const std::vector<bytes_opt>& parameters) -> bytes_opt {
-        Json::Value json_value = json::to_json_value(utf8_type->to_string(parameters[0].value()));
+        rjson::value json_value = rjson::parse(utf8_type->to_string(parameters[0].value()));
         bytes_opt parsed_json_value;
-        if (!json_value.isNull()) {
-            parsed_json_value.emplace(t->from_json_object(json_value, sf));
+        if (!json_value.IsNull()) {
+            parsed_json_value.emplace(from_json_object(*t, json_value, sf));
         }
-        return std::move(parsed_json_value);
+        return parsed_json_value;
     });
 }
 
@@ -191,11 +198,13 @@ functions::get(database& db,
         const std::vector<shared_ptr<assignment_testable>>& provided_args,
         const sstring& receiver_ks,
         const sstring& receiver_cf,
-        shared_ptr<column_specification> receiver) {
+        const column_specification* receiver) {
 
     static const function_name TOKEN_FUNCTION_NAME = function_name::native_function("token");
     static const function_name TO_JSON_FUNCTION_NAME = function_name::native_function("tojson");
     static const function_name FROM_JSON_FUNCTION_NAME = function_name::native_function("fromjson");
+    static const function_name MIN_FUNCTION_NAME = function_name::native_function("min");
+    static const function_name MAX_FUNCTION_NAME = function_name::native_function("max");
 
     if (name.has_keyspace()
                 ? name == TOKEN_FUNCTION_NAME
@@ -226,6 +235,40 @@ functions::get(database& db,
             throw exceptions::invalid_request_exception("fromJson() can only be called if receiver type is known");
         }
         return make_from_json_function(db, keyspace, receiver->type);
+    }
+
+    if (name.has_keyspace()
+                ? name == MIN_FUNCTION_NAME
+                : name.name == MIN_FUNCTION_NAME.name) {
+        if (provided_args.size() != 1) {
+            throw exceptions::invalid_request_exception("min() operates on 1 argument at a time");
+        }
+        selection::selector *sp = dynamic_cast<selection::selector*>(provided_args[0].get());
+        if (!sp) {
+            throw exceptions::invalid_request_exception("min() is only valid in SELECT clause");
+        }
+        const data_type arg_type = sp->get_type();
+        if (arg_type->is_collection() || arg_type->is_tuple() || arg_type->is_user_type()) {
+            // `min()' function is created on demand for arguments of compound types.
+            return aggregate_fcts::make_min_dynamic_function(arg_type);
+        }
+    }
+
+    if (name.has_keyspace()
+                ? name == MAX_FUNCTION_NAME
+                : name.name == MAX_FUNCTION_NAME.name) {
+        if (provided_args.size() != 1) {
+            throw exceptions::invalid_request_exception("max() operates on 1 argument at a time");
+        }
+        selection::selector *sp = dynamic_cast<selection::selector*>(provided_args[0].get());
+        if (!sp) {
+            throw exceptions::invalid_request_exception("max() is only valid in SELECT clause");
+        }
+        const data_type arg_type = sp->get_type();
+        if (arg_type->is_collection() || arg_type->is_tuple() || arg_type->is_user_type()) {
+            // `max()' function is created on demand for arguments of compound types.
+            return aggregate_fcts::make_max_dynamic_function(arg_type);
+        }
     }
 
     std::vector<shared_ptr<function>> candidates;
@@ -272,36 +315,43 @@ functions::get(database& db,
 
     if (compatibles.empty()) {
         throw exceptions::invalid_request_exception(
-                sprint("Invalid call to function %s, none of its type signatures match (known type signatures: %s)",
+                format("Invalid call to function {}, none of its type signatures match (known type signatures: {})",
                                                         name, join(", ", candidates)));
     }
 
     if (compatibles.size() > 1) {
         throw exceptions::invalid_request_exception(
-                sprint("Ambiguous call to function %s (can be matched by following signatures: %s): use type casts to disambiguate",
+                format("Ambiguous call to function {} (can be matched by following signatures: {}): use type casts to disambiguate",
                     name, join(", ", compatibles)));
     }
 
     return std::move(compatibles[0]);
 }
 
-std::vector<shared_ptr<function>>
+boost::iterator_range<functions::declared_t::iterator>
 functions::find(const function_name& name) {
-    auto range = _declared.equal_range(name);
-    std::vector<shared_ptr<function>> ret;
-    for (auto i = range.first; i != range.second; ++i) {
-        ret.push_back(i->second);
+    assert(name.has_keyspace()); // : "function name not fully qualified";
+    auto pair = _declared.equal_range(name);
+    return boost::make_iterator_range(pair.first, pair.second);
+}
+
+functions::declared_t::iterator
+functions::find_iter(const function_name& name, const std::vector<data_type>& arg_types) {
+    auto range = find(name);
+    auto i = std::find_if(range.begin(), range.end(), [&] (const std::pair<const function_name, shared_ptr<function>>& d) {
+        return type_equals(d.second->arg_types(), arg_types);
+    });
+    if (i == range.end()) {
+        return _declared.end();
     }
-    return ret;
+    return i;
 }
 
 shared_ptr<function>
 functions::find(const function_name& name, const std::vector<data_type>& arg_types) {
-    assert(name.has_keyspace()); // : "function name not fully qualified";
-    for (auto&& f : find(name)) {
-        if (type_equals(f->arg_types(), arg_types)) {
-            return f;
-        }
+    auto i = find_iter(name, arg_types);
+    if (i != _declared.end()) {
+        return i->second;
     }
     return {};
 }
@@ -317,7 +367,7 @@ functions::validate_types(database& db,
                           const sstring& receiver_cf) {
     if (provided_args.size() != fun->arg_types().size()) {
         throw exceptions::invalid_request_exception(
-                sprint("Invalid number of arguments in call to function %s: %d required but %d provided",
+                format("Invalid number of arguments in call to function {}: {:d} required but {:d} provided",
                         fun->name(), fun->arg_types().size(), provided_args.size()));
     }
 
@@ -331,9 +381,9 @@ functions::validate_types(database& db,
         }
 
         auto&& expected = make_arg_spec(receiver_ks, receiver_cf, *fun, i);
-        if (!is_assignable(provided->test_assignment(db, keyspace, expected))) {
+        if (!is_assignable(provided->test_assignment(db, keyspace, *expected))) {
             throw exceptions::invalid_request_exception(
-                    sprint("Type error: %s cannot be passed as argument %d of function %s of type %s",
+                    format("Type error: {} cannot be passed as argument {:d} of function {} of type {}",
                             provided, i, fun->name(), expected->type->as_cql3_type()));
         }
     }
@@ -358,7 +408,7 @@ functions::match_arguments(database& db, const sstring& keyspace,
             continue;
         }
         auto&& expected = make_arg_spec(receiver_ks, receiver_cf, *fun, i);
-        auto arg_res = provided->test_assignment(db, keyspace, expected);
+        auto arg_res = provided->test_assignment(db, keyspace, *expected);
         if (arg_res == assignment_testable::test_result::NOT_ASSIGNABLE) {
             return assignment_testable::test_result::NOT_ASSIGNABLE;
         }
@@ -371,24 +421,11 @@ functions::match_arguments(database& db, const sstring& keyspace,
 
 bool
 functions::type_equals(const std::vector<data_type>& t1, const std::vector<data_type>& t2) {
-#if 0
-    if (t1.size() != t2.size())
-        return false;
-    for (int i = 0; i < t1.size(); i ++)
-        if (!typeEquals(t1.get(i), t2.get(i)))
-            return false;
-    return true;
-#endif
-    abort();
-}
-
-bool
-function_call::uses_function(const sstring& ks_name, const sstring& function_name) const {
-    return _fun->uses_function(ks_name, function_name);
+    return t1 == t2;
 }
 
 void
-function_call::collect_marker_specification(shared_ptr<variable_specifications> bound_names) {
+function_call::collect_marker_specification(variable_specifications& bound_names) const {
     for (auto&& t : _terms) {
         t->collect_marker_specification(bound_names);
     }
@@ -408,12 +445,12 @@ function_call::bind_and_get(const query_options& options) {
         // simplify things.
         auto val = t->bind_and_get(options);
         if (!val) {
-            throw exceptions::invalid_request_exception(sprint("Invalid null value for argument to %s", *_fun));
+            throw exceptions::invalid_request_exception(format("Invalid null value for argument to {}", *_fun));
         }
         buffers.push_back(std::move(to_bytes_opt(val)));
     }
     auto result = execute_internal(options.get_cql_serialization_format(), *_fun, std::move(buffers));
-    return options.make_temporary(cql3::raw_value::make_value(result));
+    return cql3::raw_value_view::make_temporary(cql3::raw_value::make_value(result));
 }
 
 bytes_opt
@@ -422,13 +459,13 @@ function_call::execute_internal(cql_serialization_format sf, scalar_function& fu
     try {
         // Check the method didn't lied on it's declared return type
         if (result) {
-            fun.return_type()->validate(*result);
+            fun.return_type()->validate(*result, sf);
         }
         return result;
     } catch (marshal_exception& e) {
-        throw runtime_exception(sprint("Return of function %s (%s) is not a valid value for its declared return type %s",
+        throw runtime_exception(format("Return of function {} ({}) is not a valid value for its declared return type {}",
                                        fun, to_hex(result),
-                                       *fun.return_type()->as_cql3_type()
+                                       fun.return_type()->as_cql3_type()
                                        ));
     }
 }
@@ -445,36 +482,47 @@ function_call::contains_bind_marker() const {
 
 shared_ptr<terminal>
 function_call::make_terminal(shared_ptr<function> fun, cql3::raw_value result, cql_serialization_format sf)  {
-    if (!dynamic_pointer_cast<const collection_type_impl>(fun->return_type())) {
-        return ::make_shared<constants::value>(std::move(result));
-    }
+    static constexpr auto to_buffer = [] (const cql3::raw_value& v) {
+        if (v) {
+            return fragmented_temporary_buffer::view{bytes_view{*v}};
+        }
+        return fragmented_temporary_buffer::view{};
+    };
 
-    auto ctype = static_pointer_cast<const collection_type_impl>(fun->return_type());
-    bytes_view res;
-    if (result) {
-        res = *result;
+    return visit(*fun->return_type(), make_visitor(
+    [&] (const list_type_impl& ltype) -> shared_ptr<terminal> {
+        return make_shared<lists::value>(lists::value::from_serialized(to_buffer(result), ltype, sf));
+    },
+    [&] (const set_type_impl& stype) -> shared_ptr<terminal> {
+        return make_shared<sets::value>(sets::value::from_serialized(to_buffer(result), stype, sf));
+    },
+    [&] (const map_type_impl& mtype) -> shared_ptr<terminal> {
+        return make_shared<maps::value>(maps::value::from_serialized(to_buffer(result), mtype, sf));
+    },
+    [&] (const user_type_impl& utype) -> shared_ptr<terminal> {
+        // TODO (kbraun): write a test for this case when User Defined Functions are implemented
+        return make_shared<user_types::value>(user_types::value::from_serialized(to_buffer(result), utype));
+    },
+    [&] (const abstract_type& type) -> shared_ptr<terminal> {
+        if (type.is_collection()) {
+            throw std::runtime_error(format("function_call::make_terminal: unhandled collection type {}", type.name()));
+        }
+        return make_shared<constants::value>(std::move(result));
     }
-    if (&ctype->_kind == &collection_type_impl::kind::list) {
-        return make_shared(lists::value::from_serialized(std::move(res), static_pointer_cast<const list_type_impl>(ctype), sf));
-    } else if (&ctype->_kind == &collection_type_impl::kind::set) {
-        return make_shared(sets::value::from_serialized(std::move(res), static_pointer_cast<const set_type_impl>(ctype), sf));
-    } else if (&ctype->_kind == &collection_type_impl::kind::map) {
-        return make_shared(maps::value::from_serialized(std::move(res), static_pointer_cast<const map_type_impl>(ctype), sf));
-    }
-    abort();
+    ));
 }
 
 ::shared_ptr<term>
-function_call::raw::prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) {
+function_call::raw::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     std::vector<shared_ptr<assignment_testable>> args;
     args.reserve(_terms.size());
     std::transform(_terms.begin(), _terms.end(), std::back_inserter(args),
             [] (auto&& x) -> shared_ptr<assignment_testable> {
         return x;
     });
-    auto&& fun = functions::functions::get(db, keyspace, _name, args, receiver->ks_name, receiver->cf_name, receiver);
+    auto&& fun = functions::functions::get(db, keyspace, _name, args, receiver->ks_name, receiver->cf_name, receiver.get());
     if (!fun) {
-        throw exceptions::invalid_request_exception(sprint("Unknown function %s called", _name));
+        throw exceptions::invalid_request_exception(format("Unknown function {} called", _name));
     }
     if (fun->is_aggregate()) {
         throw exceptions::invalid_request_exception("Aggregation function are not supported in the where clause");
@@ -486,13 +534,13 @@ function_call::raw::prepare(database& db, const sstring& keyspace, ::shared_ptr<
     // Functions.get() will complain if no function "name" type check with the provided arguments.
     // We still have to validate that the return type matches however
     if (!receiver->type->is_value_compatible_with(*scalar_fun->return_type())) {
-        throw exceptions::invalid_request_exception(sprint("Type error: cannot assign result of function %s (type %s) to %s (type %s)",
+        throw exceptions::invalid_request_exception(format("Type error: cannot assign result of function {} (type {}) to {} (type {})",
                                                     fun->name(), fun->return_type()->as_cql3_type(),
                                                     receiver->name, receiver->type->as_cql3_type()));
     }
 
     if (scalar_fun->arg_types().size() != _terms.size()) {
-        throw exceptions::invalid_request_exception(sprint("Incorrect number of arguments specified for function %s (expected %d, found %d)",
+        throw exceptions::invalid_request_exception(format("Incorrect number of arguments specified for function {} (expected {:d}, found {:d})",
                                                     fun->name(), fun->arg_types().size(), _terms.size()));
     }
 
@@ -530,16 +578,16 @@ function_call::raw::execute(scalar_function& fun, std::vector<shared_ptr<term>> 
 }
 
 assignment_testable::test_result
-function_call::raw::test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
+function_call::raw::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
     // Note: Functions.get() will return null if the function doesn't exist, or throw is no function matching
     // the arguments can be found. We may get one of those if an undefined/wrong function is used as argument
     // of another, existing, function. In that case, we return true here because we'll throw a proper exception
     // later with a more helpful error message that if we were to return false here.
     try {
-        auto&& fun = functions::get(db, keyspace, _name, _terms, receiver->ks_name, receiver->cf_name, receiver);
-        if (fun && receiver->type->equals(fun->return_type())) {
+        auto&& fun = functions::get(db, keyspace, _name, _terms, receiver.ks_name, receiver.cf_name, &receiver);
+        if (fun && receiver.type == fun->return_type()) {
             return assignment_testable::test_result::EXACT_MATCH;
-        } else if (!fun || receiver->type->is_value_compatible_with(*fun->return_type())) {
+        } else if (!fun || receiver.type->is_value_compatible_with(*fun->return_type())) {
             return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         } else {
             return assignment_testable::test_result::NOT_ASSIGNABLE;
@@ -551,7 +599,7 @@ function_call::raw::test_assignment(database& db, const sstring& keyspace, share
 
 sstring
 function_call::raw::to_string() const {
-    return sprint("%s(%s)", _name, join(", ", _terms));
+    return format("{}({})", _name, join(", ", _terms));
 }
 
 

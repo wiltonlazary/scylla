@@ -21,13 +21,14 @@
 
 #pragma once
 
-#include <experimental/string_view>
+#include <string_view>
 #include <memory>
 #include <optional>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/bool_class.hh>
+#include <seastar/core/sharded.hh>
 
 #include "auth/authenticator.hh"
 #include "auth/authorizer.hh"
@@ -35,18 +36,14 @@
 #include "auth/permissions_cache.hh"
 #include "auth/role_manager.hh"
 #include "seastarx.hh"
-#include "stdx.hh"
 
 namespace cql3 {
 class query_processor;
 }
 
-namespace db {
-class config;
-}
-
 namespace service {
 class migration_manager;
+class migration_notifier;
 class migration_listener;
 }
 
@@ -55,8 +52,6 @@ namespace auth {
 class role_or_anonymous;
 
 struct service_config final {
-    static service_config from_db_config(const db::config&);
-
     sstring authorizer_java_name;
     sstring authenticator_java_name;
     sstring role_manager_java_name;
@@ -83,13 +78,15 @@ public:
 ///
 /// All state associated with access-control is stored externally to any particular instance of this class.
 ///
-class service final {
+/// peering_sharded_service inheritance is needed to be able to access shard local authentication service
+/// given an object from another shard. Used for bouncing lwt requests to correct shard.
+class service final : public seastar::peering_sharded_service<service> {
     permissions_cache_config _permissions_cache_config;
     std::unique_ptr<permissions_cache> _permissions_cache;
 
     cql3::query_processor& _qp;
 
-    ::service::migration_manager& _migration_manager;
+    ::service::migration_notifier& _mnotifier;
 
     std::unique_ptr<authorizer> _authorizer;
 
@@ -104,7 +101,7 @@ public:
     service(
             permissions_cache_config,
             cql3::query_processor&,
-            ::service::migration_manager&,
+            ::service::migration_notifier&,
             std::unique_ptr<authorizer>,
             std::unique_ptr<authenticator>,
             std::unique_ptr<role_manager>);
@@ -117,10 +114,11 @@ public:
     service(
             permissions_cache_config,
             cql3::query_processor&,
+            ::service::migration_notifier&,
             ::service::migration_manager&,
             const service_config&);
 
-    future<> start();
+    future<> start(::service::migration_manager&);
 
     future<> stop();
 
@@ -141,13 +139,13 @@ public:
     ///
     /// \returns an exceptional future with \ref nonexistant_role if the role does not exist.
     ///
-    future<bool> has_superuser(stdx::string_view role_name) const;
+    future<bool> has_superuser(std::string_view role_name) const;
 
     ///
     /// Return the set of all roles granted to the given role, including itself and roles granted through other roles.
     ///
     /// \returns an exceptional future with \ref nonexistent_role if the role does not exist.
-    future<role_set> get_roles(stdx::string_view role_name) const;
+    future<role_set> get_roles(std::string_view role_name) const;
 
     future<bool> exists(const resource&) const;
 
@@ -166,7 +164,7 @@ public:
 private:
     future<bool> has_existing_legacy_users() const;
 
-    future<> create_keyspace_if_missing() const;
+    future<> create_keyspace_if_missing(::service::migration_manager& mm) const;
 };
 
 future<bool> has_superuser(const service&, const authenticated_user&);
@@ -183,10 +181,21 @@ future<permission_set> get_permissions(const service&, const authenticated_user&
 ///
 bool is_enforcing(const service&);
 
+/// A description of a CQL command from which auth::service can tell whether or not this command could endanger
+/// internal data on which auth::service depends.
+struct command_desc {
+    auth::permission permission; ///< Nature of the command's alteration.
+    const ::auth::resource& resource; ///< Resource impacted by this command.
+    enum class type {
+        ALTER_WITH_OPTS, ///< Command is ALTER ... WITH ...
+        OTHER
+    } type_ = type::OTHER;
+};
+
 ///
 /// Protected resources cannot be modified even if the performer has permissions to do so.
 ///
-bool is_protected(const service&, const resource&) noexcept;
+bool is_protected(const service&, command_desc) noexcept;
 
 ///
 /// Create a role with optional authentication information.
@@ -197,7 +206,7 @@ bool is_protected(const service&, const resource&) noexcept;
 ///
 future<> create_role(
         const service&,
-        stdx::string_view name,
+        std::string_view name,
         const role_config&,
         const authentication_options&);
 
@@ -210,7 +219,7 @@ future<> create_role(
 ///
 future<> alter_role(
         const service&,
-        stdx::string_view name,
+        std::string_view name,
         const role_config_update&,
         const authentication_options&);
 
@@ -219,20 +228,20 @@ future<> alter_role(
 ///
 /// \returns an exceptional future with \ref nonexistant_role if the named role does not exist.
 ///
-future<> drop_role(const service&, stdx::string_view name);
+future<> drop_role(const service&, std::string_view name);
 
 ///
 /// Check if `grantee` has been granted the named role.
 ///
 /// \returns an exceptional future with \ref nonexistent_role if `grantee` or `name` do not exist.
 ///
-future<bool> has_role(const service&, stdx::string_view grantee, stdx::string_view name);
+future<bool> has_role(const service&, std::string_view grantee, std::string_view name);
 ///
 /// Check if the authenticated user has been granted the named role.
 ///
 /// \returns an exceptional future with \ref nonexistent_role if the user or `name` do not exist.
 ///
-future<bool> has_role(const service&, const authenticated_user&, stdx::string_view name);
+future<bool> has_role(const service&, const authenticated_user&, std::string_view name);
 
 ///
 /// \returns an exceptional future with \ref nonexistent_role if the named role does not exist.
@@ -242,7 +251,7 @@ future<bool> has_role(const service&, const authenticated_user&, stdx::string_vi
 ///
 future<> grant_permissions(
         const service&,
-        stdx::string_view role_name,
+        std::string_view role_name,
         permission_set,
         const resource&);
 
@@ -254,7 +263,7 @@ future<> grant_permissions(
 /// \returns an exceptional future with \ref unsupported_authorization_operation if granting permissions is not
 /// supported.
 ///
-future<> grant_applicable_permissions(const service&, stdx::string_view role_name, const resource&);
+future<> grant_applicable_permissions(const service&, std::string_view role_name, const resource&);
 future<> grant_applicable_permissions(const service&, const authenticated_user&, const resource&);
 
 ///
@@ -265,7 +274,7 @@ future<> grant_applicable_permissions(const service&, const authenticated_user&,
 ///
 future<> revoke_permissions(
         const service&,
-        stdx::string_view role_name,
+        std::string_view role_name,
         permission_set,
         const resource&);
 
@@ -290,7 +299,7 @@ using recursive_permissions = bool_class<struct recursive_permissions_tag>;
 future<std::vector<permission_details>> list_filtered_permissions(
         const service&,
         permission_set,
-        std::optional<stdx::string_view> role_name,
+        std::optional<std::string_view> role_name,
         const std::optional<std::pair<resource, recursive_permissions>>& resource_filter);
 
 }

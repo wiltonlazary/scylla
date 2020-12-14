@@ -20,113 +20,34 @@
  */
 
 #include "init.hh"
-#include "message/messaging_service.hh"
 #include "gms/failure_detector.hh"
 #include "gms/gossiper.hh"
-#include "service/storage_service.hh"
 #include "to_string.hh"
 #include "gms/inet_address.hh"
+#include "seastarx.hh"
+#include "db/config.hh"
 
 logging::logger startlog("init");
 
-//
-// NOTE: there functions are (temporarily)
-// duplicated in cql_test_env.cc
-// until proper shutdown is done.
-
-void init_storage_service(distributed<database>& db, sharded<auth::service>& auth_service, sharded<db::system_distributed_keyspace>& sys_dist_ks) {
-    service::init_storage_service(db, auth_service, sys_dist_ks).get();
-    // #293 - do not stop anything
-    //engine().at_exit([] { return service::deinit_storage_service(); });
-}
-
-void init_ms_fd_gossiper(sstring listen_address_in
-                , uint16_t storage_port
-                , uint16_t ssl_storage_port
-                , bool tcp_nodelay_inter_dc
-                , sstring ms_encrypt_what
-                , sstring ms_trust_store
-                , sstring ms_cert
-                , sstring ms_key
-                , sstring ms_tls_prio
-                , bool ms_client_auth
-                , sstring ms_compress
+void init_gossiper(sharded<gms::gossiper>& gossiper
+                , db::config& cfg
+                , sstring listen_address_in
                 , db::seed_provider_type seed_provider
-                , sstring cluster_name
-                , double phi
-                , bool sltba)
-{
-    const auto listen = gms::inet_address::lookup(listen_address_in).get0();
+                , sstring cluster_name) {
+    auto preferred = cfg.listen_interface_prefer_ipv6() ? std::make_optional(net::inet_address::family::INET6) : std::nullopt;
+    auto family = cfg.enable_ipv6_dns_lookup() || preferred ? std::nullopt : std::make_optional(net::inet_address::family::INET);
+    const auto listen = gms::inet_address::lookup(listen_address_in, family).get0();
 
-    using encrypt_what = netw::messaging_service::encrypt_what;
-    using compress_what = netw::messaging_service::compress_what;
-    using tcp_nodelay_what = netw::messaging_service::tcp_nodelay_what;
-    using namespace seastar::tls;
-
-    encrypt_what ew = encrypt_what::none;
-    if (ms_encrypt_what == "all") {
-        ew = encrypt_what::all;
-    } else if (ms_encrypt_what == "dc") {
-        ew = encrypt_what::dc;
-    } else if (ms_encrypt_what == "rack") {
-        ew = encrypt_what::rack;
-    }
-
-    compress_what cw = compress_what::none;
-    if (ms_compress == "all") {
-        cw = compress_what::all;
-    } else if (ms_compress == "dc") {
-        cw = compress_what::dc;
-    }
-
-    tcp_nodelay_what tndw = tcp_nodelay_what::all;
-    if (!tcp_nodelay_inter_dc) {
-        tndw = tcp_nodelay_what::local;
-    }
-
-    future<> f = make_ready_future<>();
-    std::shared_ptr<credentials_builder> creds;
-
-    if (ew != encrypt_what::none) {
-        creds = std::make_shared<credentials_builder>();
-        creds->set_dh_level(dh_params::level::MEDIUM);
-
-        creds->set_x509_key_file(ms_cert, ms_key, x509_crt_format::PEM).get();
-        if (ms_trust_store.empty()) {
-            creds->set_system_trust().get();
-        } else {
-            creds->set_x509_trust_file(ms_trust_store, x509_crt_format::PEM).get();
-        }
-
-        if (!ms_tls_prio.empty()) {
-            creds->set_priority_string(ms_tls_prio);
-        }
-        if (ms_client_auth) {
-            creds->set_client_auth(seastar::tls::client_auth::REQUIRE);
-        }
-    }
-
-    // Init messaging_service
-    // Delay listening messaging_service until gossip message handlers are registered
-    bool listen_now = false;
-    netw::get_messaging_service().start(listen, storage_port, ew, cw, tndw, ssl_storage_port, creds, sltba, listen_now).get();
-
-    // #293 - do not stop anything
-    //engine().at_exit([] { return netw::get_messaging_service().stop(); });
-    // Init failure_detector
-    gms::get_failure_detector().start(std::move(phi)).get();
-    // #293 - do not stop anything
-    //engine().at_exit([]{ return gms::get_failure_detector().stop(); });
     // Init gossiper
     std::set<gms::inet_address> seeds;
-    if (seed_provider.parameters.count("seeds") > 0) {
+    if (seed_provider.parameters.contains("seeds")) {
         size_t begin = 0;
         size_t next = 0;
         sstring seeds_str = seed_provider.parameters.find("seeds")->second;
         while (begin < seeds_str.length() && begin != (next=seeds_str.find(",",begin))) {
             auto seed = boost::trim_copy(seeds_str.substr(begin,next-begin));
             try {
-                seeds.emplace(gms::inet_address::lookup(seed).get0());
+                seeds.emplace(gms::inet_address::lookup(seed, family, preferred).get0());
             } catch (...) {
                 startlog.error("Bad configuration: invalid value in 'seeds': '{}': {}", seed, std::current_exception());
                 throw bad_configuration_error();
@@ -138,18 +59,22 @@ void init_ms_fd_gossiper(sstring listen_address_in
         seeds.emplace(gms::inet_address("127.0.0.1"));
     }
     auto broadcast_address = utils::fb_utilities::get_broadcast_address();
-    if (broadcast_address != listen && seeds.count(listen)) {
-        print("Use broadcast_address instead of listen_address for seeds list: seeds=%s, listen_address=%s, broadcast_address=%s\n",
-                to_string(seeds), listen_address_in, broadcast_address);
+    startlog.info("seeds={}, listen_address={}, broadcast_address={}",
+            to_string(seeds), listen_address_in, broadcast_address);
+    if (broadcast_address != listen && seeds.contains(listen)) {
+        startlog.error("Use broadcast_address instead of listen_address for seeds list");
         throw std::runtime_error("Use broadcast_address for seeds list");
     }
-    gms::get_gossiper().start().get();
-    auto& gossiper = gms::get_local_gossiper();
-    gossiper.set_seeds(seeds);
-    // #293 - do not stop anything
-    //engine().at_exit([]{ return gms::get_gossiper().stop(); });
-    gms::get_gossiper().invoke_on_all([cluster_name](gms::gossiper& g) {
+    if ((!cfg.replace_address_first_boot().empty() || !cfg.replace_address().empty()) && seeds.contains(broadcast_address)) {
+        startlog.error("Bad configuration: replace-address and replace-address-first-boot are not allowed for seed nodes");
+        throw bad_configuration_error();
+    }
+    gossiper.local().set_seeds(seeds);
+    // Do it in the background.
+    (void)gossiper.invoke_on_all([cluster_name](gms::gossiper& g) {
         g.set_cluster_name(cluster_name);
+    }).handle_exception([] (std::exception_ptr e) {
+        startlog.error("Unexpected exception while setting cluster name: {}", e);
     });
 }
 

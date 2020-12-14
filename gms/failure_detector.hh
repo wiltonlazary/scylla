@@ -38,21 +38,20 @@
 
 #pragma once
 
-#include "unimplemented.hh"
-#include "core/sstring.hh"
-#include "core/shared_ptr.hh"
-#include "core/distributed.hh"
+#include <seastar/core/sstring.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/distributed.hh>
 #include "utils/bounded_stats_deque.hh"
-#include "gms/i_failure_detector.hh"
 #include <iosfwd>
 #include <cmath>
 #include <list>
 #include <map>
-#include <experimental/optional>
+#include <optional>
+
+#include "gms/inet_address.hh"
 
 
 namespace gms {
-class inet_address;
 class i_failure_detection_event_listener;
 class endpoint_state;
 
@@ -62,6 +61,9 @@ public:
 private:
     clk::time_point _tlast{clk::time_point::min()};
     utils::bounded_stats_deque _arrival_intervals;
+    std::chrono::milliseconds _initial;
+    std::chrono::milliseconds _max_interval;
+    std::chrono::milliseconds _min_interval;
 
     // this is useless except to provide backwards compatibility in phi_convict_threshold,
     // because everyone seems pretty accustomed to the default of 8, and users who have
@@ -70,15 +72,13 @@ private:
     static constexpr double PHI_FACTOR{M_LOG10El};
 
 public:
-    arrival_window(int size)
-        : _arrival_intervals(size) {
+    arrival_window(int size, std::chrono::milliseconds initial,
+            std::chrono::milliseconds max_interval, std::chrono::milliseconds min_interval)
+        : _arrival_intervals(size)
+        , _initial(initial)
+        , _max_interval(max_interval)
+        , _min_interval(min_interval) {
     }
-
-    // in the event of a long partition, never record an interval longer than the rpc timeout,
-    // since if a host is regularly experiencing connectivity problems lasting this long we'd
-    // rather mark it down quickly instead of adapting
-    // this value defaults to the same initial value the FD is seeded with
-    static clk::duration get_max_interval();
 
     void add(clk::time_point value, const gms::inet_address& ep);
 
@@ -99,7 +99,7 @@ public:
  * "The Phi Accrual Failure Detector" by Hayashibara.
  * Check the paper and the <i>IFailureDetector</i> interface for details.
  */
-class failure_detector : public i_failure_detector, public seastar::async_sharded_service<failure_detector> {
+class failure_detector {
 private:
     static constexpr int SAMPLE_SIZE = 1000;
     // this is useless except to provide backwards compatibility in phi_convict_threshold,
@@ -111,6 +111,8 @@ private:
     std::map<inet_address, arrival_window> _arrival_samples;
     std::list<i_failure_detection_event_listener*> _fd_evnt_listeners;
     double _phi = 8;
+    std::chrono::milliseconds _initial;
+    std::chrono::milliseconds _max_interval;
 
     static constexpr std::chrono::milliseconds DEFAULT_MAX_PAUSE{5000};
 
@@ -128,35 +130,17 @@ private:
         return DEFAULT_MAX_PAUSE;
     }
 
-    std::experimental::optional<arrival_window::clk::time_point> _last_interpret;
+    std::optional<arrival_window::clk::time_point> _last_interpret;
     arrival_window::clk::time_point _last_paused;
 
 public:
-    failure_detector() = default;
-
-    failure_detector(double phi) : _phi(phi) {
+    failure_detector(double phi, std::chrono::milliseconds initial, std::chrono::milliseconds max_interval)
+            : _phi(phi), _initial(initial), _max_interval(max_interval) {
     }
-
-    future<> stop() {
-        return make_ready_future<>();
-    }
-
-    sstring get_all_endpoint_states();
-
-    std::map<sstring, sstring> get_simple_states();
-
-    int get_down_endpoint_count();
-
-    int get_up_endpoint_count();
-
-    sstring get_endpoint_state(sstring address);
 
     std::map<inet_address, arrival_window> arrival_samples() const {
         return _arrival_samples;
     }
-
-private:
-    void append_endpoint_state(std::stringstream& ss, const endpoint_state& state);
 
 public:
     /**
@@ -187,7 +171,6 @@ public:
 
     double get_phi_convict_threshold();
 
-
     bool is_alive(inet_address ep);
 
     void report(inet_address ep);
@@ -204,62 +187,5 @@ public:
 
     friend std::ostream& operator<<(std::ostream& os, const failure_detector& x);
 };
-
-extern distributed<failure_detector> _the_failure_detector;
-inline failure_detector& get_local_failure_detector() {
-    return _the_failure_detector.local();
-}
-inline distributed<failure_detector>& get_failure_detector() {
-    return _the_failure_detector;
-}
-
-inline future<> set_phi_convict_threshold(double phi) {
-    return smp::submit_to(0, [phi] {
-        get_local_failure_detector().set_phi_convict_threshold(phi);
-    });
-}
-
-inline future<double> get_phi_convict_threshold() {
-    return smp::submit_to(0, [] {
-        return get_local_failure_detector().get_phi_convict_threshold();
-    });
-}
-
-inline future<sstring> get_all_endpoint_states() {
-    return smp::submit_to(0, [] {
-        return get_local_failure_detector().get_all_endpoint_states();
-    });
-}
-
-inline future<sstring> get_endpoint_state(sstring address) {
-    return smp::submit_to(0, [address] {
-        return get_local_failure_detector().get_endpoint_state(address);
-    });
-}
-
-inline future<std::map<sstring, sstring>> get_simple_states() {
-    return smp::submit_to(0, [] {
-        return get_local_failure_detector().get_simple_states();
-    });
-}
-
-inline future<int> get_down_endpoint_count() {
-    return smp::submit_to(0, [] {
-        return get_local_failure_detector().get_down_endpoint_count();
-    });
-}
-
-
-inline future<int> get_up_endpoint_count() {
-    return smp::submit_to(0, [] {
-        return get_local_failure_detector().get_up_endpoint_count();
-    });
-}
-
-inline future<std::map<inet_address, arrival_window>> get_arrival_samples() {
-    return smp::submit_to(0, [] {
-        return get_local_failure_detector().arrival_samples();
-    });
-}
 
 } // namespace gms

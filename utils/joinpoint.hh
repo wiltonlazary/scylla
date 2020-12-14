@@ -22,9 +22,12 @@
 #pragma once
 
 #include <memory>
-#include <experimental/optional>
+#include <optional>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/smp.hh>
+
+#include "seastarx.hh"
 
 /**
  * Joinpoint:
@@ -46,12 +49,12 @@ public:
 
     joinpoint(func_type f)
         : _func(std::move(f))
-        , _shard(engine().cpu_id())
+        , _shard(this_shard_id())
         , _enter(0)
         , _wait(0)
     {}
     type value() {
-        return smp::submit_to(_shard, [this, id = engine().cpu_id()] {
+        return smp::submit_to(_shard, [this, id = this_shard_id()] {
             _enter.signal();
             if (id == _shard) {
                 // We should not generate to common value until all shards
@@ -78,7 +81,7 @@ private:
     shard_id _shard;
     semaphore _enter;
     semaphore _wait;
-    std::experimental::optional<T> _value;
+    std::optional<T> _value;
 };
 
 /**
@@ -92,7 +95,7 @@ private:
 template<typename Func, typename T = std::result_of_t<Func()>>
 joinpoint<T> make_joinpoint(Func && f) {
     return joinpoint<T>([f = std::forward<Func>(f)] {
-        return futurize<T>::apply(f);
+        return futurize_invoke(f);
     });
 }
 

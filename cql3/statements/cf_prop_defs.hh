@@ -43,13 +43,15 @@
 
 #include "cql3/statements/property_definitions.hh"
  
-#include "schema.hh"
 #include "schema_builder.hh"
 #include "compaction_strategy.hh"
 #include "utils/UUID.hh"
 
 namespace db {
 class extensions;
+}
+namespace cdc {
+class options;
 }
 
 namespace cql3 {
@@ -62,6 +64,7 @@ public:
     static const sstring KW_READREPAIRCHANCE;
     static const sstring KW_DCLOCALREADREPAIRCHANCE;
     static const sstring KW_GCGRACESECONDS;
+    static const sstring KW_PAXOSGRACESECONDS;
     static const sstring KW_MINCOMPACTIONTHRESHOLD;
     static const sstring KW_MAXCOMPACTIONTHRESHOLD;
     static const sstring KW_CACHING;
@@ -78,6 +81,8 @@ public:
 
     static const sstring KW_ID;
 
+    static const sstring KW_CDC;
+
     static const sstring COMPACTION_STRATEGY_CLASS_KEY;
     static const sstring COMPACTION_ENABLED_KEY;
 
@@ -86,11 +91,14 @@ public:
     static constexpr int32_t DEFAULT_MIN_INDEX_INTERVAL = 128;
     static constexpr int32_t DEFAULT_MAX_INDEX_INTERVAL = 2048;
 private:
-    std::experimental::optional<sstables::compaction_strategy_type> _compaction_strategy_class;
+    mutable std::optional<sstables::compaction_strategy_type> _compaction_strategy_class;
 public:
-    void validate(const db::extensions&);
+    schema::extensions_map make_schema_extensions(const db::extensions& exts);
+    void validate(const database& db, const schema::extensions_map& schema_extensions) const;
     std::map<sstring, sstring> get_compaction_options() const;
-    stdx::optional<std::map<sstring, sstring>> get_compression_options() const;
+    std::optional<std::map<sstring, sstring>> get_compression_options() const;
+    const cdc::options* get_cdc_options(const schema::extensions_map&) const;
+    std::optional<caching_options> get_caching_options() const;
 #if 0
     public CachingOptions getCachingOptions() throws SyntaxException, ConfigurationException
     {
@@ -110,9 +118,10 @@ public:
 #endif
     int32_t get_default_time_to_live() const;
     int32_t get_gc_grace_seconds() const;
-    stdx::optional<utils::UUID> get_id() const;
+    int32_t get_paxos_grace_seconds() const;
+    std::optional<utils::UUID> get_id() const;
 
-    void apply_to_builder(schema_builder& builder, const db::extensions&);
+    void apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions);
     void validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const;
 };
 

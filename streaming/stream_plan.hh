@@ -40,18 +40,19 @@
 
 #include "utils/UUID.hh"
 #include "utils/UUID_gen.hh"
-#include "core/sstring.hh"
+#include <seastar/core/sstring.hh>
 #include "gms/inet_address.hh"
 #include "query-request.hh"
 #include "dht/i_partitioner.hh"
 #include "streaming/stream_coordinator.hh"
-#include "streaming/stream_event_handler.hh"
 #include "streaming/stream_detail.hh"
+#include "streaming/stream_reason.hh"
 #include <vector>
 
 namespace streaming {
 
 class stream_state;
+class stream_event_handler;
 
 /**
  * {@link StreamPlan} is a helper class that builds StreamOperation of given configuration.
@@ -65,6 +66,7 @@ private:
     using token = dht::token;
     UUID _plan_id;
     sstring _description;
+    stream_reason _reason;
     std::vector<stream_event_handler*> _handlers;
     shared_ptr<stream_coordinator> _coordinator;
     bool _range_added = false;
@@ -76,9 +78,10 @@ public:
      *
      * @param description Stream type that describes this StreamPlan
      */
-    stream_plan(sstring description)
+    stream_plan(sstring description, stream_reason reason = stream_reason::unspecified)
         : _plan_id(utils::UUID_gen::get_time_UUID())
         , _description(description)
+        , _reason(reason)
         , _coordinator(make_shared<stream_coordinator>()) {
     }
 
@@ -133,7 +136,7 @@ public:
     /**
      * @return true if this plan has no plan to execute
      */
-    bool is_empty() {
+    bool is_empty() const {
         return !_coordinator->has_active_sessions();
     }
 
@@ -144,7 +147,8 @@ public:
      */
     future<stream_state> execute();
 
-    void abort();
+    void abort() noexcept;
+    void do_abort();
 };
 
 } // namespace streaming

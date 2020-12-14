@@ -24,9 +24,12 @@
 #include "types.hh"
 #include "bytes.hh"
 
-#include <boost/variant.hpp>
+#include <optional>
+#include <variant>
 
-#include <experimental/optional>
+#include <seastar/util/variant_utils.hh>
+
+#include "utils/fragmented_temporary_buffer.hh"
 
 namespace cql3 {
 
@@ -36,11 +39,22 @@ struct null_value {
 struct unset_value {
 };
 
+class raw_value;
 /// \brief View to a raw CQL protocol value.
 ///
 /// \see raw_value
 struct raw_value_view {
-    boost::variant<bytes_view, null_value, unset_value> _data;
+    std::variant<fragmented_temporary_buffer::view, null_value, unset_value> _data;
+    // Temporary storage is only useful if a raw_value_view needs to be instantiated
+    // with a value which lifetime is bounded only to the view itself.
+    // This hack is introduced in order to avoid storing temporary storage
+    // in an external container, which may cause memory leaking problems.
+    // This pointer is disengaged for regular raw_value_view instances.
+    // Data is stored in a shared pointer for two reasons:
+    // - pointers are cheap to copy
+    // - it makes the view keep its semantics - it's safe to copy a view multiple times
+    //   and all copies still refer to the same underlying data.
+    lw_shared_ptr<bytes> _temporary_storage = nullptr;
 
     raw_value_view(null_value&& data)
         : _data{std::move(data)}
@@ -48,12 +62,12 @@ struct raw_value_view {
     raw_value_view(unset_value&& data)
         : _data{std::move(data)}
     {}
-    raw_value_view(bytes_view&& data)
-        : _data{std::move(data)}
-    {}
-    raw_value_view(const bytes_view& data)
+    raw_value_view(fragmented_temporary_buffer::view data)
         : _data{data}
     {}
+    // This constructor is only used by make_temporary() and it acquires ownership
+    // of the given buffer. The view created that way refers to its own temporary storage.
+    explicit raw_value_view(bytes&& temporary_storage);
 public:
     static raw_value_view make_null() {
         return raw_value_view{std::move(null_value{})};
@@ -61,36 +75,49 @@ public:
     static raw_value_view make_unset_value() {
         return raw_value_view{std::move(unset_value{})};
     }
-    static raw_value_view make_value(bytes_view &&view) {
-        return raw_value_view{std::move(view)};
-    }
-    static raw_value_view make_value(const bytes_view& view) {
+    static raw_value_view make_value(fragmented_temporary_buffer::view view) {
         return raw_value_view{view};
     }
+    static raw_value_view make_temporary(raw_value&& value);
     bool is_null() const {
-        return _data.which() == 1;
+        return std::holds_alternative<null_value>(_data);
     }
     bool is_unset_value() const {
-        return _data.which() == 2;
+        return std::holds_alternative<unset_value>(_data);
     }
     bool is_value() const {
-        return _data.which() == 0;
+        return std::holds_alternative<fragmented_temporary_buffer::view>(_data);
     }
-    bytes_view_opt data() const {
-        if (_data.which() == 0) {
-            return boost::get<bytes_view>(_data);
+    std::optional<fragmented_temporary_buffer::view> data() const {
+        if (auto pdata = std::get_if<fragmented_temporary_buffer::view>(&_data)) {
+            return *pdata;
         }
         return {};
     }
     explicit operator bool() const {
-        return _data.which() == 0;
+        return is_value();
     }
-    const bytes_view* operator->() const {
-        return &boost::get<bytes_view>(_data);
+    const fragmented_temporary_buffer::view* operator->() const {
+        return &std::get<fragmented_temporary_buffer::view>(_data);
     }
-    const bytes_view& operator*() const {
-        return boost::get<bytes_view>(_data);
+    const fragmented_temporary_buffer::view& operator*() const {
+        return std::get<fragmented_temporary_buffer::view>(_data);
     }
+
+    bool operator==(const raw_value_view& other) const {
+        if (_data.index() != other._data.index()) {
+            return false;
+        }
+        if (is_value() && **this != *other) {
+            return false;
+        }
+        return true;
+    }
+    bool operator!=(const raw_value_view& other) const {
+        return !(*this == other);
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const raw_value_view& value);
 };
 
 /// \brief Raw CQL protocol value.
@@ -99,7 +126,7 @@ public:
 /// protocol. A raw value can hold either a null value, an unset value, or a byte
 /// blob that represents the value.
 class raw_value {
-    boost::variant<bytes, null_value, unset_value> _data;
+    std::variant<bytes, null_value, unset_value> _data;
 
     raw_value(null_value&& data)
         : _data{std::move(data)}
@@ -120,15 +147,7 @@ public:
     static raw_value make_unset_value() {
         return raw_value{std::move(unset_value{})};
     }
-    static raw_value make_value(const raw_value_view& view) {
-        if (view.is_null()) {
-            return make_null();
-        }
-        if (view.is_unset_value()) {
-            return make_unset_value();
-        }
-        return make_value(to_bytes(*view));
-    }
+    static raw_value make_value(const raw_value_view& view);
     static raw_value make_value(bytes&& bytes) {
         return raw_value{std::move(bytes)};
     }
@@ -142,44 +161,52 @@ public:
         return make_null();
     }
     bool is_null() const {
-        return _data.which() == 1;
+        return std::holds_alternative<null_value>(_data);
     }
     bool is_unset_value() const {
-        return _data.which() == 2;
+        return std::holds_alternative<unset_value>(_data);
     }
     bool is_value() const {
-        return _data.which() == 0;
+        return std::holds_alternative<bytes>(_data);
     }
     bytes_opt data() const {
-        if (_data.which() == 0) {
-            return boost::get<bytes>(_data);
+        if (auto pdata = std::get_if<bytes>(&_data)) {
+            return *pdata;
         }
         return {};
     }
     explicit operator bool() const {
-        return _data.which() == 0;
+        return is_value();
     }
     const bytes* operator->() const {
-        return &boost::get<bytes>(_data);
+        return &std::get<bytes>(_data);
     }
     const bytes& operator*() const {
-        return boost::get<bytes>(_data);
+        return std::get<bytes>(_data);
     }
-    raw_value_view to_view() const {
-        switch (_data.which()) {
-        case 0:  return raw_value_view::make_value(bytes_view{boost::get<bytes>(_data)});
-        case 1:  return raw_value_view::make_null();
-        default: return raw_value_view::make_unset_value();
-        }
+    bytes&& extract_value() && {
+        auto b = std::get_if<bytes>(&_data);
+        assert(b);
+        return std::move(*b);
     }
+    raw_value_view to_view() const;
 };
 
 }
 
+inline bytes to_bytes(const cql3::raw_value_view& view)
+{
+    return linearized(*view);
+}
+
 inline bytes_opt to_bytes_opt(const cql3::raw_value_view& view) {
-    return to_bytes_opt(view.data());
+    auto buffer_view = view.data();
+    if (buffer_view) {
+        return bytes_opt(linearized(*buffer_view));
+    }
+    return bytes_opt();
 }
 
 inline bytes_opt to_bytes_opt(const cql3::raw_value& value) {
-    return value.data();
+    return to_bytes_opt(value.to_view());
 }

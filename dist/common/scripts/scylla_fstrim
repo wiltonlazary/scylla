@@ -1,4 +1,5 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 #
 # Copyright 2017 ScyllaDB
 #
@@ -25,6 +26,9 @@ import yaml
 import argparse
 import subprocess
 
+from scylla_util import parse_scylla_dirs_with_default
+
+
 def find_mount_point(path):
     path = os.path.abspath(path)
     while not os.path.ismount(path):
@@ -37,21 +41,20 @@ def main():
                         default='/etc/scylla/scylla.yaml',
                         help='path to scylla.yaml')
     args = parser.parse_args()
-    s = open(args.config).read()
-    cfg = yaml.load(s)
+    cfg = parse_scylla_dirs_with_default(conf=args.config)
     mountpoints = set()
     for d in cfg['data_file_directories']:
         mountpoints.add(find_mount_point(d))
 
     mountpoints.add(find_mount_point(cfg['commitlog_directory']))
     # workaround of #2649
-    subprocess.call(["/usr/lib/scylla/scylla-blocktune", "--set-nomerges", "1"])
+    subprocess.call(["/opt/scylladb/scripts/scylla-blocktune", "--set-nomerges", "1"])
     for d in mountpoints:
         print("Running fstrim on {} ...".format(d))
         res = subprocess.call(["fstrim", d])
         if res != 0:
             print("{} doesn't support TRIM.".format(d))
-    subprocess.call(["/usr/lib/scylla/scylla-blocktune", "--set-nomerges", "2"])
+    subprocess.call(["/opt/scylladb/scripts/scylla-blocktune", "--set-nomerges", "2"])
 
 if __name__ == "__main__":
     main()

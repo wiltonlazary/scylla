@@ -21,8 +21,8 @@
 
 #pragma once
 #include "bytes.hh"
-#include "schema.hh"
-#include "core/future.hh"
+#include "schema_fwd.hh"
+#include <seastar/core/future.hh>
 #include "database_fwd.hh"
 #include "keys.hh"
 #include "compound_compat.hh"
@@ -47,7 +47,7 @@ public:
     bool operator==(const key_view& k) const { return k._bytes == _bytes; }
     bool operator!=(const key_view& k) const { return !(k == *this); }
 
-    bool empty() { return _bytes.empty(); }
+    bool empty() const { return _bytes.empty(); }
 
     explicit operator bytes_view() const {
         return _bytes;
@@ -144,13 +144,13 @@ inline key maximum_key() {
 };
 
 class decorated_key_view {
-    dht::token_view _token;
+    dht::token _token;
     key_view _partition_key;
 public:
-    decorated_key_view(dht::token_view token, key_view partition_key) noexcept
+    decorated_key_view(dht::token token, key_view partition_key) noexcept
         : _token(token), _partition_key(partition_key) { }
 
-    dht::token_view token() const {
+    dht::token token() const {
         return _token;
     }
 

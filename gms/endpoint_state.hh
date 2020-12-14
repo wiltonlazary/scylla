@@ -44,7 +44,7 @@
 #include "gms/versioned_value.hh"
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
-#include <experimental/optional>
+#include <optional>
 #include <chrono>
 
 namespace gms {
@@ -62,6 +62,8 @@ private:
     /* fields below do not get serialized */
     clk::time_point _update_timestamp;
     bool _is_alive;
+    bool _is_normal = false;
+
 public:
     bool operator==(const endpoint_state& other) const {
         return _heart_beat_state  == other._heart_beat_state &&
@@ -70,77 +72,66 @@ public:
                _is_alive          == other._is_alive;
     }
 
-    endpoint_state()
+    endpoint_state() noexcept
         : _heart_beat_state(0)
         , _update_timestamp(clk::now())
         , _is_alive(true) {
+        update_is_normal();
     }
 
-    endpoint_state(heart_beat_state initial_hb_state)
+    endpoint_state(heart_beat_state initial_hb_state) noexcept
         : _heart_beat_state(initial_hb_state)
         , _update_timestamp(clk::now())
         , _is_alive(true) {
+        update_is_normal();
     }
 
     endpoint_state(heart_beat_state&& initial_hb_state,
             const std::map<application_state, versioned_value>& application_state)
         : _heart_beat_state(std::move(initial_hb_state))
-          ,_application_state(application_state)
+        , _application_state(application_state)
         , _update_timestamp(clk::now())
         , _is_alive(true) {
+        update_is_normal();
     }
 
     // Valid only on shard 0
-    heart_beat_state& get_heart_beat_state() {
+    heart_beat_state& get_heart_beat_state() noexcept {
         return _heart_beat_state;
     }
 
     // Valid only on shard 0
-    const heart_beat_state& get_heart_beat_state() const {
+    const heart_beat_state& get_heart_beat_state() const noexcept {
         return _heart_beat_state;
     }
 
-    void set_heart_beat_state_and_update_timestamp(heart_beat_state hbs) {
+    void set_heart_beat_state_and_update_timestamp(heart_beat_state hbs) noexcept {
         update_timestamp();
         _heart_beat_state = hbs;
     }
 
-    const versioned_value* get_application_state_ptr(application_state key) const;
+    const versioned_value* get_application_state_ptr(application_state key) const noexcept;
 
     /**
      * TODO replace this with operations that don't expose private state
      */
     // @Deprecated
-    std::map<application_state, versioned_value>& get_application_state_map() {
+    std::map<application_state, versioned_value>& get_application_state_map() noexcept {
         return _application_state;
     }
 
-    const std::map<application_state, versioned_value>& get_application_state_map() const {
+    const std::map<application_state, versioned_value>& get_application_state_map() const noexcept {
         return _application_state;
     }
 
     void add_application_state(application_state key, versioned_value value) {
         _application_state[key] = std::move(value);
+        update_is_normal();
     }
 
-    void apply_application_state(application_state key, versioned_value&& value) {
-        auto&& e = _application_state[key];
-        if (e.version < value.version) {
-            e = std::move(value);
-        }
-    }
-
-    void apply_application_state(application_state key, const versioned_value& value) {
-        auto&& e = _application_state[key];
-        if (e.version < value.version) {
-            e = value;
-        }
-    }
-
-    void apply_application_state(const endpoint_state& es) {
-        for (auto&& e : es._application_state) {
-            apply_application_state(e.first, e.second);
-        }
+    void add_application_state(const endpoint_state& es) {
+        _application_state = es._application_state;
+        update_is_normal();
     }
 
     /* getters and setters */
@@ -149,43 +140,60 @@ public:
      *
      * Valid only on shard 0.
      */
-    clk::time_point get_update_timestamp() const {
+    clk::time_point get_update_timestamp() const noexcept {
         return _update_timestamp;
     }
 
-    void update_timestamp() {
+    void update_timestamp() noexcept {
         _update_timestamp = clk::now();
     }
 
-    bool is_alive() const {
+    bool is_alive() const noexcept {
         return _is_alive;
     }
 
-    void set_alive(bool alive) {
+    void set_alive(bool alive) noexcept {
         _is_alive = alive;
     }
 
-    void mark_alive() {
+    void mark_alive() noexcept {
         set_alive(true);
     }
 
-    void mark_dead() {
+    void mark_dead() noexcept {
         set_alive(false);
     }
 
-    bool is_shutdown() const {
+    std::string_view get_status() const noexcept {
+        constexpr std::string_view empty = "";
         auto* app_state = get_application_state_ptr(application_state::STATUS);
         if (!app_state) {
-            return false;
+            return empty;
         }
-        auto value = app_state->value;
-        std::vector<sstring> pieces;
-        boost::split(pieces, value, boost::is_any_of(","));
-        if (pieces.empty()) {
-            return false;
+        const auto& value = app_state->value;
+        if (value.empty()) {
+            return empty;
         }
-        return pieces[0] == sstring(versioned_value::SHUTDOWN);
+        auto pos = value.find(',');
+        if (pos == sstring::npos) {
+            return std::string_view(value);
+        }
+        return std::string_view(value.c_str(), pos);
     }
+
+    bool is_shutdown() const noexcept {
+        return get_status() == versioned_value::SHUTDOWN;
+    }
+
+    bool is_normal() const noexcept {
+        return _is_normal;
+    }
+
+    void update_is_normal() noexcept {
+        _is_normal = get_status() == versioned_value::STATUS_NORMAL;
+    }
+
+    bool is_cql_ready() const noexcept;
 
     friend std::ostream& operator<<(std::ostream& os, const endpoint_state& x);
 };

@@ -42,8 +42,9 @@
 #include "prepared_statement.hh"
 #include "schema_builder.hh"
 #include "service/migration_manager.hh"
+#include "database.hh"
 #include "boost/range/adaptor/map.hpp"
-#include "stdx.hh"
+#include "user_types_metadata.hh"
 
 namespace cql3 {
 
@@ -61,12 +62,12 @@ void alter_type_statement::prepare_keyspace(const service::client_state& state)
     }
 }
 
-future<> alter_type_statement::check_access(const service::client_state& state)
+future<> alter_type_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const
 {
     return state.has_keyspace_access(keyspace(), auth::permission::ALTER);
 }
 
-void alter_type_statement::validate(service::storage_proxy& proxy, const service::client_state& state)
+void alter_type_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const
 {
     // Validation is left to announceMigration as it's easier to do it while constructing the updated type.
     // It doesn't really change anything anyway.
@@ -77,23 +78,22 @@ const sstring& alter_type_statement::keyspace() const
     return _name.get_keyspace();
 }
 
-static stdx::optional<uint32_t> get_idx_of_field(user_type type, shared_ptr<column_identifier> field)
+void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, bool is_local_only) const
 {
-    for (uint32_t i = 0; i < type->field_names().size(); ++i) {
-        if (field->name() == type->field_names()[i]) {
-            return {i};
-        }
-    }
-    return {};
-}
-
-void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, bool is_local_only)
-{
-    auto&& all_types = ks.metadata()->user_types()->get_all_types();
+    auto&& all_types = ks.metadata()->user_types().get_all_types();
     auto to_update = all_types.find(_name.get_user_type_name());
     // Shouldn't happen, unless we race with a drop
     if (to_update == all_types.end()) {
-        throw exceptions::invalid_request_exception(sprint("No user type named %s exists.", _name.to_string()));
+        throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_string()));
+    }
+
+    for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+        for (auto&& column : schema->partition_key_columns()) {
+            if (column.type->references_user_type(_name.get_keyspace(), _name.get_user_type_name())) {
+                throw exceptions::invalid_request_exception(format("Cannot add new field to type {} because it is used in the partition key column {} of table {}.{}",
+                    _name.to_string(), column.name_as_text(), schema->ks_name(), schema->cf_name()));
+            }
+        }
     }
 
     auto&& updated = make_updated_type(db, to_update->second);
@@ -110,7 +110,7 @@ void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, b
             if (t_opt) {
                 modified = true;
                 // We need to update this column
-                cfm.with_altered_column_type(column.name(), *t_opt);
+                cfm.alter_column_type(column.name(), *t_opt);
             }
         }
         if (modified) {
@@ -121,21 +121,9 @@ void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, b
             }
         }
     }
-
-    // Other user types potentially using the updated type
-    for (auto&& ut : ks.metadata()->user_types()->get_all_types() | boost::adaptors::map_values) {
-        // Re-updating the type we've just updated would be harmless but useless so we avoid it.
-        if (ut->_keyspace != updated->_keyspace || ut->_name != updated->_name) {
-            auto upd_opt = ut->update_user_type(updated);
-            if (upd_opt) {
-                service::get_local_migration_manager().announce_type_update(
-                    static_pointer_cast<const user_type_impl>(*upd_opt), is_local_only).get();
-            }
-        }
-    }
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> alter_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only)
+future<shared_ptr<cql_transport::event::schema_change>> alter_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
 {
     return seastar::async([this, &proxy, is_local_only] {
         auto&& db = proxy.get_db().local();
@@ -143,13 +131,13 @@ future<shared_ptr<cql_transport::event::schema_change>> alter_type_statement::an
             auto&& ks = db.find_keyspace(keyspace());
             do_announce_migration(db, ks, is_local_only);
             using namespace cql_transport;
-            return make_shared<event::schema_change>(
+            return ::make_shared<event::schema_change>(
                     event::schema_change::change_type::UPDATED,
                     event::schema_change::target_type::TYPE,
                     keyspace(),
                     _name.get_string_type_name());
         } catch (no_such_keyspace& e) {
-            throw exceptions::invalid_request_exception(sprint("Cannot alter type in unknown keyspace %s", keyspace()));
+            throw exceptions::invalid_request_exception(format("Cannot alter type in unknown keyspace {}", keyspace()));
         }
     });
 }
@@ -164,37 +152,44 @@ alter_type_statement::add_or_alter::add_or_alter(const ut_name& name, bool is_ad
 
 user_type alter_type_statement::add_or_alter::do_add(database& db, user_type to_update) const
 {
-    if (get_idx_of_field(to_update, _field_name)) {
-        throw exceptions::invalid_request_exception(sprint("Cannot add new field %s to type %s: a field of the same name already exists", _field_name->name(), _name.to_string()));
+    if (to_update->idx_of_field(_field_name->name())) {
+        throw exceptions::invalid_request_exception(format("Cannot add new field {} to type {}: a field of the same name already exists",
+            _field_name->to_string(), _name.to_string()));
+    }
+
+    if (to_update->size() == max_udt_fields) {
+        throw exceptions::invalid_request_exception(format("Cannot add new field to type {}: maximum number of fields reached", _name));
     }
 
     std::vector<bytes> new_names(to_update->field_names());
     new_names.push_back(_field_name->name());
     std::vector<data_type> new_types(to_update->field_types());
-    auto&& add_type = _field_type->prepare(db, keyspace())->get_type();
+    auto&& add_type = _field_type->prepare(db, keyspace()).get_type();
     if (add_type->references_user_type(to_update->_keyspace, to_update->_name)) {
-        throw exceptions::invalid_request_exception(sprint("Cannot add new field %s of type %s to type %s as this would create a circular reference", _field_name->name(), _field_type->to_string(), _name.to_string()));
+        throw exceptions::invalid_request_exception(format("Cannot add new field {} of type {} to type {} as this would create a circular reference",
+                    *_field_name, *_field_type, _name.to_string()));
     }
     new_types.push_back(std::move(add_type));
-    return user_type_impl::get_instance(to_update->_keyspace, to_update->_name, std::move(new_names), std::move(new_types));
+    return user_type_impl::get_instance(to_update->_keyspace, to_update->_name, std::move(new_names), std::move(new_types), to_update->is_multi_cell());
 }
 
 user_type alter_type_statement::add_or_alter::do_alter(database& db, user_type to_update) const
 {
-    stdx::optional<uint32_t> idx = get_idx_of_field(to_update, _field_name);
+    auto idx = to_update->idx_of_field(_field_name->name());
     if (!idx) {
-        throw exceptions::invalid_request_exception(sprint("Unknown field %s in type %s", _field_name->name(), _name.to_string()));
+        throw exceptions::invalid_request_exception(format("Unknown field {} in type {}", _field_name->to_string(), _name.to_string()));
     }
 
     auto previous = to_update->field_types()[*idx];
-    auto new_type = _field_type->prepare(db, keyspace())->get_type();
+    auto new_type = _field_type->prepare(db, keyspace()).get_type();
     if (!new_type->is_compatible_with(*previous)) {
-        throw exceptions::invalid_request_exception(sprint("Type %s in incompatible with previous type %s of field %s in user type %s", _field_type->to_string(), previous->as_cql3_type()->to_string(), _field_name->name(), _name.to_string()));
+        throw exceptions::invalid_request_exception(format("Type {} in incompatible with previous type {} of field {} in user type {}",
+            *_field_type, previous->as_cql3_type(), *_field_name, _name));
     }
 
     std::vector<data_type> new_types(to_update->field_types());
     new_types[*idx] = new_type;
-    return user_type_impl::get_instance(to_update->_keyspace, to_update->_name, to_update->field_names(), std::move(new_types));
+    return user_type_impl::get_instance(to_update->_keyspace, to_update->_name, to_update->field_names(), std::move(new_types), to_update->is_multi_cell());
 }
 
 user_type alter_type_statement::add_or_alter::make_updated_type(database& db, user_type to_update) const
@@ -217,13 +212,13 @@ user_type alter_type_statement::renames::make_updated_type(database& db, user_ty
     std::vector<bytes> new_names(to_update->field_names());
     for (auto&& rename : _renames) {
         auto&& from = rename.first;
-        stdx::optional<uint32_t> idx = get_idx_of_field(to_update, from);
+        auto idx = to_update->idx_of_field(from->name());
         if (!idx) {
-            throw exceptions::invalid_request_exception(sprint("Unknown field %s in type %s", from->to_string(), _name.to_string()));
+            throw exceptions::invalid_request_exception(format("Unknown field {} in type {}", from->to_string(), _name.to_string()));
         }
         new_names[*idx] = rename.second->name();
     }
-    auto&& updated = user_type_impl::get_instance(to_update->_keyspace, to_update->_name, std::move(new_names), to_update->field_types());
+    auto&& updated = user_type_impl::get_instance(to_update->_keyspace, to_update->_name, std::move(new_names), to_update->field_types(), to_update->is_multi_cell());
     create_type_statement::check_for_duplicate_names(updated);
     return updated;
 }

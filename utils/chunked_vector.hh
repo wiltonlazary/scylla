@@ -26,7 +26,8 @@
 //
 // std::deque would be a good fit, except the backing array can grow quite large.
 
-#include <boost/container/small_vector.hpp>
+#include "utils/small_vector.hh"
+
 #include <boost/range/algorithm/equal.hpp>
 #include <boost/algorithm/clamp.hpp>
 #include <boost/version.hpp>
@@ -39,23 +40,6 @@
 
 namespace utils {
 
-namespace internal {
-
-#if BOOST_VERSION >= 106000
-
-template <typename T, size_t N>
-using boost_small_vector = boost::container::small_vector<T, N>;
-
-#else
-
-// Older versions of boost have a double-free bug, so use std::vector instead.
-template <typename T, size_t N>
-using boost_small_vector = std::vector<T>;
-
-#endif
-
-}
-
 struct chunked_vector_free_deleter {
     void operator()(void* x) const { ::free(x); }
 };
@@ -65,7 +49,7 @@ class chunked_vector {
     static_assert(std::is_nothrow_move_constructible<T>::value, "T must be nothrow move constructible");
     using chunk_ptr = std::unique_ptr<T[], chunked_vector_free_deleter>;
     // Each chunk holds max_chunk_capacity() items, except possibly the last
-    internal::boost_small_vector<chunk_ptr, 1> _chunks;
+    utils::small_vector<chunk_ptr, 1> _chunks;
     size_t _size = 0;
     size_t _capacity = 0;
 private:
@@ -78,7 +62,7 @@ private:
         }
     }
     void do_reserve_for_push_back();
-    void make_room(size_t n);
+    size_t make_room(size_t n, bool stop_after_one);
     chunk_ptr new_chunk(size_t n);
     T* addr(size_t i) const {
         return &_chunks[i / max_chunk_capacity()][i % max_chunk_capacity()];
@@ -113,6 +97,9 @@ public:
     }
     size_t size() const {
         return _size;
+    }
+    size_t capacity() const {
+        return _capacity;
     }
     T& operator[](size_t i) {
         return *addr(i);
@@ -162,8 +149,29 @@ public:
     void resize(size_t n);
     void reserve(size_t n) {
         if (n > _capacity) {
-            make_room(n);
+            make_room(n, false);
         }
+    }
+    /// Reserve some of the memory.
+    ///
+    /// Allows reserving the memory chunk-by-chunk, avoiding stalls when a lot of
+    /// chunks are needed. To drive the reservation to completion, call this
+    /// repeatedly with the value returned from the previous call until it
+    /// returns 0, yielding between calls when necessary. Example usage:
+    ///
+    ///     return do_until([&size] { return !size; }, [&my_vector, &size] () mutable {
+    ///         size = my_vector.reserve_partial(size);
+    ///     });
+    ///
+    /// Here, `do_until()` takes care of yielding between iterations when
+    /// necessary.
+    ///
+    /// \returns the memory that remains to be reserved
+    size_t reserve_partial(size_t n) {
+        if (n > _capacity) {
+            return make_room(n, true);
+        }
+        return 0;
     }
 
     size_t memory_size() const {
@@ -260,10 +268,20 @@ public:
     using iterator = iterator_type<T>;
     using const_iterator = iterator_type<const T>;
 public:
-    iterator begin() const { return iterator(_chunks.data(), 0); }
-    iterator end() const { return iterator(_chunks.data(), _size); }
+    const T& front() const { return *cbegin(); }
+    T& front() { return *begin(); }
+    iterator begin() { return iterator(_chunks.data(), 0); }
+    iterator end() { return iterator(_chunks.data(), _size); }
+    const_iterator begin() const { return const_iterator(_chunks.data(), 0); }
+    const_iterator end() const { return const_iterator(_chunks.data(), _size); }
     const_iterator cbegin() const { return const_iterator(_chunks.data(), 0); }
     const_iterator cend() const { return const_iterator(_chunks.data(), _size); }
+    std::reverse_iterator<iterator> rbegin() { return std::reverse_iterator(end()); }
+    std::reverse_iterator<iterator> rend() { return std::reverse_iterator(begin()); }
+    std::reverse_iterator<const_iterator> rbegin() const { return std::reverse_iterator(end()); }
+    std::reverse_iterator<const_iterator> rend() const { return std::reverse_iterator(begin()); }
+    std::reverse_iterator<const_iterator> crbegin() const { return std::reverse_iterator(cend()); }
+    std::reverse_iterator<const_iterator> crend() const { return std::reverse_iterator(cbegin()); }
 public:
     bool operator==(const chunked_vector& x) const {
         return boost::equal(*this, x);
@@ -358,8 +376,8 @@ chunked_vector<T, max_contiguous_allocation>::migrate(T* begin, T* end, T* resul
 }
 
 template <typename T, size_t max_contiguous_allocation>
-void
-chunked_vector<T, max_contiguous_allocation>::make_room(size_t n) {
+size_t
+chunked_vector<T, max_contiguous_allocation>::make_room(size_t n, bool stop_after_one) {
     // First, if the last chunk is below max_chunk_capacity(), enlarge it
 
     auto last_chunk_capacity_deficit = _chunks.size() * max_chunk_capacity() - _capacity;
@@ -381,11 +399,14 @@ chunked_vector<T, max_contiguous_allocation>::make_room(size_t n) {
 
     // Add more chunks as needed
 
-    while (_capacity < n) {
+    bool stop = false;
+    while (_capacity < n && !stop) {
         auto now = std::min(n - _capacity, max_chunk_capacity());
         _chunks.push_back(new_chunk(now));
         _capacity += now;
+        stop = stop_after_one;
     }
+    return (n - _capacity);
 }
 
 template <typename T, size_t max_contiguous_allocation>
@@ -442,7 +463,10 @@ chunked_vector<T, max_contiguous_allocation>::shrink_to_fit() {
 template <typename T, size_t max_contiguous_allocation>
 void
 chunked_vector<T, max_contiguous_allocation>::clear() {
-    resize(0);
+    while (_size > 0) {
+        pop_back();
+    }
+    shrink_to_fit();
 }
 
 }

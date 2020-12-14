@@ -50,7 +50,7 @@ future<bool> gossiping_property_file_snitch::property_file_was_modified() {
         });
     }).then_wrapped([this] (auto&& f) {
         try {
-            auto st = std::get<0>(f.get());
+            auto st = f.get0();
 
             if (!_last_file_mod ||
                 _last_file_mod->tv_sec != st.st_mtim.tv_sec) {
@@ -69,7 +69,7 @@ future<bool> gossiping_property_file_snitch::property_file_was_modified() {
 gossiping_property_file_snitch::gossiping_property_file_snitch(
     const sstring& fname, unsigned io_cpuid)
 : production_snitch_base(fname), _file_reader_cpu_id(io_cpuid) {
-    if (engine().cpu_id() == _file_reader_cpu_id) {
+    if (this_shard_id() == _file_reader_cpu_id) {
         io_cpu_id() = _file_reader_cpu_id;
     }
 }
@@ -82,7 +82,7 @@ future<> gossiping_property_file_snitch::start() {
     reset_io_state();
 
     // Run a timer only on specific CPU
-    if (engine().cpu_id() == _file_reader_cpu_id) {
+    if (this_shard_id() == _file_reader_cpu_id) {
         //
         // Here we will create a timer that will read the properties file every
         // minute and load its contents into the gossiper.endpoint_state_map
@@ -104,7 +104,8 @@ future<> gossiping_property_file_snitch::start() {
 
 void gossiping_property_file_snitch::periodic_reader_callback() {
     _file_reader_runs = true;
-    property_file_was_modified().then([this] (bool was_modified) {
+    //FIXME: discarded future.
+    (void)property_file_was_modified().then([this] (bool was_modified) {
 
         if (was_modified) {
             return read_property_file();
@@ -136,17 +137,16 @@ future<> gossiping_property_file_snitch::gossiper_starting() {
     // this function will be executed on CPU0 only.
     //
     auto& g = get_local_gossiper();
-    auto& ss = get_local_storage_service();
 
-    auto local_internal_addr = netw::get_local_messaging_service().listen_address();
+    auto local_internal_addr = g.get_local_messaging().listen_address();
     std::ostringstream ostrm;
 
     ostrm<<local_internal_addr<<std::flush;
 
     return g.add_local_application_state(application_state::INTERNAL_IP,
-        ss.value_factory.internal_ip(ostrm.str())).then([this] {
+        versioned_value::internal_ip(ostrm.str())).then([this] {
         _gossip_started = true;
-        reload_gossiper_state();
+        return reload_gossiper_state();
     });
 }
 
@@ -183,14 +183,14 @@ future<> gossiping_property_file_snitch::reload_configuration() {
     sstring new_rack;
 
     // Rack and Data Center have to be defined in the properties file!
-    if (!_prop_values.count(dc_property_key) || !_prop_values.count(rack_property_key)) {
+    if (!_prop_values.contains(dc_property_key) || !_prop_values.contains(rack_property_key)) {
         throw_incomplete_file();
     }
 
     new_dc   = _prop_values[dc_property_key];
     new_rack = _prop_values[rack_property_key];
 
-    if (_prop_values.count(prefer_local_property_key)) {
+    if (_prop_values.contains(prefer_local_property_key)) {
         if (_prop_values[prefer_local_property_key] == "false") {
             new_prefer_local = false;
         } else if (_prop_values[prefer_local_property_key] == "true") {
@@ -213,7 +213,7 @@ future<> gossiping_property_file_snitch::reload_configuration() {
             [this] (snitch_ptr& local_s) {
 
             // Distribute the new values on all CPUs but the current one
-            if (engine().cpu_id() != _file_reader_cpu_id) {
+            if (this_shard_id() != _file_reader_cpu_id) {
                 local_s->set_my_dc(_my_dc);
                 local_s->set_my_rack(_my_rack);
                 local_s->set_prefer_local(_prefer_local);
@@ -223,24 +223,12 @@ future<> gossiping_property_file_snitch::reload_configuration() {
                 // reload Gossiper state (executed on CPU0 only)
                 smp::submit_to(0, [] {
                     auto& local_snitch_ptr = get_local_snitch_ptr();
-                    local_snitch_ptr->reload_gossiper_state();
+                    return local_snitch_ptr->reload_gossiper_state();
                 }).get();
 
-                // update Storage Service on each shard
-                auto cpus = boost::irange(0u, smp::count);
-                parallel_for_each(cpus.begin(), cpus.end(), [] (unsigned int c) {
-                    return smp::submit_to(c, [] {
-                        if (service::get_storage_service().local_is_initialized()) {
-                            auto& tmd = service::get_local_storage_service().get_token_metadata();
-
-                            // initiate the token metadata endpoints cache reset
-                            tmd.invalidate_cached_rings();
-                            // re-read local rack and DC info
-                            tmd.update_topology(utils::fb_utilities::get_broadcast_address());
-                        }
-                    });
-                }).get();
-
+                if (service::get_storage_service().local_is_initialized()) {
+                    service::storage_service::update_topology(utils::fb_utilities::get_broadcast_address()).get();
+                }
 
                 // spread the word...
                 smp::submit_to(0, [] {
@@ -269,7 +257,7 @@ void gossiping_property_file_snitch::set_stopped() {
 }
 
 future<> gossiping_property_file_snitch::stop_io() {
-    if (engine().cpu_id() == _file_reader_cpu_id) {
+    if (this_shard_id() == _file_reader_cpu_id) {
         _file_reader.cancel();
 
         // If timer is not running then set the STOPPED state right away.
@@ -291,7 +279,7 @@ void gossiping_property_file_snitch::resume_io() {
 
 void gossiping_property_file_snitch::start_io() {
     // Run a timer only on specific CPU
-    if (engine().cpu_id() == _file_reader_cpu_id) {
+    if (this_shard_id() == _file_reader_cpu_id) {
         _file_reader.arm(reload_property_file_period());
     }
 }
@@ -317,21 +305,24 @@ future<> gossiping_property_file_snitch::pause_io() {
 }
 
 // should be invoked of CPU0 only
-void gossiping_property_file_snitch::reload_gossiper_state() {
+future<> gossiping_property_file_snitch::reload_gossiper_state() {
     if (!_gossip_started) {
-        return;
+        return make_ready_future<>();
     }
 
+    future<> ret = make_ready_future<>();
     if (_reconnectable_helper) {
-        gms::get_local_gossiper().unregister_(_reconnectable_helper);
+        ret = gms::get_local_gossiper().unregister_(_reconnectable_helper);
     }
 
     if (!_prefer_local) {
-        return;
+        return ret;
     }
 
-    _reconnectable_helper = make_shared<reconnectable_snitch_helper>(_my_dc);
-    gms::get_local_gossiper().register_(_reconnectable_helper);
+    return ret.then([this] {
+        _reconnectable_helper = ::make_shared<reconnectable_snitch_helper>(_my_dc);
+        gms::get_local_gossiper().register_(_reconnectable_helper);
+    });
 }
 
 using registry_2_params = class_registrator<i_endpoint_snitch,

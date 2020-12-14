@@ -63,6 +63,10 @@
 #include <stdexcept>
 #include <algorithm>
 #include <seastar/core/byteorder.hh>
+#include <seastar/core/temporary_buffer.hh>
+
+#include "seastarx.hh"
+
 #if 0
 #include "murmur3.h"
 #endif
@@ -71,8 +75,8 @@
 
 namespace hll {
 
-static const double pow_2_32 = 4294967296.0; ///< 2^32
-static const double neg_pow_2_32 = -4294967296.0; ///< -(2^32)
+static constexpr double pow_2_32 = 4294967296.0; ///< 2^32
+static constexpr double neg_pow_2_32 = -4294967296.0; ///< -(2^32)
 
 
 static inline size_t size_unsigned_var_int(unsigned int value) {

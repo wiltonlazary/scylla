@@ -39,7 +39,7 @@
 #pragma once
 
 #include "gms/inet_address.hh"
-#include "core/sstring.hh"
+#include <seastar/core/sstring.hh>
 
 namespace streaming {
 
@@ -72,7 +72,7 @@ public:
     /**
      * @return true if file transfer is completed
      */
-    bool is_completed() {
+    bool is_completed() const {
         return current_bytes >= total_bytes;
     }
 

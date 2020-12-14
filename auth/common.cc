@@ -28,15 +28,15 @@
 #include "database.hh"
 #include "schema_builder.hh"
 #include "service/migration_manager.hh"
+#include "timeout_config.hh"
 
 namespace auth {
 
 namespace meta {
 
-const sstring DEFAULT_SUPERUSER_NAME("cassandra");
-const sstring AUTH_KS("system_auth");
-const sstring USERS_CF("users");
-const sstring AUTH_PACKAGE_NAME("org.apache.cassandra.auth.");
+constexpr std::string_view AUTH_KS("system_auth");
+constexpr std::string_view USERS_CF("users");
+constexpr std::string_view AUTH_PACKAGE_NAME("org.apache.cassandra.auth.");
 
 }
 
@@ -47,9 +47,9 @@ future<> do_after_system_ready(seastar::abort_source& as, seastar::noncopyable_f
     struct empty_state { };
     return delay_until_system_ready(as).then([&as, func = std::move(func)] () mutable {
         return exponential_backoff_retry::do_until_value(1s, 1min, as, [func = std::move(func)] {
-            return func().then_wrapped([] (auto&& f) -> stdx::optional<empty_state> {
+            return func().then_wrapped([] (auto&& f) -> std::optional<empty_state> {
                 if (f.failed()) {
-                    auth_log.info("Auth task failed with error, rescheduling: {}", f.get_exception());
+                    auth_log.debug("Auth task failed with error, rescheduling: {}", f.get_exception());
                     return { };
                 }
                 return { empty_state() };
@@ -58,40 +58,65 @@ future<> do_after_system_ready(seastar::abort_source& as, seastar::noncopyable_f
     }).discard_result();
 }
 
-future<> create_metadata_table_if_missing(
-        stdx::string_view table_name,
+static future<> create_metadata_table_if_missing_impl(
+        std::string_view table_name,
         cql3::query_processor& qp,
-        stdx::string_view cql,
+        std::string_view cql,
         ::service::migration_manager& mm) {
-    auto& db = qp.db().local();
+    static auto ignore_existing = [] (seastar::noncopyable_function<future<>()> func) {
+        return futurize_invoke(std::move(func)).handle_exception_type([] (exceptions::already_exists_exception& ignored) { });
+    };
+    auto& db = qp.db();
+    auto parsed_statement = cql3::query_processor::parse_statement(cql);
+    auto& parsed_cf_statement = static_cast<cql3::statements::raw::cf_statement&>(*parsed_statement);
 
-    if (db.has_schema(meta::AUTH_KS, sstring(table_name))) {
-        return make_ready_future<>();
-    }
-
-    auto parsed_statement = static_pointer_cast<cql3::statements::raw::cf_statement>(
-            cql3::query_processor::parse_statement(cql));
-
-    parsed_statement->prepare_keyspace(meta::AUTH_KS);
+    parsed_cf_statement.prepare_keyspace(meta::AUTH_KS);
 
     auto statement = static_pointer_cast<cql3::statements::create_table_statement>(
-            parsed_statement->prepare(db, qp.get_cql_stats())->statement);
+            parsed_cf_statement.prepare(db, qp.get_cql_stats())->statement);
 
-    const auto schema = statement->get_cf_meta_data(qp.db().local());
+    const auto schema = statement->get_cf_meta_data(qp.db());
     const auto uuid = generate_legacy_id(schema->ks_name(), schema->cf_name());
 
     schema_builder b(schema);
     b.set_uuid(uuid);
-
-    return mm.announce_new_column_family(b.build(), false);
+    schema_ptr table = b.build();
+    return ignore_existing([&mm, table = std::move(table)] () {
+        return mm.announce_new_column_family(table, false);
+    });
 }
 
-future<> wait_for_schema_agreement(::service::migration_manager& mm, const database& db) {
+future<> create_metadata_table_if_missing(
+        std::string_view table_name,
+        cql3::query_processor& qp,
+        std::string_view cql,
+        ::service::migration_manager& mm) noexcept {
+    return futurize_invoke(create_metadata_table_if_missing_impl, table_name, qp, cql, mm);
+}
+
+future<> wait_for_schema_agreement(::service::migration_manager& mm, const database& db, seastar::abort_source& as) {
     static const auto pause = [] { return sleep(std::chrono::milliseconds(500)); };
 
-    return do_until([&db] { return db.get_version() != database::empty_version; }, pause).then([&mm] {
-        return do_until([&mm] { return mm.have_schema_agreement(); }, pause);
+    return do_until([&db, &as] {
+        as.check();
+        return db.get_version() != database::empty_version;
+    }, pause).then([&mm, &as] {
+        return do_until([&mm, &as] {
+            as.check();
+            return mm.have_schema_agreement();
+        }, pause);
     });
+}
+
+const timeout_config& internal_distributed_timeout_config() noexcept {
+#ifdef DEBUG
+    // Give the much slower debug tests more headroom for completing auth queries.
+    static const auto t = 30s;
+#else
+    static const auto t = 5s;
+#endif
+    static const timeout_config tc{t, t, t, t, t, t, t};
+    return tc;
 }
 
 }

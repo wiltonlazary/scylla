@@ -1,6 +1,8 @@
-#!/bin/bash -e
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 #
-#  Copyright (C) 2017 ScyllaDB
+# Copyright 2018 ScyllaDB
+#
 
 #
 # This file is part of Scylla.
@@ -18,13 +20,16 @@
 # You should have received a copy of the GNU General Public License
 # along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
 
-. /usr/lib/scylla/scylla_lib.sh
+import os
+import subprocess
+import shutil
+from scylla_util import *
 
-# We need to disable distribution provided fstrim scripts for each distribution
-
-if is_redhat_variant; then
-    systemctl disable fstrim.timer
-fi
-if [ "$ID" = "ubuntu" ] && [ -f /etc/cron.weekly/fstrim ]; then
-	mv -fv /etc/cron.weekly/fstrim /etc/cron.weekly/fstrim.old    
-fi
+if __name__ == '__main__':
+    if os.getuid() > 0:
+        print('Requires root permission.')
+        sys.exit(1)
+    systemd_unit('scylla-fstrim.timer').unmask()
+    systemd_unit('scylla-fstrim.timer').enable()
+    if is_redhat_variant():
+        systemd_unit('fstrim.timer').disable()

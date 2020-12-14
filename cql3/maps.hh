@@ -56,8 +56,8 @@ class maps {
 private:
     maps() = delete;
 public:
-    static shared_ptr<column_specification> key_spec_of(column_specification& column);
-    static shared_ptr<column_specification> value_spec_of(column_specification& column);
+    static lw_shared_ptr<column_specification> key_spec_of(const column_specification& column);
+    static lw_shared_ptr<column_specification> value_spec_of(const column_specification& column);
 
     class literal : public term::raw {
     public:
@@ -66,11 +66,11 @@ public:
         literal(const std::vector<std::pair<::shared_ptr<term::raw>, ::shared_ptr<term::raw>>>& entries_)
             : entries{entries_}
         { }
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) override;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
-        void validate_assignable_to(database& db, const sstring& keyspace, column_specification& receiver);
+        void validate_assignable_to(database& db, const sstring& keyspace, const column_specification& receiver) const;
     public:
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) override;
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override;
         virtual sstring to_string() const override;
     };
 
@@ -81,10 +81,10 @@ public:
         value(std::map<bytes, bytes, serialized_compare> map)
             : map(std::move(map)) {
         }
-        static value from_serialized(bytes_view value, map_type type, cql_serialization_format sf);
+        static value from_serialized(const fragmented_temporary_buffer::view& value, const map_type_impl& type, cql_serialization_format sf);
         virtual cql3::raw_value get(const query_options& options) override;
         virtual bytes get_with_protocol_version(cql_serialization_format sf);
-        bool equals(map_type mt, const value& v);
+        bool equals(const map_type_impl& mt, const value& v);
         virtual sstring to_string() const;
     };
 
@@ -98,13 +98,13 @@ public:
                 : _comparator(std::move(comparator)), _elements(std::move(elements)) {
         }
         virtual bool contains_bind_marker() const override;
-        virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names) override;
+        virtual void collect_marker_specification(variable_specifications& bound_names) const override;
         shared_ptr<terminal> bind(const query_options& options);
     };
 
     class marker : public abstract_marker {
     public:
-        marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+        marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
             : abstract_marker{bind_index, std::move(receiver)}
         { }
         virtual ::shared_ptr<terminal> bind(const query_options& options) override;
@@ -126,7 +126,7 @@ public:
         setter_by_key(const column_definition& column, shared_ptr<term> k, shared_ptr<term> t)
             : operation(column, std::move(t)), _k(std::move(k)) {
         }
-        virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names) override;
+        virtual void collect_marker_specification(variable_specifications& bound_names) const override;
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
     };
 
