@@ -1000,7 +1000,7 @@ future<> database::drop_column_family(const sstring& ks_name, const sstring& cf_
     remove(*cf);
     cf->clear_views();
     auto& ks = find_keyspace(ks_name);
-    return when_all_succeed(cf->await_pending_writes(), cf->await_pending_reads()).then_unpack([this, &ks, cf, tsf = std::move(tsf), snapshot] {
+    return cf->await_pending_ops().then([this, &ks, cf, tsf = std::move(tsf), snapshot] {
         return truncate(ks, *cf, std::move(tsf), snapshot).finally([this, cf] {
             return cf->stop();
         });
@@ -1019,7 +1019,7 @@ const utils::UUID& database::find_uuid(const schema_ptr& schema) const {
     return find_uuid(schema->ks_name(), schema->cf_name());
 }
 
-keyspace& database::find_keyspace(const sstring& name) {
+keyspace& database::find_keyspace(std::string_view name) {
     try {
         return _keyspaces.at(name);
     } catch (...) {
@@ -1027,7 +1027,7 @@ keyspace& database::find_keyspace(const sstring& name) {
     }
 }
 
-const keyspace& database::find_keyspace(const sstring& name) const {
+const keyspace& database::find_keyspace(std::string_view name) const {
     try {
         return _keyspaces.at(name);
     } catch (...) {
@@ -1208,7 +1208,7 @@ keyspace::make_directory_for_column_family(const sstring& name, utils::UUID uuid
     });
 }
 
-no_such_keyspace::no_such_keyspace(const sstring& ks_name)
+no_such_keyspace::no_such_keyspace(std::string_view ks_name)
     : runtime_error{format("Can't find a keyspace {}", ks_name)}
 {
 }
@@ -2059,26 +2059,28 @@ future<> database::truncate(const keyspace& ks, column_family& cf, timestamp_fun
 
         return cf.run_with_compaction_disabled([this, &cf, should_flush, auto_snapshot, tsf = std::move(tsf), low_mark]() mutable {
             future<> f = make_ready_future<>();
-            if (should_flush) {
+            bool did_flush = false;
+            if (should_flush && cf.can_flush()) {
                 // TODO:
                 // this is not really a guarantee at all that we've actually
                 // gotten all things to disk. Again, need queue-ish or something.
                 f = cf.flush();
+                did_flush = true;
             } else {
                 f = cf.clear();
             }
-            return f.then([this, &cf, auto_snapshot, tsf = std::move(tsf), low_mark, should_flush] {
+            return f.then([this, &cf, auto_snapshot, tsf = std::move(tsf), low_mark, should_flush, did_flush] {
                 dblog.debug("Discarding sstable data for truncated CF + indexes");
                 // TODO: notify truncation
 
-                return tsf().then([this, &cf, auto_snapshot, low_mark, should_flush](db_clock::time_point truncated_at) {
+                return tsf().then([this, &cf, auto_snapshot, low_mark, should_flush, did_flush](db_clock::time_point truncated_at) {
                     future<> f = make_ready_future<>();
                     if (auto_snapshot) {
                         auto name = format("{:d}-{}", truncated_at.time_since_epoch().count(), cf.schema()->cf_name());
                         f = cf.snapshot(*this, name);
                     }
-                    return f.then([this, &cf, truncated_at, low_mark, should_flush] {
-                        return cf.discard_sstables(truncated_at).then([this, &cf, truncated_at, low_mark, should_flush](db::replay_position rp) {
+                    return f.then([this, &cf, truncated_at, low_mark, should_flush, did_flush] {
+                        return cf.discard_sstables(truncated_at).then([this, &cf, truncated_at, low_mark, should_flush, did_flush](db::replay_position rp) {
                             // TODO: indexes.
                             // Note: since discard_sstables was changed to only count tables owned by this shard,
                             // we can get zero rp back. Changed assert, and ensure we save at least low_mark.
@@ -2086,7 +2088,7 @@ future<> database::truncate(const keyspace& ks, column_family& cf, timestamp_fun
                             // We nowadays do not flush tables with sstables but autosnapshot=false. This means
                             // the low_mark assertion does not hold, because we maybe/probably never got around to 
                             // creating the sstables that would create them.
-                            assert(!should_flush || low_mark <= rp || rp == db::replay_position());
+                            assert(!did_flush || low_mark <= rp || rp == db::replay_position());
                             rp = std::max(low_mark, rp);
                             return truncate_views(cf, truncated_at, should_flush).then([&cf, truncated_at, rp] {
                                 // save_truncation_record() may actually fail after we cached the truncation time

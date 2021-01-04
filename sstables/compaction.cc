@@ -212,16 +212,18 @@ public:
 };
 
 struct compaction_writer {
+    shared_sstable sst;
     // We use a ptr for pointer stability and so that it can be null
     // when using a noop monitor.
     sstable_writer writer;
     // The order in here is important. A monitor must be destroyed before the writer it is monitoring since it has a
     // periodic timer that checks the writer.
+    // The writer must be destroyed before the shared_sstable since the it may depend on the sstable
+    // (as in the mx::writer over compressed_file_data_sink_impl case that depends on sstables::compression).
     std::unique_ptr<compaction_write_monitor> monitor;
-    shared_sstable sst;
 
     compaction_writer(std::unique_ptr<compaction_write_monitor> monitor, sstable_writer writer, shared_sstable sst)
-        : writer(std::move(writer)), monitor(std::move(monitor)), sst(std::move(sst)) {}
+        : sst(std::move(sst)), writer(std::move(writer)), monitor(std::move(monitor)) {}
     compaction_writer(sstable_writer writer, shared_sstable sst)
         : compaction_writer(nullptr, std::move(writer), std::move(sst)) {}
 };
@@ -612,9 +614,7 @@ private:
                 reader.consume_in_thread(std::move(cfc), db::no_timeout);
             });
         });
-        // producer will filter out a partition before it reaches the consumer(s)
-        auto producer = make_filtering_reader(make_sstable_reader(), make_partition_filter());
-        return consumer(std::move(producer));
+        return consumer(make_sstable_reader());
     }
 
     virtual reader_consumer make_interposer_consumer(reader_consumer end_consumer) {
@@ -668,12 +668,6 @@ private:
         }
         return [this] (const dht::decorated_key& dk) {
             return get_max_purgeable_timestamp(_cf, *_selector, _compacting_for_max_purgeable_func, dk);
-        };
-    }
-
-    virtual flat_mutation_reader::filter make_partition_filter() const {
-        return [] (const dht::decorated_key&) {
-            return true;
         };
     }
 
@@ -896,12 +890,6 @@ public:
         _unused_sstables.clear();
     }
 
-    virtual flat_mutation_reader::filter make_partition_filter() const override {
-        return [&s = *_schema] (const dht::decorated_key& dk){
-            return dht::shard_of(s, dk.token()) == this_shard_id();
-        };
-    }
-
     virtual compaction_writer create_compaction_writer(const dht::decorated_key& dk) override {
         auto sst = _sstable_creator(this_shard_id());
         setup_new_sstable(sst);
@@ -1074,6 +1062,10 @@ public:
     cleanup_compaction(column_family& cf, compaction_descriptor descriptor, compaction_options::upgrade opts)
         : cleanup_compaction(opts.db, cf, std::move(descriptor)) {}
 
+    flat_mutation_reader make_sstable_reader() const override {
+        return make_filtering_reader(regular_compaction::make_sstable_reader(), make_partition_filter());
+    }
+
     std::string_view report_start_desc() const override {
         return "Cleaning";
     }
@@ -1082,7 +1074,7 @@ public:
         return "Cleaned";
     }
 
-    flat_mutation_reader::filter make_partition_filter() const override {
+    flat_mutation_reader::filter make_partition_filter() const {
         return [this] (const dht::decorated_key& dk) {
             if (dht::shard_of(*_schema, dk.token()) != this_shard_id()) {
                 log_trace("Token {} does not belong to CPU {}, skipping", dk.token(), this_shard_id());

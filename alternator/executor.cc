@@ -55,7 +55,7 @@
 #include "schema.hh"
 #include "alternator/tags_extension.hh"
 #include "alternator/rmw_operation.hh"
-
+#include <seastar/core/coroutine.hh>
 #include <boost/range/adaptors.hpp>
 
 logging::logger elogger("alternator-executor");
@@ -220,7 +220,7 @@ static std::tuple<bool, std::string_view, std::string_view> try_get_internal_tab
     std::string_view ks_name = table_name.substr(0, delim);
     table_name.remove_prefix(ks_name.size() + 1);
     // Only internal keyspaces can be accessed to avoid leakage
-    if (!is_internal_keyspace(sstring(ks_name))) {
+    if (!is_internal_keyspace(ks_name)) {
         return {false, "", ""};
     }
     return {true, ks_name, table_name};
@@ -476,8 +476,8 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
         return make_ready_future<request_return_type>(api_error::resource_not_found(
                 format("Requested resource not found: Table: {} not found", table_name)));
     }
-    return _mm.announce_column_family_drop(keyspace_name, table_name, false, service::migration_manager::drop_views::yes).then([this, keyspace_name] {
-        return _mm.announce_keyspace_drop(keyspace_name, false);
+    return _mm.announce_column_family_drop(keyspace_name, table_name, service::migration_manager::drop_views::yes).then([this, keyspace_name] {
+        return _mm.announce_keyspace_drop(keyspace_name);
     }).then([table_name = std::move(table_name)] {
         // FIXME: need more attributes?
         rjson::value table_description = rjson::empty_object();
@@ -704,52 +704,48 @@ static void update_tags_map(const rjson::value& tags, std::map<sstring, sstring>
 static future<> update_tags(service::migration_manager& mm, schema_ptr schema, std::map<sstring, sstring>&& tags_map) {
     schema_builder builder(schema);
     builder.add_extension(tags_extension::NAME, ::make_shared<tags_extension>(std::move(tags_map)));
-    return mm.announce_column_family_update(builder.build(), false, std::vector<view_ptr>(), false);
+    return mm.announce_column_family_update(builder.build(), false, std::vector<view_ptr>());
 }
 
 future<executor::request_return_type> executor::tag_resource(client_state& client_state, service_permit permit, rjson::value request) {
     _stats.api_operations.tag_resource++;
 
-    return seastar::async([this, &client_state, request = std::move(request)] () mutable -> request_return_type {
-        const rjson::value* arn = rjson::find(request, "ResourceArn");
-        if (!arn || !arn->IsString()) {
-            return api_error::access_denied("Incorrect resource identifier");
-        }
-        schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
-        std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
-        const rjson::value* tags = rjson::find(request, "Tags");
-        if (!tags || !tags->IsArray()) {
-            return api_error::validation("Cannot parse tags");
-        }
-        if (tags->Size() < 1) {
-            return api_error::validation("The number of tags must be at least 1") ;
-        }
-        update_tags_map(*tags, tags_map,  update_tags_action::add_tags);
-        update_tags(_mm, schema, std::move(tags_map)).get();
-        return json_string("");
-    });
+    const rjson::value* arn = rjson::find(request, "ResourceArn");
+    if (!arn || !arn->IsString()) {
+        co_return api_error::access_denied("Incorrect resource identifier");
+    }
+    schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
+    std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
+    const rjson::value* tags = rjson::find(request, "Tags");
+    if (!tags || !tags->IsArray()) {
+        co_return api_error::validation("Cannot parse tags");
+    }
+    if (tags->Size() < 1) {
+        co_return api_error::validation("The number of tags must be at least 1") ;
+    }
+    update_tags_map(*tags, tags_map,  update_tags_action::add_tags);
+    co_await update_tags(_mm, schema, std::move(tags_map));
+    co_return json_string("");
 }
 
 future<executor::request_return_type> executor::untag_resource(client_state& client_state, service_permit permit, rjson::value request) {
     _stats.api_operations.untag_resource++;
 
-    return seastar::async([this, &client_state, request = std::move(request)] () -> request_return_type {
-        const rjson::value* arn = rjson::find(request, "ResourceArn");
-        if (!arn || !arn->IsString()) {
-            return api_error::access_denied("Incorrect resource identifier");
-        }
-        const rjson::value* tags = rjson::find(request, "TagKeys");
-        if (!tags || !tags->IsArray()) {
-            return api_error::validation(format("Cannot parse tag keys"));
-        }
+    const rjson::value* arn = rjson::find(request, "ResourceArn");
+    if (!arn || !arn->IsString()) {
+        co_return api_error::access_denied("Incorrect resource identifier");
+    }
+    const rjson::value* tags = rjson::find(request, "TagKeys");
+    if (!tags || !tags->IsArray()) {
+        co_return api_error::validation(format("Cannot parse tag keys"));
+    }
 
-        schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
+    schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
 
-        std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
-        update_tags_map(*tags, tags_map, update_tags_action::delete_tags);
-        update_tags(_mm, schema, std::move(tags_map)).get();
-        return json_string("");
-    });
+    std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
+    update_tags_map(*tags, tags_map, update_tags_action::delete_tags);
+    co_await update_tags(_mm, schema, std::move(tags_map));
+    co_return json_string("");
 }
 
 future<executor::request_return_type> executor::list_tags_of_resource(client_state& client_state, service_permit permit, rjson::value request) {
@@ -985,7 +981,7 @@ future<executor::request_return_type> executor::create_table(client_state& clien
     return create_keyspace(keyspace_name).handle_exception_type([] (exceptions::already_exists_exception&) {
             // Ignore the fact that the keyspace may already exist. See discussion in #6340
         }).then([this, table_name, request = std::move(request), schema, view_builders = std::move(view_builders), tags_map = std::move(tags_map)] () mutable {
-        return futurize_invoke([&] { return _mm.announce_new_column_family(schema, false); }).then([this, table_info = std::move(request), schema, view_builders = std::move(view_builders), tags_map = std::move(tags_map)] () mutable {
+        return futurize_invoke([&] { return _mm.announce_new_column_family(schema); }).then([this, table_info = std::move(request), schema, view_builders = std::move(view_builders), tags_map = std::move(tags_map)] () mutable {
             return parallel_for_each(std::move(view_builders), [this, schema] (schema_builder builder) {
                 return _mm.announce_new_view(view_ptr(builder.build()));
             }).then([this, table_info = std::move(table_info), schema, tags_map = std::move(tags_map)] () mutable {
@@ -3553,7 +3549,7 @@ future<> executor::create_keyspace(std::string_view keyspace_name) {
         }
         auto opts = get_network_topology_options(rf);
         auto ksm = keyspace_metadata::new_keyspace(keyspace_name_str, "org.apache.cassandra.locator.NetworkTopologyStrategy", std::move(opts), true);
-        return _mm.announce_new_keyspace(ksm, api::new_timestamp(), false);
+        return _mm.announce_new_keyspace(ksm, api::new_timestamp());
     });
 }
 

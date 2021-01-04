@@ -59,6 +59,9 @@ i18n_xlat = {
 }
 
 python3_dependencies = subprocess.run('./install-dependencies.sh --print-python3-runtime-packages', shell=True, capture_output=True, encoding='utf-8').stdout.strip()
+node_exporter_filename = subprocess.run('./install-dependencies.sh --print-node-exporter-filename', shell=True, capture_output=True, encoding='utf-8').stdout.strip()
+node_exporter_dirname = os.path.basename(node_exporter_filename).rstrip('.tar.gz')
+
 
 def pkgname(name):
     if name in i18n_xlat:
@@ -450,6 +453,7 @@ apps = set([
     'scylla',
     'test/tools/cql_repl',
     'tools/scylla-types',
+    'tools/scylla-sstable-index',
 ])
 
 tests = scylla_tests | perf_tests | raft_tests
@@ -983,6 +987,7 @@ deps = {
     'test/tools/cql_repl': idls + ['test/tools/cql_repl.cc'] + scylla_core + scylla_tests_generic_dependencies,
     #FIXME: we don't need all of scylla_core here, only the types module, need to modularize scylla_core.
     'tools/scylla-types': idls + ['tools/scylla-types.cc'] + scylla_core,
+    'tools/scylla-sstable-index': idls + ['tools/scylla-sstable-index.cc'] + scylla_core,
 }
 
 pure_boost_tests = set([
@@ -1798,7 +1803,7 @@ with open(buildfile_tmp, 'w') as f:
         f.write(textwrap.dedent('''\
             build $builddir/{mode}/iotune: copy $builddir/{mode}/seastar/apps/iotune/iotune
             ''').format(**locals()))
-        f.write('build $builddir/{mode}/dist/tar/{scylla_product}-package.tar.gz: package $builddir/{mode}/scylla $builddir/{mode}/iotune $builddir/SCYLLA-RELEASE-FILE $builddir/SCYLLA-VERSION-FILE $builddir/debian/debian | always\n'.format(**locals()))
+        f.write('build $builddir/{mode}/dist/tar/{scylla_product}-package.tar.gz: package $builddir/{mode}/scylla $builddir/{mode}/iotune $builddir/SCYLLA-RELEASE-FILE $builddir/SCYLLA-VERSION-FILE $builddir/debian/debian $builddir/node_exporter | always\n'.format(**locals()))
         f.write('  mode = {mode}\n'.format(**locals()))
         f.write(f'build $builddir/dist/{mode}/redhat: rpmbuild $builddir/{mode}/dist/tar/{scylla_product}-package.tar.gz\n')
         f.write(f'  mode = {mode}\n')
@@ -1957,6 +1962,9 @@ with open(buildfile_tmp, 'w') as f:
         rule debian_files_gen
             command = ./dist/debian/debian_files_gen.py
         build $builddir/debian/debian: debian_files_gen | always
+        rule extract_node_exporter
+            command = tar -C build -xvpf {node_exporter_filename} && rm -rfv build/node_exporter && mv -v build/{node_exporter_dirname} build/node_exporter
+        build $builddir/node_exporter: extract_node_exporter | always
         ''').format(**globals()))
 
 os.rename(buildfile_tmp, buildfile)

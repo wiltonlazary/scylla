@@ -59,7 +59,7 @@
 #include "partition_slice_builder.hh"
 #include "cas_request.hh"
 
-bool is_system_keyspace(const sstring& name);
+bool is_system_keyspace(std::string_view name);
 
 namespace cql3 {
 
@@ -72,6 +72,10 @@ modification_statement_timeout(const schema& s) {
     } else {
         return &timeout_config::write_timeout;
     }
+}
+
+db::timeout_clock::duration modification_statement::get_timeout(const query_options& options) const {
+    return attrs->is_timeout_set() ? attrs->get_timeout(options) : options.get_timeout_config().*get_timeout_config_selector();
 }
 
 modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_, cql_stats& stats_)
@@ -287,7 +291,7 @@ modification_statement::do_execute(service::storage_proxy& proxy, service::query
 future<>
 modification_statement::execute_without_condition(service::storage_proxy& proxy, service::query_state& qs, const query_options& options) const {
     auto cl = options.get_consistency();
-    auto timeout = db::timeout_clock::now() + options.get_timeout_config().*get_timeout_config_selector();
+    auto timeout = db::timeout_clock::now() + get_timeout(options);
     return get_mutations(proxy, options, timeout, false, options.get_timestamp(qs), qs).then([this, cl, timeout, &proxy, &qs] (auto mutations) {
         if (mutations.empty()) {
             return now();

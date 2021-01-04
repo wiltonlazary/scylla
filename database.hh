@@ -224,6 +224,10 @@ public:
         return bool(_seal_immediate_fn);
     }
 
+    bool can_flush() const {
+        return may_flush() && !empty();
+    }
+
     bool empty() const {
         for (auto& m : _memtables) {
            if (!m->empty()) {
@@ -490,6 +494,8 @@ private:
     utils::phased_barrier _pending_reads_phaser;
     // Corresponding phaser for in-progress streams
     utils::phased_barrier _pending_streams_phaser;
+    // Corresponding phaser for in-progress flushes
+    utils::phased_barrier _pending_flushes_phaser;
 
     // This field cashes the last truncation time for the table.
     // The master resides in system.truncated table
@@ -564,9 +570,10 @@ private:
         return sstable_generation % smp::count;
     }
 
-    // Rebuilds existing sstable set with new sstables added to it and old sstables removed from it.
-    void rebuild_sstable_list(const std::vector<sstables::shared_sstable>& new_sstables,
-        const std::vector<sstables::shared_sstable>& old_sstables);
+    // Builds new sstable set from existing one, with new sstables added to it and old sstables removed from it.
+    future<lw_shared_ptr<sstables::sstable_set>>
+    build_new_sstable_list(const std::vector<sstables::shared_sstable>& new_sstables,
+                           const std::vector<sstables::shared_sstable>& old_sstables);
 
     // Rebuild sstable set, delete input sstables right away, and update row cache and statistics.
     void on_compaction_completion(sstables::compaction_completion_desc& desc);
@@ -748,6 +755,8 @@ public:
     future<> clear(); // discards memtable(s) without flushing them to disk.
     future<db::replay_position> discard_sstables(db_clock::time_point);
 
+    bool can_flush() const;
+
     // FIXME: this is just an example, should be changed to something more
     // general. compact_all_sstables() starts a compaction of all sstables.
     // It doesn't flush the current memtable first. It's just a ad-hoc method,
@@ -918,6 +927,14 @@ public:
 
     size_t streams_in_progress() const {
         return _pending_streams_phaser.operations_in_progress();
+    }
+
+    future<> await_pending_flushes() {
+        return _pending_flushes_phaser.advance_and_await();
+    }
+
+    future<> await_pending_ops() {
+        return when_all(await_pending_reads(), await_pending_writes(), await_pending_streams(), await_pending_flushes()).discard_result();
     }
 
     void add_or_update_view(view_ptr v);
@@ -1144,7 +1161,7 @@ public:
 
 class no_such_keyspace : public std::runtime_error {
 public:
-    no_such_keyspace(const sstring& ks_name);
+    no_such_keyspace(std::string_view ks_name);
 };
 
 class no_such_column_family : public std::runtime_error {
@@ -1377,8 +1394,8 @@ public:
      */
     future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&);
     /* below, find_keyspace throws no_such_<type> on fail */
-    keyspace& find_keyspace(const sstring& name);
-    const keyspace& find_keyspace(const sstring& name) const;
+    keyspace& find_keyspace(std::string_view name);
+    const keyspace& find_keyspace(std::string_view name) const;
     bool has_keyspace(std::string_view name) const;
     void validate_keyspace_update(keyspace_metadata& ksm);
     void validate_new_keyspace(keyspace_metadata& ksm);
@@ -1564,6 +1581,6 @@ future<> stop_database(sharded<database>& db);
 flat_mutation_reader make_multishard_streaming_reader(distributed<database>& db, schema_ptr schema,
         std::function<std::optional<dht::partition_range>()> range_generator);
 
-bool is_internal_keyspace(const sstring& name);
+bool is_internal_keyspace(std::string_view name);
 
 #endif /* DATABASE_HH_ */

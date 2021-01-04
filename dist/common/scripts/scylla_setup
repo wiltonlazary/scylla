@@ -193,33 +193,30 @@ if __name__ == '__main__':
     default_no_coredump_setup = False
     default_no_cpuscaling_setup = False
 
-    if is_offline():
-        default_no_node_exporter = True
-        warn_offline('node exporter setup')
+    if is_offline() and not is_nonroot():
+        default_no_ntp_setup = True
+        warn_offline('ntp setup')
+        if not shutil.which('mkfs.xfs'):
+            default_no_kernel_check = True
+            default_no_raid_setup = True
+            warn_offline_missing_pkg('kernel version check', 'xfsprogs')
+            warn_offline_missing_pkg('RAID setup', 'xfsprogs')
 
-        if not is_nonroot():
-            default_no_ntp_setup = True
-            warn_offline('ntp setup')
-            if not shutil.which('mkfs.xfs'):
-                default_no_kernel_check = True
-                default_no_raid_setup = True
-                warn_offline_missing_pkg('kernel version check', 'xfsprogs')
-                warn_offline_missing_pkg('RAID setup', 'xfsprogs')
+        if not default_no_raid_setup and not shutil.which('mdadm'):
+            default_no_raid_setup = True
+            warn_offline_missing_pkg('RAID setup', 'mdadm')
 
-            if not default_no_raid_setup and not shutil.which('mdadm'):
-                default_no_raid_setup = True
-                warn_offline_missing_pkg('RAID setup', 'mdadm')
+        if not shutil.which('coredumpctl'):
+            default_no_coredump_setup = True
+            warn_offline_missing_pkg('coredump setup', 'systemd-coredump')
 
-            if not shutil.which('coredumpctl'):
-                default_no_coredump_setup = True
-                warn_offline_missing_pkg('coredump setup', 'systemd-coredump')
+        if is_debian_variant() and not shutil.which('cpufreq-set'):
+            default_no_cpuscaling_setup = True
+            warn_offline_missing_pkg('cpuscaling setup', 'cpufrequtils')
+        elif not shutil.which('cpupower'):
+            default_no_cpuscaling_setup = True
+            warn_offline_missing_pkg('cpuscaling setup', 'cpupower')
 
-            if is_debian_variant() and not shutil.which('cpufreq-set'):
-                default_no_cpuscaling_setup = True
-                warn_offline_missing_pkg('cpuscaling setup', 'cpufrequtils')
-            elif not shutil.which('cpupower'):
-                default_no_cpuscaling_setup = True
-                warn_offline_missing_pkg('cpuscaling setup', 'cpupower')
         print()
 
     parser = argparse.ArgumentParser(description='Configure environment for Scylla.')
@@ -273,7 +270,7 @@ if __name__ == '__main__':
                         help='skip daily version check')
     parser.add_argument('--no-node-exporter', action='store_true',
                         default=default_no_node_exporter,
-                        help='do not install the node exporter')
+                        help='do not enable the node exporter')
     parser.add_argument('--no-cpuscaling-setup', action='store_true',
                         default=default_no_cpuscaling_setup,
                         help='skip cpu scaling setup')
@@ -515,10 +512,12 @@ if __name__ == '__main__':
         if io_setup:
             run_setup_script('IO configuration', 'scylla_io_setup')
 
-    node_exporter = interactive_ask_service('Do you want to install node exporter to export Prometheus data from the node? Note that the Scylla monitoring stack uses this data', 'Yes - install node exporter. No - skip this  step.', node_exporter)
+    node_exporter = interactive_ask_service('Do you want to enable node exporter to export Prometheus data from the node? Note that the Scylla monitoring stack uses this data', 'Yes - enable node exporter. No - skip this  step.', node_exporter)
     args.no_node_exporter = not node_exporter
     if node_exporter:
-        run_setup_script('node exporter', 'node_exporter_install')
+        node_exporter_unit = systemd_unit('scylla-node-exporter')
+        node_exporter_unit.enable()
+        node_exporter_unit.start()
 
     if args.developer_mode:
         run_setup_script('developer mode', 'scylla_dev_mode_setup --developer-mode 1')
